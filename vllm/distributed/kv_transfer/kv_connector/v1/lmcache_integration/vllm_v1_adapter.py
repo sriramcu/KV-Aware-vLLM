@@ -1109,7 +1109,13 @@ class LMCacheConnectorV1Impl:
             self._kv_importance_tiers = self._load_kv_importance_tiers()
 
         tiers = self._kv_importance_tiers.get(str(req_id), {})
-        return {int(k): str(v) for k, v in tiers.items()}
+        out = {}
+        for k, v in tiers.items():
+            if isinstance(v, dict):
+                out[int(k)] = str(v.get("tier", "cpu"))
+            else:
+                out[int(k)] = str(v)
+        return out
 
     # [SY]
     def _tier_to_lmcache_location(self, tier: str) -> str:
@@ -1155,7 +1161,12 @@ class LMCacheConnectorV1Impl:
 
             target_locations.append(self._tier_to_lmcache_location(target_tier))
 
-
+        logger.info(
+            "[SY] req_id=%s target_tiers_count=%d sample=%s",
+            req_id,
+            len(target_locations),
+            target_locations[:8],
+        )
         return target_locations
 
 

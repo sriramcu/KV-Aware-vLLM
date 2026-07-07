@@ -1,0 +1,16 @@
+#!/bin/bash
+#SBATCH --job-name=kvaware_h100_wo_gnn
+#SBATCH --partition=gpu-h100-dchen
+#SBATCH --output=/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/logs/%x_%j.out
+#SBATCH --error=/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/logs/%x_%j.err
+#SBATCH --time=06:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gres=gpu:2
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=160G
+
+set -euxo pipefail
+
+mkdir -p /mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/logs
+/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM/local_repro/run_driver.sh wo_gnn
