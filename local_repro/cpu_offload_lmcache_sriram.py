@@ -23,6 +23,100 @@ from vllm.config import KVTransferConfig
 from vllm.engine.arg_utils import EngineArgs
 
 import hashlib
+
+# ===== SRIRAM PROCESS MONITOR START =====
+import os as _sr_os
+import time as _sr_time
+import threading as _sr_threading
+import shutil as _sr_shutil
+import subprocess as _sr_subprocess
+
+
+def _sr_top_processes():
+    try:
+        return _sr_subprocess.check_output(
+            [
+                "bash",
+                "-lc",
+                "ps -u $USER -o pid,ppid,rss,vsz,stat,etime,cmd --sort=-rss | head -20",
+            ],
+            stderr=_sr_subprocess.STDOUT,
+            timeout=3,
+            text=True,
+        ).replace("\n", " || ")
+    except Exception as e:
+        return repr(e)
+
+def _sr_disk_usage(path):
+    try:
+        u = _sr_shutil.disk_usage(path)
+        return f"{path}: used={u.used/1024**3:.1f}G free={u.free/1024**3:.1f}G total={u.total/1024**3:.1f}G"
+    except Exception as e:
+        return f"{path}: {e!r}"
+
+
+def _sr_status():
+    vals = {}
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith(("VmRSS:", "VmHWM:", "VmSize:", "Threads:")):
+                    k, v = line.split(":", 1)
+                    vals[k] = v.strip()
+    except Exception as e:
+        vals["err"] = repr(e)
+    return vals
+
+
+def _sr_gpu():
+    try:
+        return _sr_subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,memory.used,memory.free,memory.total,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            stderr=_sr_subprocess.STDOUT,
+            timeout=3,
+            text=True,
+        ).replace("\n", " | ")
+    except Exception as e:
+        return repr(e)
+
+def _sr_meminfo():
+    try:
+        keys = ("MemTotal:", "MemFree:", "MemAvailable:", "Buffers:", "Cached:", "SwapTotal:", "SwapFree:")
+        out = []
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith(keys):
+                    out.append(line.strip())
+        return " | ".join(out)
+    except Exception as e:
+        return repr(e)
+
+def _sr_monitor_loop():
+    while True:
+        print(
+            "[SRIRAM_MONITOR] "
+            f"pid={_sr_os.getpid()} "
+            f"status={_sr_status()} "
+            f"tmp={_sr_disk_usage('/tmp')} "
+            f"shm={_sr_disk_usage('/dev/shm')} "
+            f"lmcache={_sr_disk_usage(_sr_os.environ.get('SRIRAM_LMCACHE_DIR', '/tmp'))} "
+            f"gpu={_sr_gpu()}",
+            f"top_procs={_sr_top_processes()} ",
+            f"meminfo={_sr_meminfo()} ",
+            flush=True,
+        )
+        _sr_time.sleep(30)
+
+
+def _sr_start_monitor():
+    t = _sr_threading.Thread(target=_sr_monitor_loop, daemon=True)
+    t.start()
+# ===== SRIRAM PROCESS MONITOR END =====
+
 def passage_prefix_signature(sorted_passage, n=2):
     prefix = "\n".join(sorted_passage[:n])
     return hashlib.sha1(prefix.encode("utf-8")).hexdigest()
@@ -71,16 +165,16 @@ from kvcache_monitor import (
 )
 from kvcache_visualize import visualize as kv_visualize
 
-
+LM_CACHE_DISK_PATH = "/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/lmcache_vllm/"
 def setup_environment_variables():
     def write_lmcache_config(path: str):
         import textwrap
 
-        config = textwrap.dedent("""
+        config = textwrap.dedent(f"""
         chunk_size: 512
         local_cpu: true
         max_local_cpu_size: 100.0
-        local_disk: "file:///tmp/sriramc2_lmcache_vllm/"
+        local_disk: "file://{LM_CACHE_DISK_PATH}"
         max_local_disk_size: 500.0
         enable_kv_events: true
         pre_caching_hash_algorithm: builtin
@@ -91,7 +185,11 @@ def setup_environment_variables():
     write_lmcache_config(cfg_path)
 
     os.environ["LMCACHE_HOOK_ENABLE"] = "1"
-    os.environ["LMCACHE_HOOK_LOG_DIR"] = "/tmp/lmcache_hit_hook"
+    os.environ["LMCACHE_HOOK_LOG_DIR"] = os.environ.get(
+        "LMCACHE_HOOK_LOG_DIR",
+        "/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/lmcache_hit_hook",
+    )
+    os.makedirs(os.environ["LMCACHE_HOOK_LOG_DIR"], exist_ok=True)
     os.environ["LMCACHE_CONFIG_FILE"] = os.path.abspath(cfg_path)
     os.environ["VLLM_USE_V1"] = "1"
     os.environ["PYTHONHASHSEED"] = "0"
@@ -108,13 +206,16 @@ def setup_environment_variables():
     os.environ["LMCACHE_LOCAL_CPU"] = "True"
     os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "100"
 
-    os.makedirs("/tmp/sriramc2_lmcache_vllm/", exist_ok=True)
-    os.environ["LMCACHE_LOCAL_DISK"] = "file:///tmp/sriramc2_lmcache_vllm/"
+    os.makedirs(f"{LM_CACHE_DISK_PATH}", exist_ok=True)
+    os.environ["LMCACHE_LOCAL_DISK"] = f"file://{LM_CACHE_DISK_PATH}"
     os.environ["LMCACHE_INTERNAL_API_SERVER_ENABLED"] = "True"
     os.environ["LMCACHE_MAX_LOCAL_DISK_SIZE"] = "500"
     os.environ["DYN_KVBM_DISABLE_DISK_OFFLOAD_FILTER"] = "False"
-    os.environ["PROMETHEUS_MULTIPROC_DIR"] = "/tmp/sriramc2_prometheus_vllm"
-    os.makedirs("/tmp/sriramc2_prometheus_vllm", exist_ok=True)
+    os.environ["PROMETHEUS_MULTIPROC_DIR"] = os.environ.get(
+        "PROMETHEUS_MULTIPROC_DIR",
+        "/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/prometheus_vllm",
+    )
+    os.makedirs(os.environ["PROMETHEUS_MULTIPROC_DIR"], exist_ok=True)
 
 
 def parse_arguments():
@@ -129,6 +230,7 @@ def parse_arguments():
         type=str,
     )
     parser.add_argument("--questions_json", type=str)
+    parser.add_argument("--max_questions", type=int, default=None)
 
     parser.add_argument(
         "--gnn_ckpt",
@@ -162,6 +264,23 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
 
     kv_events_config = KVEventsConfig(enable_kv_cache_events=True)
 
+    # llm_args = EngineArgs(
+    #     model=model,
+    #     kv_transfer_config=ktc,
+    #     # kv_events_config=kv_events_config,
+    #     max_model_len=8000,
+    #     gpu_memory_utilization=0.65,
+    #     dtype="bfloat16",
+    #     max_num_seqs=20,
+    #     tensor_parallel_size=1,
+    #     enforce_eager=False,
+    #     enable_chunked_prefill=True,
+    #     disable_log_stats=False,
+    #     distributed_executor_backend=None,
+    #     quantization=None,
+    #     enable_prefix_caching=True,
+    # )
+
     llm_args = EngineArgs(
         model=model,
         kv_transfer_config=ktc,
@@ -169,7 +288,7 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
         max_model_len=8000,
         gpu_memory_utilization=0.65,
         dtype="bfloat16",
-        max_num_seqs=20,
+        max_num_seqs=16,
         tensor_parallel_size=2,
         enforce_eager=False,
         enable_chunked_prefill=True,
@@ -178,6 +297,9 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
         quantization="fp8",
         enable_prefix_caching=True,
     )
+
+    print("[SRIRAM BEFORE LLM] CUDA_VISIBLE_DEVICES=", os.environ.get("CUDA_VISIBLE_DEVICES"), flush=True)
+    print("[SRIRAM BEFORE LLM] CUDA_DEVICE_ORDER=", os.environ.get("CUDA_DEVICE_ORDER"), flush=True)
 
     llm = LLM(**asdict(llm_args))
 
@@ -418,9 +540,13 @@ def main():
     if not args.question and not args.questions_json:
         raise ValueError("provide either --question or --questions_json")
     
+    _sr_start_monitor()
     setup_environment_variables()
 
     questions = load_questions(args)
+    if args.max_questions is not None:
+        questions = questions[:args.max_questions]
+        print(f"Using first {len(questions)} questions", flush=True)
 
     vllm_tokenizer = AutoTokenizer.from_pretrained(args.llm_model, use_fast=True)
     if vllm_tokenizer.pad_token_id is None and vllm_tokenizer.eos_token_id is not None:

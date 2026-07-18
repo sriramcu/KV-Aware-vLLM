@@ -1,51 +1,110 @@
 #!/bin/bash
 set -euxo pipefail
 
-MODE="${1:?usage: run_driver.sh with_gnn|wo_gnn}"
+MODE="${1:-wo_gnn}"
+shift || true
+export MODE
 
-export HOME_DIR=/mnt/shared/gpfs/home/sriramc2
-export PROJECT_DIR=$HOME_DIR/KV-Aware-vLLM
-export RUN_ROOT=$HOME_DIR/runs/kvaware_repro
+if [[ "$MODE" != "with_gnn" && "$MODE" != "wo_gnn" ]]; then
+  echo "Unknown mode: $MODE"
+  echo "usage: run_driver.sh with_gnn|wo_gnn"
+  exit 2
+fi
 
-source $HOME_DIR/venvs/kvaware/bin/activate
+HOME_DIR=/mnt/shared/gpfs/home/sriramc2
+REPO="$HOME_DIR/KV-Aware-vLLM"
+RUN_ROOT="$HOME_DIR/runs/kvaware_repro"
 
-cd "$PROJECT_DIR"
+DATASET_NAME="${DATASET_NAME:-hotpotqa}"
+MAX_QUESTIONS="${MAX_QUESTIONS:-250}"
+QUESTIONS_JSON="$REPO/Hierarchical_KV/LinearRAG/dataset/${DATASET_NAME}/questions.json"
 
-mkdir -p "$RUN_ROOT/outputs/$MODE"
-mkdir -p "$RUN_ROOT/tmp/$MODE"
+source "$HOME_DIR/venvs/kvaware/bin/activate"
+
 mkdir -p "$RUN_ROOT/logs"
-mkdir -p "/tmp/sriramc2_lmcache_vllm"
-mkdir -p "/tmp/sriramc2_prometheus_vllm"
+mkdir -p "$RUN_ROOT/sidecars"
+mkdir -p "$RUN_ROOT/lmcache_vllm"
+mkdir -p "$RUN_ROOT/lmcache_hit_hook"
+mkdir -p "$RUN_ROOT/prometheus_vllm"
+mkdir -p "$RUN_ROOT/tmp"
 
-export HF_HOME=$HOME_DIR/.cache/huggingface
-export TRANSFORMERS_CACHE=$HF_HOME/transformers
-export HF_HUB_CACHE=$HF_HOME/hub
+export PYTHONPATH="$REPO:${PYTHONPATH:-}"
+
+export HF_HOME="$HOME_DIR/.cache/huggingface"
+export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
+export HF_HUB_CACHE="$HF_HOME/hub"
+export TRANSFORMERS_CACHE="$HF_HOME/transformers"
 
 export VLLM_USE_V1=1
 export PYTHONHASHSEED=0
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 
-export VLLM_KV_IMPORTANCE_TIERS="/tmp/kv_importance_tiers_${USER}_${MODE}_${SLURM_JOB_ID}.json"
+if [[ "$MODE" == "with_gnn" ]]; then
+  export VLLM_KV_IMPORTANCE_ENABLE=1
+else
+  export VLLM_KV_IMPORTANCE_ENABLE=0
+fi
+
 export GNN_KV_BLOCK_SIZE=16
 
-if [ "$MODE" = "with_gnn" ]; then
-  export VLLM_KV_IMPORTANCE_ENABLE=1
-elif [ "$MODE" = "wo_gnn" ]; then
-  export VLLM_KV_IMPORTANCE_ENABLE=0
-else
-  echo "Unknown mode: $MODE"
-  exit 2
+JOB_TAG="${DATASET_NAME}_${MODE}_${SLURM_JOB_ID:-manual}"
+
+export VLLM_KV_IMPORTANCE_TIERS="$RUN_ROOT/sidecars/kv_importance_tiers_${JOB_TAG}.json"
+
+mkdir -p "$RUN_ROOT/lmcache_vllm"
+mkdir -p "$RUN_ROOT/lmcache_hit_hook"
+mkdir -p "$RUN_ROOT/prometheus_vllm"
+
+# delete old jobs' cache dirs if no other job is running
+if [[ "${CLEAN_OLD_LMCACHE:-1}" == "1" ]]; then
+  if squeue -u "$USER" -h | grep -v "${SLURM_JOB_ID:-NO_CURRENT_JOB}" | grep -q .; then
+    echo "Other jobs are running; not deleting old LMCache caches."
+    squeue -u "$USER"
+  else
+    echo "Deleting old LMCache caches..."
+    rm -rf "$RUN_ROOT/lmcache_vllm"/*
+    rm -rf "$RUN_ROOT/lmcache_hit_hook"/*
+    rm -rf "$RUN_ROOT/prometheus_vllm"/*
+  fi
 fi
+
+export SRIRAM_LMCACHE_DIR="$RUN_ROOT/lmcache_vllm/${JOB_TAG}"
+export LMCACHE_HOOK_LOG_DIR="$RUN_ROOT/lmcache_hit_hook/${JOB_TAG}"
+export PROMETHEUS_MULTIPROC_DIR="$RUN_ROOT/prometheus_vllm/${JOB_TAG}"
+
+rm -rf "$SRIRAM_LMCACHE_DIR" "$LMCACHE_HOOK_LOG_DIR" "$PROMETHEUS_MULTIPROC_DIR"
+mkdir -p "$SRIRAM_LMCACHE_DIR" "$LMCACHE_HOOK_LOG_DIR" "$PROMETHEUS_MULTIPROC_DIR"
+
+# Use short node-local path only for sockets/temp files.
+export TMPDIR="/tmp/sr_${SLURM_JOB_ID:-manual}"
+export TEMP="$TMPDIR"
+export TMP="$TMPDIR"
+rm -rf "$TMPDIR"
+mkdir -p "$TMPDIR"
 
 echo "=== RUN CONFIG ==="
 date
 hostname
 whoami
-pwd
+echo "REPO=$REPO"
 echo "MODE=$MODE"
+echo "DATASET_NAME=$DATASET_NAME"
+echo "MAX_QUESTIONS=$MAX_QUESTIONS"
+echo "QUESTIONS_JSON=$QUESTIONS_JSON"
 echo "VLLM_KV_IMPORTANCE_ENABLE=$VLLM_KV_IMPORTANCE_ENABLE"
 echo "VLLM_KV_IMPORTANCE_TIERS=$VLLM_KV_IMPORTANCE_TIERS"
+echo "SRIRAM_LMCACHE_DIR=$SRIRAM_LMCACHE_DIR"
+echo "LMCACHE_HOOK_LOG_DIR=$LMCACHE_HOOK_LOG_DIR"
+echo "PROMETHEUS_MULTIPROC_DIR=$PROMETHEUS_MULTIPROC_DIR"
+echo "TMPDIR=$TMPDIR"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
+echo "CUDA_DEVICE_ORDER=${CUDA_DEVICE_ORDER:-unset}"
+
+if [[ ! -f "$QUESTIONS_JSON" ]]; then
+  echo "Missing questions file: $QUESTIONS_JSON"
+  exit 3
+fi
+
 nvidia-smi
 
 echo "=== PYTHON LOCATION ==="
@@ -59,18 +118,25 @@ print(vllm.__file__)
 PY
 
 echo "=== START DRIVER ==="
-python local_repro/cpu_offload_lmcache_sriram.py \
-  --dataset_name hotpotqa \
-  2>&1 | tee "$RUN_ROOT/outputs/$MODE/vllm-results-${MODE}-${SLURM_JOB_ID}.txt"
+cd "$TMPDIR"
+
+python "$REPO/local_repro/cpu_offload_lmcache_sriram.py" \
+  --llm_model meta-llama/Llama-3.3-70B-Instruct \
+  --dataset_name "$DATASET_NAME" \
+  --questions_json "$QUESTIONS_JSON" \
+  --max_questions "$MAX_QUESTIONS" \
+  "$@"
 
 echo "=== SIDE CAR CHECK ==="
 ls -lh "$VLLM_KV_IMPORTANCE_TIERS" || true
+
 python - <<'PY'
 import json, os
 p = os.environ["VLLM_KV_IMPORTANCE_TIERS"]
 print("sidecar:", p)
 if os.path.exists(p):
-    data = json.load(open(p))
+    with open(p) as f:
+        data = json.load(f)
     print("num requests in sidecar:", len(data))
     first_key = next(iter(data), None)
     print("first key:", first_key)
@@ -82,6 +148,9 @@ if os.path.exists(p):
 else:
     print("sidecar missing")
 PY
+
+echo "=== CACHE SIZE ==="
+du -sh "$SRIRAM_LMCACHE_DIR" || true
 
 echo "=== DONE ==="
 date

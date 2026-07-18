@@ -2601,11 +2601,51 @@ def nvmlDeviceGetCount():
     _nvmlCheckReturn(ret)
     return c_count.value
 
+# def nvmlDeviceGetHandleByIndex(index):
+#     c_index = c_uint(index)
+#     device = c_nvmlDevice_t()
+#     fn = _nvmlGetFunctionPointer("nvmlDeviceGetHandleByIndex_v2")
+#     ret = fn(c_index, byref(device))
+#     _nvmlCheckReturn(ret)
+#     return device
+
 def nvmlDeviceGetHandleByIndex(index):
     c_index = c_uint(index)
     device = c_nvmlDevice_t()
     fn = _nvmlGetFunctionPointer("nvmlDeviceGetHandleByIndex_v2")
     ret = fn(c_index, byref(device))
+
+    if ret != NVML_SUCCESS:
+        try:
+            import os
+            print("[SRIRAM NVML DEBUG] nvmlDeviceGetHandleByIndex failed", flush=True)
+            print(f"[SRIRAM NVML DEBUG] requested index={index!r}", flush=True)
+            print(f"[SRIRAM NVML DEBUG] CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r}", flush=True)
+            print(f"[SRIRAM NVML DEBUG] CUDA_DEVICE_ORDER={os.environ.get('CUDA_DEVICE_ORDER')!r}", flush=True)
+
+            try:
+                count = nvmlDeviceGetCount()
+                print(f"[SRIRAM NVML DEBUG] nvmlDeviceGetCount={count}", flush=True)
+                for i in range(count):
+                    try:
+                        h = nvmlDeviceGetHandleByIndex(i)
+                        try:
+                            name = nvmlDeviceGetName(h)
+                        except Exception as e:
+                            name = f"<name error: {e!r}>"
+                        try:
+                            pci = nvmlDeviceGetPciInfo(h)
+                            bus = getattr(pci, "busId", None)
+                        except Exception as e:
+                            bus = f"<pci error: {e!r}>"
+                        print(f"[SRIRAM NVML DEBUG] physical_index={i} name={name!r} busId={bus!r}", flush=True)
+                    except Exception as e:
+                        print(f"[SRIRAM NVML DEBUG] physical_index={i} handle_error={e!r}", flush=True)
+            except Exception as e:
+                print(f"[SRIRAM NVML DEBUG] nvmlDeviceGetCount error={e!r}", flush=True)
+        except Exception as e:
+            print(f"[SRIRAM NVML DEBUG] debug block failed: {e!r}", flush=True)
+
     _nvmlCheckReturn(ret)
     return device
 

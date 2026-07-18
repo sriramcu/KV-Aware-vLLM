@@ -1,0 +1,151 @@
+{
+  "best_val_primary": 0.004245682852342725,
+  "val_ce": 0.004245682153850794,
+  "val_token_acc": 1.0,
+  "val_confusion_matrix": [
+    [
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      80,
+      0
+    ],
+    [
+      0,
+      0,
+      0
+    ]
+  ],
+  "val_low_precision": 0.0,
+  "val_low_recall": 0.0,
+  "val_low_f1": 0.0,
+  "val_low_support": 0,
+  "val_medium_precision": 1.0,
+  "val_medium_recall": 1.0,
+  "val_medium_f1": 1.0,
+  "val_medium_support": 80,
+  "val_high_precision": 0.0,
+  "val_high_recall": 0.0,
+  "val_high_f1": 0.0,
+  "val_high_support": 0,
+  "val_macro_f1": 0.3333333333333333,
+  "val_adjacent_acc": 1.0,
+  "val_mean_class_distance": 0.0,
+  "val_normalized_distance_error": 0.0,
+  "test_ce": 0.003374009858816862,
+  "test_token_acc": 1.0,
+  "test_confusion_matrix": [
+    [
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      80,
+      0
+    ],
+    [
+      0,
+      0,
+      0
+    ]
+  ],
+  "test_low_precision": 0.0,
+  "test_low_recall": 0.0,
+  "test_low_f1": 0.0,
+  "test_low_support": 0,
+  "test_medium_precision": 1.0,
+  "test_medium_recall": 1.0,
+  "test_medium_f1": 1.0,
+  "test_medium_support": 80,
+  "test_high_precision": 0.0,
+  "test_high_recall": 0.0,
+  "test_high_f1": 0.0,
+  "test_high_support": 0,
+  "test_macro_f1": 0.3333333333333333,
+  "test_adjacent_acc": 1.0,
+  "test_mean_class_distance": 0.0,
+  "test_normalized_distance_error": 0.0,
+  "val_by_dataset": {
+    "hotpotqa": {
+      "ce": 0.004245682153850794,
+      "token_acc": 1.0,
+      "confusion_matrix": [
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          80,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ]
+      ],
+      "low_precision": 0.0,
+      "low_recall": 0.0,
+      "low_f1": 0.0,
+      "low_support": 0,
+      "medium_precision": 1.0,
+      "medium_recall": 1.0,
+      "medium_f1": 1.0,
+      "medium_support": 80,
+      "high_precision": 0.0,
+      "high_recall": 0.0,
+      "high_f1": 0.0,
+      "high_support": 0,
+      "macro_f1": 0.3333333333333333,
+      "adjacent_acc": 1.0,
+      "mean_class_distance": 0.0,
+      "normalized_distance_error": 0.0
+    }
+  },
+  "test_by_dataset": {
+    "hotpotqa": {
+      "ce": 0.003374009858816862,
+      "token_acc": 1.0,
+      "confusion_matrix": [
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          80,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ]
+      ],
+      "low_precision": 0.0,
+      "low_recall": 0.0,
+      "low_f1": 0.0,
+      "low_support": 0,
+      "medium_precision": 1.0,
+      "medium_recall": 1.0,
+      "medium_f1": 1.0,
+      "medium_support": 80,
+      "high_precision": 0.0,
+      "high_recall": 0.0,
+      "high_f1": 0.0,
+      "high_support": 0,
+      "macro_f1": 0.3333333333333333,
+      "adjacent_acc": 1.0,
+      "mean_class_distance": 0.0,
+      "normalized_distance_error": 0.0
+    }
+  }
+}
