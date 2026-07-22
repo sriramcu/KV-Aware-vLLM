@@ -8,11 +8,10 @@
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=160G
 
 set -euxo pipefail
 export PYTHONPATH=/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM:${PYTHONPATH:-}
-export CUDA_DEVICE_ORDER=PCI_BUS_ID
+# export CUDA_DEVICE_ORDER=PCI_BUS_ID
 
 mkdir -p /mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/logs
 /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM/local_repro/run_driver.sh with_gnn 2>&1

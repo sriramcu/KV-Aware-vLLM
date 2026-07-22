@@ -604,7 +604,7 @@ class LMCacheConnectorV1Impl:
                     config_key = key[8:]  # Remove "lmcache." prefix
                     if _validate_and_set_config_value(config, config_key, value):
                         logger.info(
-                            "Updated config %s from vLLM extra config: %s",
+                            "Updated c[onfig %s from vLLM extra config: %s",
                             config_key,
                             value,
                         )
@@ -1108,23 +1108,7 @@ class LMCacheConnectorV1Impl:
         if not hasattr(self, "_kv_importance_tiers"):
             self._kv_importance_tiers = self._load_kv_importance_tiers()
 
-        # tiers = self._kv_importance_tiers.get(str(req_id), {})
-
-        full_req_id = str(req_id)
-
-        # Try the full vLLM ID first, then the original numeric dataset ID.
-        tiers = self._kv_importance_tiers.get(full_req_id)
-
-        if tiers is None:
-            base_req_id = full_req_id.split("-", 1)[0]
-            tiers = self._kv_importance_tiers.get(base_req_id, {})
-
-        logger.info(
-            "[SY] tier lookup req_id=%s matched=%s blocks=%d",
-            full_req_id,
-            bool(tiers),
-            len(tiers),
-        )
+        tiers = self._kv_importance_tiers.get(str(req_id), {})
         out = {}
         for k, v in tiers.items():
             if isinstance(v, dict):
@@ -1188,10 +1172,6 @@ class LMCacheConnectorV1Impl:
 
     @_lmcache_nvtx_annotate
     def wait_for_save(self):
-        logger.warning(
-            "[SY] USING PATCHED ADAPTER file=%s",
-            __file__,
-        )
         """Blocking until the KV cache is saved to the connector buffer."""
 
         connector_metadata = self._parent._get_connector_metadata()

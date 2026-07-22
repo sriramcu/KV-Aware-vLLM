@@ -157,15 +157,18 @@ from Hierarchical_KV.LinearRAG.run import load_embedding_model
 vllm_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../"))
 sys.path.insert(0, vllm_root)
 
-from kvcache_monitor import (
-    install as kv_install,
-    report as kv_report,
-    reset as kv_reset,
-    to_dataframe as kv_to_dataframe,
-)
-from kvcache_visualize import visualize as kv_visualize
+# from kvcache_monitor import (
+#     install as kv_install,
+#     report as kv_report,
+#     reset as kv_reset,
+#     to_dataframe as kv_to_dataframe,
+# )
+# from kvcache_visualize import visualize as kv_visualize
 
-LM_CACHE_DISK_PATH = "/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/lmcache_vllm/"
+LM_CACHE_DISK_PATH = os.environ.get(
+    "SRIRAM_LMCACHE_DIR",
+    "/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/lmcache_vllm/manual",
+)
 def setup_environment_variables():
     def write_lmcache_config(path: str):
         import textwrap
@@ -175,7 +178,7 @@ def setup_environment_variables():
         local_cpu: true
         max_local_cpu_size: 100.0
         local_disk: "file://{LM_CACHE_DISK_PATH}"
-        max_local_disk_size: 500.0
+        max_local_disk_size: 450.0
         enable_kv_events: true
         pre_caching_hash_algorithm: builtin
         """).strip()
@@ -209,7 +212,7 @@ def setup_environment_variables():
     os.makedirs(f"{LM_CACHE_DISK_PATH}", exist_ok=True)
     os.environ["LMCACHE_LOCAL_DISK"] = f"file://{LM_CACHE_DISK_PATH}"
     os.environ["LMCACHE_INTERNAL_API_SERVER_ENABLED"] = "True"
-    os.environ["LMCACHE_MAX_LOCAL_DISK_SIZE"] = "500"
+    os.environ["LMCACHE_MAX_LOCAL_DISK_SIZE"] = "450"
     os.environ["DYN_KVBM_DISABLE_DISK_OFFLOAD_FILTER"] = "False"
     os.environ["PROMETHEUS_MULTIPROC_DIR"] = os.environ.get(
         "PROMETHEUS_MULTIPROC_DIR",
@@ -301,6 +304,11 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
     print("[SRIRAM BEFORE LLM] CUDA_VISIBLE_DEVICES=", os.environ.get("CUDA_VISIBLE_DEVICES"), flush=True)
     print("[SRIRAM BEFORE LLM] CUDA_DEVICE_ORDER=", os.environ.get("CUDA_DEVICE_ORDER"), flush=True)
 
+    print(
+        "[LMCache configuration] disk path:",
+        LM_CACHE_DISK_PATH,
+        flush=True,
+    )
     llm = LLM(**asdict(llm_args))
 
     try:
@@ -631,12 +639,12 @@ def main():
         max_tokens=512,
     )
 
-    kv_install()
+    # kv_install()
 
-    import lmcache_hit_hook as hook
+    # import lmcache_hit_hook as hook
 
-    hook.reset_logs()
-    hook.install()
+    # hook.reset_logs()
+    # hook.install()
 
     lmcache_connector = "LMCacheConnectorV1"
     os.environ["VLLM_KV_IMPORTANCE_TIERS"] = importance_path
@@ -649,7 +657,7 @@ def main():
     # llm_inputs = [llm_inputs[0]] * 1000
 
     with build_llm_with_lmcache(lmcache_connector, args.llm_model) as llm:
-        kv_reset()
+        # kv_reset()
         
         print(f"Cold run starting...")
         start = time.time()
@@ -664,18 +672,18 @@ def main():
         print(f"Second generation took {time_taken:.2f} seconds.")
 
 
-        save_kv_monitor_results(args.dataset_name, start)
+        # save_kv_monitor_results(args.dataset_name, start)
 
         for output in outputs:
             generated_text = output.outputs[0].text
             print(f"Output: {generated_text!r}")
 
 
-        summary_path = hook.dump_summary()
-        print(f"LMCache hook summary written to: {summary_path}")
+        # summary_path = hook.dump_summary()
+        # print(f"LMCache hook summary written to: {summary_path}")
 
-        with open(summary_path, "r", encoding="utf-8") as f:
-            print(json.dumps(json.load(f), indent=2))
+        # with open(summary_path, "r", encoding="utf-8") as f:
+        #     print(json.dumps(json.load(f), indent=2))
 
 
 if __name__ == "__main__":
