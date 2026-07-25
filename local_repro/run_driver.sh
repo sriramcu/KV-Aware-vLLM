@@ -17,6 +17,7 @@ RUN_ROOT="$HOME_DIR/runs/kvaware_repro"
 
 DATASET_NAME="${DATASET_NAME:-hotpotqa}"
 MAX_QUESTIONS="${MAX_QUESTIONS:-250}"
+SUBMISSION_BATCH_SIZE="${SUBMISSION_BATCH_SIZE:-8}"
 QUESTIONS_JSON="$REPO/Hierarchical_KV/LinearRAG/dataset/${DATASET_NAME}/questions.json"
 
 source "$HOME_DIR/venvs/kvaware/bin/activate"
@@ -108,6 +109,7 @@ echo "SRIRAM_KV_MEM_DEBUG=$SRIRAM_KV_MEM_DEBUG"
 echo "SRIRAM_KV_MEM_DEBUG_INTERVAL_S=$SRIRAM_KV_MEM_DEBUG_INTERVAL_S"
 echo "SRIRAM_LONG_PIN_SECONDS=$SRIRAM_LONG_PIN_SECONDS"
 echo "SRIRAM_LONG_REF_SECONDS=$SRIRAM_LONG_REF_SECONDS"
+echo "SUBMISSION_BATCH_SIZE=$SUBMISSION_BATCH_SIZE"
 
 if [[ ! -f "$QUESTIONS_JSON" ]]; then
   echo "Missing questions file: $QUESTIONS_JSON"
@@ -134,6 +136,7 @@ python "$REPO/local_repro/cpu_offload_lmcache_sriram.py" \
   --dataset_name "$DATASET_NAME" \
   --questions_json "$QUESTIONS_JSON" \
   --max_questions "$MAX_QUESTIONS" \
+  --submission_batch_size "$SUBMISSION_BATCH_SIZE" \
   "$@"
 
 echo "=== SIDE CAR CHECK ==="

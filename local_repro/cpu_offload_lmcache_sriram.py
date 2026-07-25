@@ -173,24 +173,24 @@ def setup_environment_variables():
     def write_lmcache_config(path: str):
         import textwrap
 
-        # config = textwrap.dedent(f"""
-        # chunk_size: 512
-        # local_cpu: true
-        # max_local_cpu_size: 100.0
-        # local_disk: "file://{LM_CACHE_DISK_PATH}"
-        # max_local_disk_size: 450.0
-        # enable_kv_events: true
-        # pre_caching_hash_algorithm: builtin
-        # enable_async_loading: false
-        # """).strip()
         config = textwrap.dedent(f"""
         chunk_size: 512
         local_cpu: true
         max_local_cpu_size: 100.0
+        local_disk: "file://{LM_CACHE_DISK_PATH}"
+        max_local_disk_size: 450.0
         enable_kv_events: true
         pre_caching_hash_algorithm: builtin
-        enable_async_loading: false
+        enable_async_loading: true
         """).strip()
+        # config = textwrap.dedent(f"""
+        # chunk_size: 512
+        # local_cpu: true
+        # max_local_cpu_size: 100.0
+        # enable_kv_events: true
+        # pre_caching_hash_algorithm: builtin
+        # enable_async_loading: false
+        # """).strip()
         Path(path).write_text(config + "\n", encoding="utf-8")
 
     cfg_path = "./lmcache_config.yaml"
@@ -212,16 +212,16 @@ def setup_environment_variables():
     os.environ["VLLM_ENGINE_ITERATION_TIMEOUT_S"] = "1200"
     os.environ["VLLM_SAMPLED_TOKEN_ID_BUFFER_SIZE"] = "10"
     os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-    os.environ["LMCACHE_ENABLE_ASYNC_LOADING"] = "False"
+    os.environ["LMCACHE_ENABLE_ASYNC_LOADING"] = "True"
     os.environ["LMCACHE_USE_EXPERIMENTAL"] = "True"
     os.environ["LMCACHE_CHUNK_SIZE"] = "512"
     os.environ["LMCACHE_LOCAL_CPU"] = "True"
     os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "100"
 
     os.makedirs(f"{LM_CACHE_DISK_PATH}", exist_ok=True)
-    # os.environ["LMCACHE_LOCAL_DISK"] = f"file://{LM_CACHE_DISK_PATH}"
+    os.environ["LMCACHE_LOCAL_DISK"] = f"file://{LM_CACHE_DISK_PATH}"
     os.environ["LMCACHE_INTERNAL_API_SERVER_ENABLED"] = "True"
-    # os.environ["LMCACHE_MAX_LOCAL_DISK_SIZE"] = "450"
+    os.environ["LMCACHE_MAX_LOCAL_DISK_SIZE"] = "450"
     os.environ["DYN_KVBM_DISABLE_DISK_OFFLOAD_FILTER"] = "False"
     os.environ["PROMETHEUS_MULTIPROC_DIR"] = os.environ.get(
         "PROMETHEUS_MULTIPROC_DIR",
@@ -243,6 +243,15 @@ def parse_arguments():
     )
     parser.add_argument("--questions_json", type=str)
     parser.add_argument("--max_questions", type=int, default=None)
+    parser.add_argument(
+        "--submission_batch_size",
+        type=int,
+        default=8,
+        help=(
+            "Number of prompts passed to each blocking llm.generate() call. "
+            "Use 8 with max_num_seqs=4 for bounded async lookahead."
+        ),
+    )
 
     parser.add_argument(
         "--gnn_ckpt",
@@ -325,6 +334,70 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
     finally:
         LMCacheEngineBuilder.destroy(ENGINE_NAME)
 
+def generate_in_submission_batches(
+    llm,
+    llm_inputs,
+    sampling_params,
+    submission_batch_size: int,
+    phase_name: str,
+):
+    """
+    Submit only a bounded wave of requests to vLLM at once.
+
+    llm.generate() is blocking, so the next wave is submitted only after
+    every request in the current wave has completed.
+    """
+    if submission_batch_size <= 0:
+        raise ValueError(
+            "submission_batch_size must be greater than zero, "
+            f"got {submission_batch_size}"
+        )
+
+    total_requests = len(llm_inputs)
+    all_outputs = []
+
+    for start_idx in range(0, total_requests, submission_batch_size):
+        end_idx = min(start_idx + submission_batch_size, total_requests)
+        batch_inputs = llm_inputs[start_idx:end_idx]
+
+        batch_number = start_idx // submission_batch_size + 1
+        total_batches = (
+            total_requests + submission_batch_size - 1
+        ) // submission_batch_size
+
+        print(
+            f"[{phase_name}] Submitting batch "
+            f"{batch_number}/{total_batches}: "
+            f"requests {start_idx}:{end_idx} "
+            f"({len(batch_inputs)} requests)",
+            flush=True,
+        )
+
+        batch_start = time.time()
+
+        batch_outputs = llm.generate(
+            batch_inputs,
+            sampling_params,
+        )
+
+        batch_elapsed = time.time() - batch_start
+
+        print(
+            f"[{phase_name}] Finished batch "
+            f"{batch_number}/{total_batches} in "
+            f"{batch_elapsed:.2f} seconds",
+            flush=True,
+        )
+
+        all_outputs.extend(batch_outputs)
+
+    if len(all_outputs) != total_requests:
+        raise RuntimeError(
+            "Generated output count does not match input count: "
+            f"{len(all_outputs)} outputs for {total_requests} inputs"
+        )
+
+    return all_outputs
 
 def build_prompt_text(passages, question):
     parts = [p for p in passages if p]
@@ -667,19 +740,50 @@ def main():
 
     with build_llm_with_lmcache(lmcache_connector, args.llm_model) as llm:
         # kv_reset()
-        
-        print(f"Cold run starting...")
-        start = time.time()
-        outputs = llm.generate(llm_inputs, sampling_params)
-        time_taken = time.time() - start
-        print(f"first generation took {time_taken:.2f} seconds.")
-        
-        print(f"Warm run starting...")
-        start = time.time()
-        outputs = llm.generate(llm_inputs, sampling_params)
-        time_taken = time.time() - start
-        print(f"Second generation took {time_taken:.2f} seconds.")
 
+        print(
+            "Bounded submission configuration: "
+            f"total_requests={len(llm_inputs)}, "
+            f"submission_batch_size={args.submission_batch_size}",
+            flush=True,
+        )
+
+        print("Cold run starting...", flush=True)
+        cold_start = time.time()
+
+        cold_outputs = generate_in_submission_batches(
+            llm=llm,
+            llm_inputs=llm_inputs,
+            sampling_params=sampling_params,
+            submission_batch_size=args.submission_batch_size,
+            phase_name="cold",
+        )
+
+        cold_time_taken = time.time() - cold_start
+        print(
+            f"first generation took {cold_time_taken:.2f} seconds.",
+            flush=True,
+        )
+
+        print("Warm run starting...", flush=True)
+        warm_start = time.time()
+
+        warm_outputs = generate_in_submission_batches(
+            llm=llm,
+            llm_inputs=llm_inputs,
+            sampling_params=sampling_params,
+            submission_batch_size=args.submission_batch_size,
+            phase_name="warm",
+        )
+
+        warm_time_taken = time.time() - warm_start
+        print(
+            f"Second generation took {warm_time_taken:.2f} seconds.",
+            flush=True,
+        )
+
+        outputs = warm_outputs
+        # start = warm_start
 
         # save_kv_monitor_results(args.dataset_name, start)
 
