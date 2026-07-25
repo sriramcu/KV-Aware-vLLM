@@ -173,14 +173,23 @@ def setup_environment_variables():
     def write_lmcache_config(path: str):
         import textwrap
 
+        # config = textwrap.dedent(f"""
+        # chunk_size: 512
+        # local_cpu: true
+        # max_local_cpu_size: 100.0
+        # local_disk: "file://{LM_CACHE_DISK_PATH}"
+        # max_local_disk_size: 450.0
+        # enable_kv_events: true
+        # pre_caching_hash_algorithm: builtin
+        # enable_async_loading: false
+        # """).strip()
         config = textwrap.dedent(f"""
         chunk_size: 512
         local_cpu: true
         max_local_cpu_size: 100.0
-        local_disk: "file://{LM_CACHE_DISK_PATH}"
-        max_local_disk_size: 450.0
         enable_kv_events: true
         pre_caching_hash_algorithm: builtin
+        enable_async_loading: false
         """).strip()
         Path(path).write_text(config + "\n", encoding="utf-8")
 
@@ -203,16 +212,16 @@ def setup_environment_variables():
     os.environ["VLLM_ENGINE_ITERATION_TIMEOUT_S"] = "1200"
     os.environ["VLLM_SAMPLED_TOKEN_ID_BUFFER_SIZE"] = "10"
     os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-    os.environ["LMCACHE_ENABLE_ASYNC_LOADING"] = "True"
+    os.environ["LMCACHE_ENABLE_ASYNC_LOADING"] = "False"
     os.environ["LMCACHE_USE_EXPERIMENTAL"] = "True"
     os.environ["LMCACHE_CHUNK_SIZE"] = "512"
     os.environ["LMCACHE_LOCAL_CPU"] = "True"
     os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "100"
 
     os.makedirs(f"{LM_CACHE_DISK_PATH}", exist_ok=True)
-    os.environ["LMCACHE_LOCAL_DISK"] = f"file://{LM_CACHE_DISK_PATH}"
+    # os.environ["LMCACHE_LOCAL_DISK"] = f"file://{LM_CACHE_DISK_PATH}"
     os.environ["LMCACHE_INTERNAL_API_SERVER_ENABLED"] = "True"
-    os.environ["LMCACHE_MAX_LOCAL_DISK_SIZE"] = "450"
+    # os.environ["LMCACHE_MAX_LOCAL_DISK_SIZE"] = "450"
     os.environ["DYN_KVBM_DISABLE_DISK_OFFLOAD_FILTER"] = "False"
     os.environ["PROMETHEUS_MULTIPROC_DIR"] = os.environ.get(
         "PROMETHEUS_MULTIPROC_DIR",
@@ -291,7 +300,7 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
         max_model_len=8000,
         gpu_memory_utilization=0.65,
         dtype="bfloat16",
-        max_num_seqs=16,
+        max_num_seqs=4,
         tensor_parallel_size=2,
         enforce_eager=False,
         enable_chunked_prefill=True,
