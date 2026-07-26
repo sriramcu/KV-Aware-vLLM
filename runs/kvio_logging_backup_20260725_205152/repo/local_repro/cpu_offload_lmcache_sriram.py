@@ -307,10 +307,10 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
         kv_transfer_config=ktc,
         kv_events_config=kv_events_config,
         max_model_len=8000,
-        gpu_memory_utilization=float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.65")),
+        gpu_memory_utilization=0.65,
         dtype="bfloat16",
         max_num_seqs=4,
-        tensor_parallel_size=int(os.environ.get("VLLM_TENSOR_PARALLEL_SIZE", "2")),
+        tensor_parallel_size=2,
         enforce_eager=False,
         enable_chunked_prefill=True,
         disable_log_stats=False,
@@ -333,24 +333,6 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
         yield llm
     finally:
         LMCacheEngineBuilder.destroy(ENGINE_NAME)
-
-def _kvio_trace_enabled() -> bool:
-    return os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1"
-
-
-def _kvio_proc_io_snapshot() -> dict[str, int]:
-    values: dict[str, int] = {}
-    if not _kvio_trace_enabled():
-        return values
-    try:
-        with open("/proc/self/io", "r", encoding="utf-8") as f:
-            for line in f:
-                key, value = line.split(":", 1)
-                values[key.strip()] = int(value.strip())
-    except Exception as exc:
-        print(f"[KVIO_DRIVER_PROC_IO_ERROR] error={exc!r}", flush=True)
-    return values
-
 
 def generate_in_submission_batches(
     llm,
@@ -382,7 +364,17 @@ def generate_in_submission_batches(
         total_batches = (
             total_requests + submission_batch_size - 1
         ) // submission_batch_size
+        batch_trace_id = f"{phase_name}-{batch_number}-{time.monotonic_ns()}"
 
+        print(
+            "[KVIO_DRIVER_BATCH_START] "
+            f"batch_trace_id={batch_trace_id} "
+            f"phase={phase_name} "
+            f"batch={batch_number}/{total_batches} "
+            f"start_idx={start_idx} end_idx={end_idx} "
+            f"mono={time.monotonic():.6f}",
+            flush=True,
+        )
         print(
             f"[{phase_name}] Submitting batch "
             f"{batch_number}/{total_batches}: "
@@ -392,40 +384,26 @@ def generate_in_submission_batches(
         )
 
         batch_start = time.time()
-        batch_start_mono = time.monotonic()
-        batch_io_before = _kvio_proc_io_snapshot()
-        if _kvio_trace_enabled():
-            print(
-                "[KVIO_DRIVER_BATCH_START] "
-                f"phase={phase_name} batch={batch_number}/{total_batches} "
-                f"requests={start_idx}:{end_idx} wall={batch_start:.6f} "
-                f"mono={batch_start_mono:.6f} proc_io={batch_io_before}",
-                flush=True,
-            )
 
         batch_outputs = llm.generate(
             batch_inputs,
             sampling_params,
         )
 
-        batch_end = time.time()
-        batch_end_mono = time.monotonic()
-        batch_elapsed = batch_end - batch_start
-        batch_io_after = _kvio_proc_io_snapshot()
-        if _kvio_trace_enabled():
-            io_delta = {
-                key: batch_io_after.get(key, 0) - batch_io_before.get(key, 0)
-                for key in set(batch_io_before) | set(batch_io_after)
-            }
-            print(
-                "[KVIO_DRIVER_BATCH_DONE] "
-                f"phase={phase_name} batch={batch_number}/{total_batches} "
-                f"requests={start_idx}:{end_idx} wall={batch_end:.6f} "
-                f"mono={batch_end_mono:.6f} elapsed={batch_end_mono - batch_start_mono:.6f} "
-                f"proc_io_delta={io_delta}",
-                flush=True,
-            )
-
+        batch_elapsed = time.time() - batch_start
+        print(
+            "[KVIO_DRIVER_BATCH_DONE] "
+            f"batch_trace_id={batch_trace_id} "
+            f"phase={phase_name} "
+            f"batch={batch_number}/{total_batches} "
+            f"start_idx={start_idx} "
+            f"end_idx={end_idx} "
+            f"num_requests={len(batch_inputs)} "
+            f"elapsed={batch_elapsed:.6f} "
+            f"mono={time.monotonic():.6f} "
+            f"wall={time.time():.6f}",
+            flush=True,
+        )
         print(
             f"[{phase_name}] Finished batch "
             f"{batch_number}/{total_batches} in "
@@ -808,22 +786,8 @@ def main():
             f"first generation took {cold_time_taken:.2f} seconds.",
             flush=True,
         )
-        if _kvio_trace_enabled():
-            print(
-                "[KVIO_PHASE_BOUNDARY] "
-                f"phase=cold_done wall={time.time():.6f} "
-                f"mono={time.monotonic():.6f} proc_io={_kvio_proc_io_snapshot()}",
-                flush=True,
-            )
 
         print("Warm run starting...", flush=True)
-        if _kvio_trace_enabled():
-            print(
-                "[KVIO_PHASE_BOUNDARY] "
-                f"phase=warm_start wall={time.time():.6f} "
-                f"mono={time.monotonic():.6f} proc_io={_kvio_proc_io_snapshot()}",
-                flush=True,
-            )
         warm_start = time.time()
 
         warm_outputs = generate_in_submission_batches(
