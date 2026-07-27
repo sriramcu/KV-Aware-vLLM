@@ -1,0 +1,5 @@
+upstream_tag=v0.4.6
+upstream_commit=a7f22be7505fafdb154e5a0400a285aa29545f00
+preserved_commit=94936ffb2b78480acfa4af67f0b0e652adb19e91
+branch=kvaware-preserve-venv-changes
+patch_sha256=f97a3cecc641beb5cbe396cc27d809409eb17171df624eed0dbe0fb31adea2dd

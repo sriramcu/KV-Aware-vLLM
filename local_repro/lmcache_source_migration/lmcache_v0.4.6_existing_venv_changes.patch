@@ -1,0 +1,2444 @@
+diff --git a/lmcache/integration/vllm/vllm_v1_adapter.py b/lmcache/integration/vllm/vllm_v1_adapter.py
+index 27c29c8d089069ed63b2f3f7ca6a761b4c691ea7..ee67eb74c7dd2100ab454bcbc0d7a6686044a1e1 100644
+--- a/lmcache/integration/vllm/vllm_v1_adapter.py
++++ b/lmcache/integration/vllm/vllm_v1_adapter.py
+@@ -3,6 +3,7 @@
+ from collections.abc import Iterable
+ from dataclasses import dataclass, field
+ from typing import TYPE_CHECKING, Any, Generator, Optional, Union
++import json
+ import math
+ import os
+ 
+@@ -58,7 +59,43 @@ if TYPE_CHECKING:
+ 
+ logger = init_logger(__name__)
+ 
++# ===== SRIRAM REQ LOOP DEBUG START =====
++import os as _sr_os
++import time as _sr_time
++import traceback as _sr_traceback
++import builtins as _sr_builtins
++from collections import defaultdict as _sr_defaultdict
++
++if not hasattr(_sr_builtins, "_SR_REQ_SEEN"):
++    _sr_builtins._SR_REQ_SEEN = _sr_defaultdict(lambda: {"count": 0, "last": 0.0})
++
++
++def _sr_req_loop_debug(req_id, total_tokens=None, computed=None, hit=None, need=None, extra=""):
++    try:
++        now = _sr_time.time()
++        table = _sr_builtins._SR_REQ_SEEN
++        s = table[str(req_id)]
++        s["count"] += 1
++        dt = now - s["last"] if s["last"] else 0.0
++        s["last"] = now
++
++        print(
++            f"[SRIRAM_REQDBG] pid={_sr_os.getpid()} req_id={req_id} "
++            f"count={s['count']} dt={dt:.3f} "
++            f"total={total_tokens} computed={computed} hit={hit} need={need} "
++            f"extra={extra}",
++            flush=True,
++        )
+ 
++        if s["count"] in (2, 5, 10, 20, 50, 100):
++            print(
++                "[SRIRAM_REQDBG_STACK]\n"
++                + "".join(_sr_traceback.format_stack(limit=18)),
++                flush=True,
++            )
++    except Exception as e:
++        print(f"[SRIRAM_REQDBG_ERROR] {e!r}", flush=True)
++# ===== SRIRAM REQ LOOP DEBUG END =====
+ @dataclass
+ class LoadSpec:
+     # Number of tokens cached in vLLM
+@@ -490,6 +527,12 @@ class LMCacheConnectorV1Impl:
+             VLLM_VERSION,
+             getattr(self.lmcache_engine, "metadata", None),
+         )
++        logger.warning(
++            "[SC] ACTIVE PATCHED ADAPTER file=%s gnn_enabled=%s tiers_file=%s",
++            __file__,
++            os.environ.get("VLLM_KV_IMPORTANCE_ENABLE"),
++            os.environ.get("VLLM_KV_IMPORTANCE_TIERS"),
++        )
+ 
+     def _apply_extra_config(
+         self, config: LMCacheEngineConfig, vllm_config: "VllmConfig"
+@@ -574,6 +617,132 @@ class LMCacheConnectorV1Impl:
+         self._requests_priority: dict[str, int] = {}
+         self._invalid_block_ids: set[int] = set()
+ 
++    def _load_kv_importance_tiers(self) -> dict:
++        """Load the per-request GNN tier sidecar."""
++        if os.environ.get("VLLM_KV_IMPORTANCE_ENABLE", "0") != "1":
++            return {}
++
++        path = os.environ.get("VLLM_KV_IMPORTANCE_TIERS")
++        if not path:
++            logger.warning("[SC] VLLM_KV_IMPORTANCE_TIERS is not set")
++            return {}
++
++        try:
++            with open(path, "r", encoding="utf-8") as file:
++                data = json.load(file)
++
++            if not isinstance(data, dict):
++                logger.warning(
++                    "[SC] Importance sidecar is not a dictionary: %s",
++                    path,
++                )
++                return {}
++
++            logger.warning(
++                "[SC] Loaded importance tiers path=%s requests=%d",
++                path,
++                len(data),
++            )
++            return data
++        except Exception as error:
++            logger.warning(
++                "[SC] Failed to load importance tiers from %s: %s",
++                path,
++                error,
++            )
++            return {}
++
++    def _get_request_block_tiers(self, req_id: str) -> dict[int, str]:
++        """Match a vLLM runtime request ID to the sidecar request ID."""
++        if not hasattr(self, "_kv_importance_tiers"):
++            self._kv_importance_tiers = self._load_kv_importance_tiers()
++
++        full_req_id = str(req_id)
++        candidate_ids = [full_req_id]
++        if "-" in full_req_id:
++            candidate_ids.append(full_req_id.split("-", 1)[0])
++
++        tiers = {}
++        matched_key = None
++        for candidate_id in candidate_ids:
++            candidate_tiers = self._kv_importance_tiers.get(candidate_id)
++            if candidate_tiers is not None:
++                tiers = candidate_tiers
++                matched_key = candidate_id
++                break
++
++        logger.warning(
++            "[SC] tier lookup req_id=%s matched_key=%s blocks=%d",
++            full_req_id,
++            matched_key,
++            len(tiers),
++        )
++
++        output: dict[int, str] = {}
++        for block_index, value in tiers.items():
++            if isinstance(value, dict):
++                tier = value.get("tier", "cpu")
++            else:
++                tier = value
++            output[int(block_index)] = str(tier).lower()
++
++        return output
++
++    def _tier_to_lmcache_location(self, tier: str) -> str:
++        """Translate a GNN tier into an LMCache storage backend."""
++        if str(tier).lower() == "disk":
++            return "LocalDiskBackend"
++
++        # LMCache has no separate GPU storage backend here. Both GNN
++        # "gpu" and "cpu" map to the fast LocalCPUBackend.
++        return "LocalCPUBackend"
++
++    def _get_target_tiers_for_request(
++        self,
++        req_id: str,
++        num_tokens: int,
++        store_mask: torch.Tensor,
++        chunk_size: int,
++    ):
++        """Choose one LMCache destination for each LMCache chunk."""
++        block_tiers = self._get_request_block_tiers(req_id)
++        if not block_tiers:
++            logger.warning("[SC] No block tiers found for request %s", req_id)
++            return None
++
++        gnn_block_size = int(os.environ.get("GNN_KV_BLOCK_SIZE", "16"))
++        first_stored_token = int((~store_mask).sum().item())
++        target_locations = []
++
++        for chunk_start in range(first_stored_token, num_tokens, chunk_size):
++            chunk_end = min(chunk_start + chunk_size, num_tokens)
++            first_block = chunk_start // gnn_block_size
++            last_block = (chunk_end - 1) // gnn_block_size
++
++            chunk_block_tiers = [
++                block_tiers.get(block_index, "cpu")
++                for block_index in range(first_block, last_block + 1)
++            ]
++
++            if "gpu" in chunk_block_tiers:
++                target_tier = "gpu"
++            elif "cpu" in chunk_block_tiers:
++                target_tier = "cpu"
++            else:
++                target_tier = "disk"
++
++            target_locations.append(
++                self._tier_to_lmcache_location(target_tier)
++            )
++
++        logger.warning(
++            "[SC] req_id=%s target_tiers_count=%d sample=%s",
++            req_id,
++            len(target_locations),
++            target_locations[:8],
++        )
++        return target_locations
++
+     def _check_legacy_register_kv_caches(self) -> None:
+         """Check for legacy connector without register_kv_caches implementation."""
+         if self.lmcache_engine is None:
+@@ -954,6 +1123,7 @@ class LMCacheConnectorV1Impl:
+         Args:
+             layer_name: the name of that layer
+         """
++        # logger.info("Using venv vllm v1 adapter")
+         if self.layerwise_retrievers:
+             logger.debug(f"Waiting for layer {self.current_layer} to be loaded")
+ 
+@@ -1172,6 +1342,13 @@ class LMCacheConnectorV1Impl:
+                     store_mask = store_mask[:aligned_token_len]
+                     slot_mapping = slot_mapping[:aligned_token_len]
+ 
++            target_tiers = self._get_target_tiers_for_request(
++                request.req_id,
++                len(token_ids),
++                store_mask,
++                self._lmcache_chunk_size,
++            )
++
+             # Probe decoder cache before store
+             if bidir_enabled and request.disagg_spec is not None:
+                 try:
+@@ -1192,6 +1369,7 @@ class LMCacheConnectorV1Impl:
+                 transfer_spec=request.disagg_spec,
+                 request_configs=request.request_configs,
+                 req_id=request.req_id,
++                target_tiers=target_tiers,
+             )
+ 
+             # Probe decoder cache after store
+@@ -1427,6 +1605,14 @@ class LMCacheConnectorV1Impl:
+                 min_retrieve,
+             )
+         else:
++            _sr_req_loop_debug(
++                req_id,
++                total_tokens=request.num_tokens,
++                computed=num_computed_tokens,
++                hit=num_external_hit_tokens,
++                need=max(need_to_allocate, 0),
++                extra="before/after get_num_new_matched_tokens",
++            )
+             logger.info(
+                 "Reqid: %s, Total tokens %d, Inference Engine computed tokens: %d, "
+                 "LMCache hit tokens: %d, need to load: %d",
+diff --git a/lmcache/v1/cache_engine.py b/lmcache/v1/cache_engine.py
+index b684a4ee9123c50e763e4e5fbb5d92dbd521f453..c6afab260492d21bef6f61c1b1e10e206794c357 100644
+--- a/lmcache/v1/cache_engine.py
++++ b/lmcache/v1/cache_engine.py
+@@ -22,6 +22,7 @@ if TYPE_CHECKING:
+ import asyncio
+ import gc
+ import multiprocessing
++import os
+ import time
+ 
+ # Third Party
+@@ -206,6 +207,9 @@ class LMCacheEngine:
+             lambda: defaultdict(list)
+         )
+ 
++        # SRIRAM DEBUG: lookup_id -> first pin/lookup timestamp.
++        self._sr_lookup_start_times: dict[str, float] = {}
++
+         InitializeUsageContext(config, metadata)
+         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
+         # Initialize PinMonitor singleton with config
+@@ -358,6 +362,74 @@ class LMCacheEngine:
+         if self.storage_manager is not None:
+             return self.storage_manager.is_hot_cache_enabled()
+         return False
++    def _put_with_optional_target_tiers(
++        self,
++        keys,
++        memory_objs,
++        transfer_spec=None,
++        target_tiers=None,
++    ):
++        """
++        Use per-chunk placement when target_tiers is supplied.
++
++        When target_tiers is absent, preserve normal LMCache behavior.
++        This keeps wo_gnn unchanged.
++        """
++        logger.info("Entered _put_with_optional_target_tiers")
++        assert self.storage_manager is not None
++
++        # wo_gnn: preserve normal replication across enabled backends.
++        if not target_tiers:
++            self.storage_manager.batched_put(
++                keys,
++                memory_objs,
++                transfer_spec=transfer_spec,
++                location=self.store_location,
++            )
++            logger.info("target_tiers = False inside _put_with_optional_target_tiers")
++            return
++
++        if len(target_tiers) < len(keys):
++            raise ValueError(
++                f"Received {len(target_tiers)} target tiers "
++                f"for {len(keys)} KV chunks"
++            )
++
++        groups = {}
++
++        for key, memory_obj, location in zip(
++            keys,
++            memory_objs,
++            target_tiers,
++            strict=False,
++        ):
++            group = groups.setdefault(
++                location,
++                {
++                    "keys": [],
++                    "memory_objs": [],
++                },
++            )
++
++            group["keys"].append(key)
++            group["memory_objs"].append(memory_obj)
++
++        logger.info(
++            "[KV placement] %s",
++            {
++                location: len(group["keys"])
++                for location, group in groups.items()
++            },
++        )
++
++        for location, group in groups.items():
++            self.storage_manager.batched_put(
++                group["keys"],
++                group["memory_objs"],
++                transfer_spec=transfer_spec,
++                location=location,
++            )
++
+ 
+     @_lmcache_nvtx_annotate
+     @torch.inference_mode()
+@@ -537,11 +609,17 @@ class LMCacheEngine:
+             transfer_spec = kwargs.get("transfer_spec", None)
+             # TODO: we implicitly rely on batched_put to call ref_count_down
+             # this management should be done in a cleaner way
+-            self.storage_manager.batched_put(
++            # self.storage_manager.batched_put(
++            #     keys,
++            #     memory_objs,
++            #     transfer_spec=transfer_spec,
++            #     location=self.store_location,
++            # )
++            self._put_with_optional_target_tiers(
+                 keys,
+                 memory_objs,
+                 transfer_spec=transfer_spec,
+-                location=self.store_location,
++                target_tiers=kwargs.get("target_tiers"),
+             )
+ 
+         self.stats_monitor.on_store_finished(
+@@ -1103,6 +1181,12 @@ class LMCacheEngine:
+ 
+         assert self.storage_manager is not None
+ 
++        if pin and lookup_id is not None:
++            self._sr_lookup_start_times.setdefault(
++                lookup_id,
++                time.monotonic(),
++            )
++
+         if tokens is not None:
+             lookup_stats = self.stats_monitor.on_lookup_request(len(tokens))
+         else:
+@@ -1271,6 +1355,12 @@ class LMCacheEngine:
+         """
+         assert self.storage_manager is not None
+ 
++        if pin:
++            self._sr_lookup_start_times.setdefault(
++                lookup_id,
++                time.monotonic(),
++            )
++
+         keys: list[CacheEngineKey] = []
+         cum_chunk_lengths = [0]
+ 
+@@ -1297,7 +1387,8 @@ class LMCacheEngine:
+                 keys.append(key)
+             cum_chunk_lengths.append(end)
+ 
+-        asyncio.run_coroutine_threadsafe(
++        kvio_submitted_at = time.monotonic()
++        kvio_future = asyncio.run_coroutine_threadsafe(
+             self.storage_manager.async_lookup_and_prefetch(
+                 lookup_id,
+                 keys,
+@@ -1309,6 +1400,43 @@ class LMCacheEngine:
+             self.storage_manager.loop,
+         )
+ 
++        if os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
++            logger.warning(
++                "[KVIO_ENGINE_SUBMIT] lookup_id=%s keys=%d chunks=%d "
++                "keys_per_chunk=%d pin=%s search_range=%s mono=%.6f",
++                lookup_id,
++                len(keys),
++                len(keys) // keys_per_chunk,
++                keys_per_chunk,
++                pin,
++                search_range,
++                kvio_submitted_at,
++            )
++
++            def _kvio_engine_done(done_future):
++                elapsed = time.monotonic() - kvio_submitted_at
++                try:
++                    exc = done_future.exception()
++                except Exception as callback_exc:
++                    logger.warning(
++                        "[KVIO_ENGINE_FUTURE_INSPECT_ERROR] "
++                        "lookup_id=%s elapsed=%.6f error=%r",
++                        lookup_id,
++                        elapsed,
++                        callback_exc,
++                    )
++                    return
++                logger.warning(
++                    "[KVIO_ENGINE_FUTURE_DONE] lookup_id=%s elapsed=%.6f "
++                    "cancelled=%s exception=%r",
++                    lookup_id,
++                    elapsed,
++                    done_future.cancelled(),
++                    exc,
++                )
++
++            kvio_future.add_done_callback(_kvio_engine_done)
++
+     def cleanup_memory_objs(self, lookup_id: str) -> None:
+         """
+         Cleanup memory objects allocated during prefetch for an aborted lookup.
+@@ -1317,14 +1445,31 @@ class LMCacheEngine:
+         has finished its prefetch tasks.
+         """
+         try:
++            cleanup_started = time.monotonic()
++            event_status = self.event_manager.get_event_status(
++                EventType.LOADING, lookup_id
++            )
++            if os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
++                logger.warning(
++                    "[KVIO_ENGINE_CLEANUP_ENTER] lookup_id=%s "
++                    "event_status=%s",
++                    lookup_id,
++                    event_status,
++                )
++
+             # Get the completed future from event_manager
+-            if (
+-                self.event_manager.get_event_status(EventType.LOADING, lookup_id)
+-                != EventStatus.DONE
+-            ):
++            if event_status != EventStatus.DONE:
+                 logger.debug(
+                     "No completed event found for lookup_id=%s to clean up.", lookup_id
+                 )
++                if os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
++                    logger.warning(
++                        "[KVIO_ENGINE_CLEANUP_DEFER] lookup_id=%s "
++                        "event_status=%s elapsed=%.6f",
++                        lookup_id,
++                        event_status,
++                        time.monotonic() - cleanup_started,
++                    )
+                 return
+             future = self.event_manager.pop_event(EventType.LOADING, lookup_id)
+ 
+@@ -1332,6 +1477,14 @@ class LMCacheEngine:
+             memory_objs = future.result()
+             # Flatten nested lists (each backend returns a list of chunks)
+             memory_objs_flat = [mm for m in memory_objs for mm in m]
++            if os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
++                logger.warning(
++                    "[KVIO_ENGINE_CLEANUP_OBJECTS] lookup_id=%s "
++                    "tiers=%d objects=%d",
++                    lookup_id,
++                    len(memory_objs),
++                    len(memory_objs_flat),
++                )
+ 
+             # Release each memory object
+             for key, memory_obj in memory_objs_flat:
+@@ -1342,6 +1495,14 @@ class LMCacheEngine:
+                     memory_obj.ref_count_down()
+                 except Exception as e:
+                     logger.error(f"Error releasing memory object: {e}")
++            if os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
++                logger.warning(
++                    "[KVIO_ENGINE_CLEANUP_DONE] lookup_id=%s objects=%d "
++                    "elapsed=%.6f",
++                    lookup_id,
++                    len(memory_objs_flat),
++                    time.monotonic() - cleanup_started,
++                )
+         except Exception as e:
+             logger.error(
+                 f"Error during cleanup_memory_objs for lookup_id={lookup_id}: {e}"
+@@ -1470,9 +1631,35 @@ class LMCacheEngine:
+ 
+     @_lmcache_nvtx_annotate
+     def lookup_unpin(self, lookup_id: str) -> None:
++        started = self._sr_lookup_start_times.pop(lookup_id, None)
++        age = (
++            time.monotonic() - started
++            if started is not None
++            else -1.0
++        )
++        debug_enabled = os.environ.get("SRIRAM_KV_MEM_DEBUG", "0") == "1"
++
+         if lookup_id in self.lookup_pins:
+             assert self.storage_manager is not None
+-            for location, keys in self.lookup_pins.pop(lookup_id).items():
++            mapping = self.lookup_pins.pop(lookup_id)
++            location_counts = {
++                location: len(keys)
++                for location, keys in mapping.items()
++            }
++
++            if debug_enabled:
++                logger.warning(
++                    "[KVDBG_LOOKUP_UNPIN] "
++                    "pid=%d lookup_id=%s age=%.3fs "
++                    "branch=lookup_pins locations=%s total_keys=%d",
++                    os.getpid(),
++                    lookup_id,
++                    age,
++                    location_counts,
++                    sum(location_counts.values()),
++                )
++
++            for location, keys in mapping.items():
+                 self.storage_manager.batched_unpin(keys, [location])
+ 
+         elif (
+@@ -1480,8 +1667,32 @@ class LMCacheEngine:
+             and self.event_manager.get_event_status(EventType.LOADING, lookup_id)
+             != EventStatus.NOT_FOUND
+         ):
++            status = self.event_manager.get_event_status(
++                EventType.LOADING,
++                lookup_id,
++            )
++            if debug_enabled:
++                logger.warning(
++                    "[KVDBG_LOOKUP_UNPIN] "
++                    "pid=%d lookup_id=%s age=%.3fs "
++                    "branch=async_cleanup event_status=%s",
++                    os.getpid(),
++                    lookup_id,
++                    age,
++                    status,
++                )
+             self.cleanup_memory_objs(lookup_id)
+ 
++        elif debug_enabled:
++            logger.warning(
++                "[KVDBG_LOOKUP_UNPIN] "
++                "pid=%d lookup_id=%s age=%.3fs "
++                "branch=no_tracked_state",
++                os.getpid(),
++                lookup_id,
++                age,
++            )
++
+     @_lmcache_nvtx_annotate
+     def clear(
+         self,
+diff --git a/lmcache/v1/gpu_connector/gpu_connectors.py b/lmcache/v1/gpu_connector/gpu_connectors.py
+index d9d878971dc17b1df8b3c40c4c61d680cf598921..43a7496f2466ebdc79b857f0b18b643d5db8d379 100644
+--- a/lmcache/v1/gpu_connector/gpu_connectors.py
++++ b/lmcache/v1/gpu_connector/gpu_connectors.py
+@@ -278,7 +278,23 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
+         :raises AssertionError: If the memory object does not have a tensor.
+         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
+         """
+-        assert memory_obj.tensor is not None
++        if memory_obj.tensor is None:
++            try:
++                try:
++                    from lmcache.v1.memory_management import _sr_mem_snapshot
++                except Exception:
++                    _sr_mem_snapshot = None
++                    
++                if _sr_mem_snapshot is not None:
++                    _sr_mem_snapshot(
++                        "GPU_CONNECTOR_TENSOR_NONE_BEFORE_ASSERT",
++                        memory_obj,
++                        extra=f"start={start} end={end} kwargs={kwargs}",
++                        stack=True,
++                    )
++            except Exception as e:
++                print(f"[SRIRAM_GPUCONNECTOR_ASSERTDBG_ERROR] {e!r}", flush=True)
++            assert memory_obj.tensor is not None
+ 
+         self.initialize_kvcaches_ptr(**kwargs)
+ 
+diff --git a/lmcache/v1/lookup_client/lmcache_async_lookup_client.py b/lmcache/v1/lookup_client/lmcache_async_lookup_client.py
+index df9ca6a5296e5295029bcae558d805019e1c7740..aa0e73ef0abea3bc49cf5c1ffce7a9292d309f75 100644
+--- a/lmcache/v1/lookup_client/lmcache_async_lookup_client.py
++++ b/lmcache/v1/lookup_client/lmcache_async_lookup_client.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # Standard
+ from typing import Optional, Union
++import os
+ import threading
+ import time
+ 
+@@ -29,6 +30,10 @@ from lmcache.v1.rpc_utils import (
+ logger = init_logger(__name__)
+ 
+ 
++def _kvio_trace_enabled() -> bool:
++    return os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1"
++
++
+ # NOTE(Jiayi): Prefetch could load extra redundant cache if multiple
+ # workers has different hit tokens.
+ class LMCacheAsyncLookupClient(LookupClientInterface):
+@@ -54,6 +59,10 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
+         # lookup_id -> first lookup time
+         # this helps us support timeout semantics
+         self.first_lookup_time: dict[str, float] = {}
++        # Observability-only timestamps/counters. They do not participate in
++        # timeout, cleanup, or scheduling decisions.
++        self._kvio_lookup_start_mono: dict[str, float] = {}
++        self._kvio_poll_count: dict[str, int] = {}
+         self.config = config
+ 
+         self.ctx = get_zmq_context(use_asyncio=False)
+@@ -169,11 +178,28 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
+             if (req_status := self.reqs_status.get(lookup_id, -1)) == -1:
+                 self.reqs_status[lookup_id] = None
+                 self.first_lookup_time[lookup_id] = time.time()
++                self._kvio_lookup_start_mono.setdefault(lookup_id, time.monotonic())
++                self._kvio_poll_count[lookup_id] = 1
++                if _kvio_trace_enabled():
++                    logger.warning(
++                        "[KVIO_LOOKUP_STATUS_CREATE] lookup_id=%s "
++                        "mono=%.6f pending=%d aborted=%d",
++                        lookup_id,
++                        self._kvio_lookup_start_mono[lookup_id],
++                        sum(v is None for v in self.reqs_status.values()),
++                        len(self.aborted_lookups),
++                    )
+             elif req_status is None:
++                self._kvio_poll_count[lookup_id] = (
++                    self._kvio_poll_count.get(lookup_id, 0) + 1
++                )
+                 time.sleep(self.lookup_backoff_time)
+                 if (
+                     time.time() - self.first_lookup_time[lookup_id]
+                 ) * 1000 > self.config.lookup_timeout_ms:
++                    age = time.monotonic() - self._kvio_lookup_start_mono.get(
++                        lookup_id, time.monotonic()
++                    )
+                     logger.warning(
+                         (
+                             "Request %s is still waiting for async lookup "
+@@ -183,6 +209,19 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
+                         lookup_id,
+                         self.config.lookup_timeout_ms // 1000,
+                     )
++                    if _kvio_trace_enabled():
++                        logger.warning(
++                            "[KVIO_LOOKUP_TIMEOUT] lookup_id=%s age=%.6f "
++                            "polls=%d pending=%d aborted_before=%d "
++                            "partial_worker_responses=%d/%d",
++                            lookup_id,
++                            age,
++                            self._kvio_poll_count.get(lookup_id, 0),
++                            sum(v is None for v in self.reqs_status.values()),
++                            len(self.aborted_lookups),
++                            len(self.res_for_each_worker.get(lookup_id, [])),
++                            self.world_size,
++                        )
+                     self.cancel_lookup(lookup_id)
+                     self.first_lookup_time.pop(lookup_id, None)
+                     return 0
+@@ -215,6 +254,19 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
+         # Serialize message using msgspec
+         msg_buf = msgspec.msgpack.encode(msg)
+ 
++        self._kvio_lookup_start_mono.setdefault(lookup_id, time.monotonic())
++        if _kvio_trace_enabled():
++            logger.warning(
++                "[KVIO_LOOKUP_REQUEST_SEND] lookup_id=%s hashes=%d "
++                "offset_tokens=%d workers=%d msg_bytes=%d mono=%.6f",
++                lookup_id,
++                len(hashes),
++                sum(offsets),
++                self.world_size,
++                len(msg_buf),
++                self._kvio_lookup_start_mono[lookup_id],
++            )
++
+         for i in range(self.world_size):
+             self.push_sockets[i].send(msg_buf, copy=False)
+         time.sleep(self.lookup_backoff_time)
+@@ -236,6 +288,20 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
+                         self.res_for_each_worker[lookup_id].append(res)
+                     all_res = self.res_for_each_worker[lookup_id]
+ 
++                    if _kvio_trace_enabled():
++                        logger.warning(
++                            "[KVIO_LOOKUP_WORKER_RESPONSE] lookup_id=%s "
++                            "response_index=%d/%d tokens=%d age=%.6f aborted=%s",
++                            lookup_id,
++                            len(all_res),
++                            self.world_size,
++                            res,
++                            time.monotonic() - self._kvio_lookup_start_mono.get(
++                                lookup_id, time.monotonic()
++                            ),
++                            lookup_id in self.aborted_lookups,
++                        )
++
+                     if len(all_res) == self.world_size:
+                         self.res_for_each_worker.pop(lookup_id)
+ 
+@@ -244,17 +310,56 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
+                         # can use the minimum value as the number of
+                         # hit tokens.
+                         self.reqs_status[lookup_id] = min(all_res)
++                        if _kvio_trace_enabled():
++                            logger.warning(
++                                "[KVIO_LOOKUP_ALL_RESPONSES] lookup_id=%s "
++                                "worker_tokens=%s min_tokens=%d age=%.6f "
++                                "aborted=%s",
++                                lookup_id,
++                                all_res,
++                                min(all_res),
++                                time.monotonic()
++                                - self._kvio_lookup_start_mono.get(
++                                    lookup_id, time.monotonic()
++                                ),
++                                lookup_id in self.aborted_lookups,
++                            )
+ 
+             except Exception as e:
+                 logger.error("Error processing response from worker: %s", e)
+ 
+     def clear_lookup_status(self, lookup_id: str) -> None:
+         with self.lock:
++            if _kvio_trace_enabled():
++                logger.warning(
++                    "[KVIO_LOOKUP_STATUS_CLEAR] lookup_id=%s age=%.6f "
++                    "status=%s aborted=%s",
++                    lookup_id,
++                    time.monotonic()
++                    - self._kvio_lookup_start_mono.get(
++                        lookup_id, time.monotonic()
++                    ),
++                    self.reqs_status.get(lookup_id),
++                    lookup_id in self.aborted_lookups,
++                )
+             self.reqs_status.pop(lookup_id, None)
+             self.first_lookup_time.pop(lookup_id, None)
++            self._kvio_lookup_start_mono.pop(lookup_id, None)
++            self._kvio_poll_count.pop(lookup_id, None)
+ 
+     def cancel_lookup(self, lookup_id: str) -> None:
+         """Mark lookup as aborted. Cleanup will happen after task finishes."""
++        if _kvio_trace_enabled():
++            logger.warning(
++                "[KVIO_LOOKUP_MARK_ABORTED] lookup_id=%s age=%.6f "
++                "aborted_before=%d",
++                lookup_id,
++                time.monotonic()
++                - self._kvio_lookup_start_mono.get(
++                    lookup_id, time.monotonic()
++                ),
++                len(self.aborted_lookups),
++            )
+         self.aborted_lookups.add(lookup_id)
+ 
+     def _cleanup_finished_aborted_lookups(self) -> None:
+@@ -267,6 +372,13 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
+             if self.reqs_status.get(lookup_id) is not None
+         ]
+         if finished_lookups:
++            if _kvio_trace_enabled():
++                logger.warning(
++                    "[KVIO_LOOKUP_CLEANUP_READY] lookup_ids=%s "
++                    "remaining_aborted_before=%d",
++                    finished_lookups,
++                    len(self.aborted_lookups),
++                )
+             self.aborted_lookups.difference_update(finished_lookups)
+ 
+         # Tell the server to free the reserved memory buffers for each aborted lookup.
+@@ -282,6 +394,16 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
+         for i in range(self.world_size):
+             self.push_sockets[i].send(msg_buf, copy=False)
+         logger.debug("Sent cleanup message for lookup_id=%s", lookup_id)
++        if _kvio_trace_enabled():
++            logger.warning(
++                "[KVIO_LOOKUP_CLEANUP_SEND] lookup_id=%s workers=%d age=%.6f",
++                lookup_id,
++                self.world_size,
++                time.monotonic()
++                - self._kvio_lookup_start_mono.get(
++                    lookup_id, time.monotonic()
++                ),
++            )
+ 
+     def supports_producer_reuse(self) -> bool:
+         """Return True as LMCacheLookupClient supports producer kvcache reuse"""
+diff --git a/lmcache/v1/memory_management.py b/lmcache/v1/memory_management.py
+index eba1c73700874abf76d7868974a6324dedf9182c..82b607174de7d699f566c76f4cb38a29a0ee05eb 100644
+--- a/lmcache/v1/memory_management.py
++++ b/lmcache/v1/memory_management.py
+@@ -27,6 +27,134 @@ import lmcache.c_ops as lmc_ops
+ 
+ logger = init_logger(__name__)
+ 
++# ===== SRIRAM DEBUG START =====
++import os as _sr_os
++import time as _sr_time
++import traceback as _sr_traceback
++import subprocess as _sr_subprocess
++import shutil as _sr_shutil
++import resource as _sr_resource
++
++
++def _sr_read_file(path):
++    try:
++        with open(path, "r") as f:
++            return f.read().strip()
++    except Exception:
++        return "NA"
++
++
++def _sr_proc_mem():
++    status = {}
++    try:
++        with open("/proc/self/status", "r") as f:
++            for line in f:
++                if line.startswith(("VmRSS:", "VmHWM:", "VmSize:", "Threads:")):
++                    k, v = line.split(":", 1)
++                    status[k] = v.strip()
++    except Exception as e:
++        status["proc_status_error"] = repr(e)
++    return status
++
++
++def _sr_cgroup_mem():
++    candidates = [
++        "/sys/fs/cgroup/memory.current",
++        "/sys/fs/cgroup/memory.max",
++        "/sys/fs/cgroup/memory/memory.usage_in_bytes",
++        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
++    ]
++    return {p: _sr_read_file(p) for p in candidates if _sr_os.path.exists(p)}
++
++
++def _sr_disk(path):
++    try:
++        u = _sr_shutil.disk_usage(path)
++        return f"{path}: used={u.used/1024**3:.1f}G free={u.free/1024**3:.1f}G total={u.total/1024**3:.1f}G"
++    except Exception as e:
++        return f"{path}: disk_error={e!r}"
++
++
++def _sr_gpu_mem():
++    parts = []
++    try:
++        import torch
++        if torch.cuda.is_available():
++            dev = torch.cuda.current_device()
++            parts.append(
++                f"torch_cuda dev={dev} "
++                f"alloc={torch.cuda.memory_allocated(dev)/1024**3:.2f}G "
++                f"reserved={torch.cuda.memory_reserved(dev)/1024**3:.2f}G "
++                f"max_alloc={torch.cuda.max_memory_allocated(dev)/1024**3:.2f}G"
++            )
++        else:
++            parts.append("torch_cuda unavailable")
++    except Exception as e:
++        parts.append(f"torch_cuda_error={e!r}")
++
++    try:
++        out = _sr_subprocess.check_output(
++            [
++                "nvidia-smi",
++                "--query-gpu=index,memory.used,memory.free,memory.total,utilization.gpu",
++                "--format=csv,noheader,nounits",
++            ],
++            stderr=_sr_subprocess.STDOUT,
++            timeout=3,
++            text=True,
++        )
++        parts.append("nvidia_smi=[" + " | ".join(x.strip() for x in out.splitlines()) + "]")
++    except Exception as e:
++        parts.append(f"nvidia_smi_error={e!r}")
++
++    return " ".join(parts)
++
++
++def _sr_obj_summary(obj):
++    vals = []
++    for name in (
++        "ref_count",
++        "pin_count",
++        "addr",
++        "address",
++        "shape",
++        "dtype",
++        "device",
++        "size",
++        "metadata",
++    ):
++        try:
++            if hasattr(obj, name):
++                vals.append(f"{name}={getattr(obj, name)!r}")
++        except Exception as e:
++            vals.append(f"{name}=ERR:{e!r}")
++    return " ".join(vals)
++
++
++def _sr_mem_snapshot(tag, obj=None, extra="", stack=False):
++    try:
++        pid = _sr_os.getpid()
++        host = _sr_proc_mem()
++        cg = _sr_cgroup_mem()
++        ru = _sr_resource.getrusage(_sr_resource.RUSAGE_SELF).ru_maxrss
++        msg = (
++            f"[SRIRAM_MEMDBG] {tag} "
++            f"t={_sr_time.time():.3f} pid={pid} "
++            f"host={host} ru_maxrss_kb={ru} cgroup={cg} "
++            f"tmp={_sr_disk('/tmp')} shm={_sr_disk('/dev/shm')} "
++            f"lmcache_disk={_sr_disk(_sr_os.environ.get('SRIRAM_LMCACHE_DIR', '/tmp'))} "
++            f"gpu={_sr_gpu_mem()} "
++            f"obj_id={id(obj) if obj is not None else None} "
++            f"obj={_sr_obj_summary(obj) if obj is not None else ''} "
++            # f"extra={extra}"
++        )
++        print(msg, flush=True)
++        if stack:
++            print("[SRIRAM_MEMDBG_STACK]\n" + "".join(_sr_traceback.format_stack(limit=12)), flush=True)
++    except Exception as e:
++        print(f"[SRIRAM_MEMDBG_ERROR] tag={tag} err={e!r}", flush=True)
++# ===== SRIRAM DEBUG END =====
++
+ 
+ # Helper functions for thread safety
+ def synchronized(lock_attr_name):
+@@ -581,6 +709,10 @@ class TensorMemoryObj(MemoryObj):
+         self.valid = True
+         self.lock = threading.Lock()
+         self.parent_allocator = parent_allocator
++
++        # SRIRAM DEBUG: lifetime of the outermost pin and ref_count > 1 state.
++        self._sr_pin_started: Optional[float] = None
++        self._sr_ref_gt1_started: Optional[float] = None
+         # Calculate the prefix sum of the group sizes
+         # If there are two groups, the prefix sum will be
+         # [0, size_of_group_1, size_of_group_1 + size_of_group_2]
+@@ -646,11 +778,42 @@ class TensorMemoryObj(MemoryObj):
+ 
+     def ref_count_up(self):
+         with self.lock:
++            if (
++                self.meta.ref_count == 1
++                and self._sr_ref_gt1_started is None
++            ):
++                self._sr_ref_gt1_started = _sr_time.monotonic()
+             self.meta.ref_count += 1
+ 
+     def ref_count_down(self):
+         with self.lock:
+             self.meta.ref_count -= 1
++
++            if self.meta.ref_count == 1:
++                started = self._sr_ref_gt1_started
++                self._sr_ref_gt1_started = None
++                if started is not None:
++                    age = _sr_time.monotonic() - started
++                    threshold = float(
++                        _sr_os.environ.get("SRIRAM_LONG_REF_SECONDS", "10")
++                    )
++                    if (
++                        _sr_os.environ.get("SRIRAM_KV_MEM_DEBUG", "0") == "1"
++                        and age >= threshold
++                    ):
++                        logger.warning(
++                            "[KVDBG_LONG_REF] "
++                            "pid=%d address=%s size=%.3fMiB "
++                            "age=%.3fs pin_count=%d",
++                            _sr_os.getpid(),
++                            self.meta.address,
++                            self.meta.phy_size / 1024**2,
++                            age,
++                            self.meta.pin_count,
++                        )
++            elif self.meta.ref_count < 1:
++                self._sr_ref_gt1_started = None
++
+             if self.meta.ref_count < 0:
+                 logger.warning(
+                     f"Ref count of MemoryObj {self.meta.address}"
+@@ -680,6 +843,7 @@ class TensorMemoryObj(MemoryObj):
+             # if pin_count is 0, indicates that the object is pinned for the first time
+             if self.meta.pin_count == 0:
+                 TensorMemoryObj.monitor.update_pinned_memory_objs_count(1)
++                self._sr_pin_started = _sr_time.monotonic()
+ 
+             self.meta.pin_count += 1
+ 
+@@ -695,6 +859,29 @@ class TensorMemoryObj(MemoryObj):
+             # if pin_count is 0, indicates that the object is unpinned
+             if self.meta.pin_count == 0:
+                 TensorMemoryObj.monitor.update_pinned_memory_objs_count(-1)
++
++                started = self._sr_pin_started
++                self._sr_pin_started = None
++                if started is not None:
++                    age = _sr_time.monotonic() - started
++                    threshold = float(
++                        _sr_os.environ.get("SRIRAM_LONG_PIN_SECONDS", "10")
++                    )
++                    if (
++                        _sr_os.environ.get("SRIRAM_KV_MEM_DEBUG", "0") == "1"
++                        and age >= threshold
++                    ):
++                        logger.warning(
++                            "[KVDBG_LONG_PIN] "
++                            "pid=%d address=%s size=%.3fMiB "
++                            "age=%.3fs ref_count=%d",
++                            _sr_os.getpid(),
++                            self.meta.address,
++                            self.meta.phy_size / 1024**2,
++                            age,
++                            self.meta.ref_count,
++                        )
++
+                 # Unregister from PinMonitor when fully unpinned
+                 pin_monitor = PinMonitor.GetOrCreate()
+                 pin_monitor.on_unpin(self)
+diff --git a/lmcache/v1/storage_backend/local_cpu_backend.py b/lmcache/v1/storage_backend/local_cpu_backend.py
+index d35f3682bfbf2fc0f4ab0d74113886fc73b177ad..6498c4b9b884b01e9f3655d1cd2dc51744b5d0cd 100644
+--- a/lmcache/v1/storage_backend/local_cpu_backend.py
++++ b/lmcache/v1/storage_backend/local_cpu_backend.py
+@@ -5,6 +5,9 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence, Union
+ import threading
+ import time
+ 
++from collections import Counter
++import os
++
+ # Third Party
+ import torch
+ 
+@@ -56,6 +59,11 @@ class LocalCPUBackend(AllocatorBackendInterface):
+         else:
+             super().__init__("cpu")
+ 
++        self._sr_last_pressure_log = 0.0
++        self._sr_pressure_events = 0
++        self._sr_evicted_keys_since_log = 0
++        self._sr_evicted_bytes_since_log = 0
++
+         self.cache_policy = get_cache_policy(config.cache_policy)
+         self.hot_cache = self.cache_policy.init_mutable_mapping()
+ 
+@@ -103,6 +111,177 @@ class LocalCPUBackend(AllocatorBackendInterface):
+ 
+         self._setup_metrics()
+ 
++    def _sr_pressure_snapshot(
++        self,
++        reason: str,
++        requested_bytes: int = 0,
++        force: bool = False,
++    ) -> None:
++        """Rate-limited LMCache pinned-pool diagnostic."""
++        if os.environ.get("SRIRAM_KV_MEM_DEBUG", "0") != "1":
++            return
++
++        self._sr_pressure_events += 1
++
++        now = time.monotonic()
++        interval = float(
++            os.environ.get("SRIRAM_KV_MEM_DEBUG_INTERVAL_S", "5")
++        )
++
++        if not force and now - self._sr_last_pressure_log < interval:
++            return
++
++        self._sr_last_pressure_log = now
++
++        # Persistent objects currently admitted to the CPU hot cache.
++        with self.cpu_lock:
++            hot_objs = list(
++                {
++                    id(memory_obj): memory_obj
++                    for memory_obj in self.hot_cache.values()
++                }.values()
++            )
++
++        hot_bytes = 0
++        evictable_bytes = 0
++        pinned_bytes = 0
++        ref_gt1_bytes = 0
++
++        evictable_count = 0
++        pinned_count = 0
++        ref_gt1_count = 0
++
++        pin_hist: Counter[int] = Counter()
++        ref_hist: Counter[int] = Counter()
++
++        for memory_obj in hot_objs:
++            try:
++                metadata = memory_obj.metadata
++                size = int(metadata.phy_size)
++                pin_count = int(metadata.pin_count)
++                ref_count = int(metadata.ref_count)
++
++                hot_bytes += size
++                pin_hist[pin_count] += 1
++                ref_hist[ref_count] += 1
++
++                if pin_count > 0:
++                    pinned_count += 1
++                    pinned_bytes += size
++
++                if ref_count > 1:
++                    ref_gt1_count += 1
++                    ref_gt1_bytes += size
++
++                if pin_count == 0 and ref_count == 1:
++                    evictable_count += 1
++                    evictable_bytes += size
++            except Exception:
++                logger.exception(
++                    "[KVDBG_CPU_POOL] Could not inspect MemoryObj"
++                )
++
++        # The actual pinned-memory allocator is normally wrapped by
++        # MixedMemoryAllocator.
++        allocator = getattr(
++            self.memory_allocator,
++            "pin_allocator",
++            self.memory_allocator,
++        )
++
++        heap_bytes = 0
++        free_bytes = 0
++        largest_free_bytes = 0
++        active_allocations = getattr(
++            allocator,
++            "num_active_allocations",
++            -1,
++        )
++
++        address_manager = getattr(allocator, "address_manager", None)
++
++        if address_manager is not None:
++            try:
++                heap_bytes = int(address_manager.get_heap_size())
++                free_bytes = int(address_manager.get_free_size())
++
++                free_blocks = getattr(
++                    address_manager,
++                    "_explicit_list",
++                    (),
++                )
++                largest_free_bytes = max(
++                    (int(block.size) for block in free_blocks),
++                    default=0,
++                )
++            except Exception:
++                logger.exception(
++                    "[KVDBG_CPU_POOL] Address-manager inspection failed"
++                )
++        elif hasattr(allocator, "free_blocks"):
++            # Paged allocator.
++            page_bytes = int(getattr(allocator, "align_bytes", 0))
++            free_pages = len(allocator.free_blocks)
++            heap_bytes = int(getattr(allocator, "buffer_size", 0))
++            free_bytes = free_pages * page_bytes
++            largest_free_bytes = page_bytes if free_pages else 0
++
++        used_bytes = max(heap_bytes - free_bytes, 0)
++
++        # Approximation of staging/in-flight/non-hot allocations.
++        # It can also include alignment overhead.
++        non_hot_bytes = max(used_bytes - hot_bytes, 0)
++
++        def gib(value: int) -> float:
++            return value / 1024**3
++
++        def percentage(value: int) -> float:
++            return 100.0 * value / heap_bytes if heap_bytes else 0.0
++
++        logger.warning(
++            "[KVDBG_CPU_POOL] "
++            "pid=%d rank=%s reason=%s pressure_events=%d "
++            "requested=%.3fGiB "
++            "pool=%.3fGiB used=%.3fGiB free=%.3fGiB "
++            "largest_free=%.3fGiB active_allocs=%s "
++            "hot_objs=%d hot=%.3fGiB "
++            "evictable=%d/%.3fGiB(%.1f%%pool) "
++            "pinned=%d/%.3fGiB(%.1f%%pool) "
++            "ref_gt1=%d/%.3fGiB(%.1f%%pool) "
++            "non_hot_or_staging=%.3fGiB(%.1f%%pool) "
++            "pin_hist=%s ref_hist=%s "
++            "evicted_objs_since_last=%d/%.3fGiB",
++            os.getpid(),
++            getattr(self.metadata, "worker_id", "NA"),
++            reason,
++            self._sr_pressure_events,
++            gib(requested_bytes),
++            gib(heap_bytes),
++            gib(used_bytes),
++            gib(free_bytes),
++            gib(largest_free_bytes),
++            active_allocations,
++            len(hot_objs),
++            gib(hot_bytes),
++            evictable_count,
++            gib(evictable_bytes),
++            percentage(evictable_bytes),
++            pinned_count,
++            gib(pinned_bytes),
++            percentage(pinned_bytes),
++            ref_gt1_count,
++            gib(ref_gt1_bytes),
++            percentage(ref_gt1_bytes),
++            gib(non_hot_bytes),
++            percentage(non_hot_bytes),
++            dict(pin_hist),
++            dict(ref_hist),
++            self._sr_evicted_keys_since_log,
++            gib(self._sr_evicted_bytes_since_log),
++        )
++
++        self._sr_evicted_keys_since_log = 0
++        self._sr_evicted_bytes_since_log = 0
+     def _setup_metrics(self) -> None:
+         if self.metadata is None:
+             return
+@@ -613,6 +792,15 @@ class LocalCPUBackend(AllocatorBackendInterface):
+                 fmt = MemoryFormat.KV_2LTD
+ 
+         memory_obj = self.memory_allocator.allocate(shapes, dtypes, fmt)
++        requested_bytes = get_size_bytes(
++            shapes if isinstance(shapes, list) else [shapes],
++            dtypes if isinstance(dtypes, list) else [dtypes],
++        )
++        if memory_obj is None:
++            self._sr_pressure_snapshot(
++                reason="initial_allocate_failed",
++                requested_bytes=requested_bytes,
++            )
+         if memory_obj is not None or not eviction:
+             return memory_obj
+ 
+@@ -626,25 +814,51 @@ class LocalCPUBackend(AllocatorBackendInterface):
+                 # Accurate estimation is hard due to fragmentation
+                 num_candidates = 1
+                 evict_keys = None
++                no_evict_candidates = False
++
+                 with self.cpu_lock:
+                     evict_keys = self.cache_policy.get_evict_candidates(
+                         self.hot_cache, num_candidates=num_candidates
+                     )
+                     if evict_keys:
+-                        # we can continue trying to evict from the hot_cache
+-                        # and don't need to wait for other requests yet
+                         wait_other_requests = False
+                         logger.debug(
+-                            f"Evicting {len(evict_keys)} chunks from cpu memory"
++                            "Evicting %d chunks from cpu memory",
++                            len(evict_keys),
++                        )
++
++                        # SRIRAM DEBUG: cpu_lock is already held here.
++                        victim_objs = [
++                            self.hot_cache[key]
++                            for key in evict_keys
++                            if (
++                                key in self.hot_cache
++                                and self.hot_cache[key].can_evict
++                            )
++                        ]
++                        victim_bytes = sum(
++                            memory_obj.get_physical_size()
++                            for memory_obj in victim_objs
+                         )
+-                        # remove
++                        self._sr_evicted_keys_since_log += len(victim_objs)
++                        self._sr_evicted_bytes_since_log += victim_bytes
++
++                        # Existing removal. force=False because cpu_lock is held.
+                         self.batched_remove(evict_keys, force=False)
+                         evict_keys_count += len(evict_keys)
+                     else:
++                        # _sr_pressure_snapshot() takes cpu_lock itself, so defer it.
++                        no_evict_candidates = True
+                         self.stats_monitor.update_local_cpu_evict_failed_count(
+                             num_candidates
+                         )
+ 
++                if no_evict_candidates:
++                    self._sr_pressure_snapshot(
++                        reason="no_evict_candidates",
++                        requested_bytes=requested_bytes,
++                    )
++
+             if wait_other_requests:
+                 if not busy_loop:
+                     logger.debug(
+@@ -664,6 +878,11 @@ class LocalCPUBackend(AllocatorBackendInterface):
+                 time.sleep(time_to_wait)
+ 
+             memory_obj = self.memory_allocator.allocate(shapes, dtypes, fmt)
++            if memory_obj is None:
++                self._sr_pressure_snapshot(
++                    reason="allocate_retry_failed",
++                    requested_bytes=requested_bytes,
++                )
+             if memory_obj is not None:
+                 break
+ 
+@@ -673,6 +892,12 @@ class LocalCPUBackend(AllocatorBackendInterface):
+                 " attempts of local cpu backend allocate()"
+             )
+ 
++        if memory_obj is None:
++            self._sr_pressure_snapshot(
++                reason="allocate_returning_none",
++                requested_bytes=requested_bytes,
++                force=True,
++            )
+         self.stats_monitor.update_local_cpu_evict_metrics(evict_keys_count)
+         return memory_obj
+ 
+@@ -720,6 +945,18 @@ class LocalCPUBackend(AllocatorBackendInterface):
+         memory_objs = self.memory_allocator.batched_allocate(
+             shapes, dtypes, batch_size, fmt
+         )
++        requested_bytes = (
++            get_size_bytes(
++                shapes if isinstance(shapes, list) else [shapes],
++                dtypes if isinstance(dtypes, list) else [dtypes],
++            )
++            * batch_size
++        )
++        if memory_objs is None:
++            self._sr_pressure_snapshot(
++                reason="initial_allocate_failed",
++                requested_bytes=requested_bytes,
++            )
+ 
+         if memory_objs is not None or not eviction:
+             return memory_objs
+@@ -735,40 +972,62 @@ class LocalCPUBackend(AllocatorBackendInterface):
+                 # Accurate estimation is hard due to fragmentation
+                 num_candidates = 1
+                 evict_keys = None
++                no_evict_candidates = False
++
+                 with self.cpu_lock:
+                     evict_keys = self.cache_policy.get_evict_candidates(
+                         self.hot_cache, num_candidates=num_candidates
+                     )
+ 
+                     # HACK: We assume batch_size=num_layers here.
+-                    # FIXME: We also assume if the one layer's ref_count > 1 or pinned,
+-                    # then the other layers are also ref_count > 1 or
+-                    # pinned in the cpu memory. This might not be true.
++                    # FIXME: We also assume if one layer's ref_count > 1 or is pinned,
++                    # then the other layers are also ref_count > 1 or pinned.
+                     if evict_keys:
+                         evict_keys_count += len(evict_keys)
+                         wait_other_requests = False
+                         for evict_key in evict_keys:
+                             evict_key_all_layer = evict_key.split_layers(batch_size)
+ 
+-                            # TODO(Jiayi): batched allocate is not supported through
+-                            # `batched_remove`. Therefore, features like usage tracking
+-                            # is not supported.
+-                            old_mem_objs = []
++                            # Collect all per-layer objects before modifying hot_cache.
++                            old_mem_objs = [
++                                self.hot_cache[key] for key in evict_key_all_layer
++                            ]
++
++                            # SRIRAM DEBUG: count the actual per-layer objects and bytes
++                            # about to be freed by the batched eviction path.
++                            victim_bytes = sum(
++                                memory_obj.get_physical_size()
++                                for memory_obj in old_mem_objs
++                            )
++                            self._sr_evicted_keys_since_log += len(old_mem_objs)
++                            self._sr_evicted_bytes_since_log += victim_bytes
++
++                            # Existing eviction behavior.
+                             for key in evict_key_all_layer:
+-                                old_mem_objs.append(self.hot_cache[key])
+                                 self.cache_policy.update_on_force_evict(key)
+                                 self.hot_cache.pop(key, None)
+ 
+                             self.memory_allocator.batched_free(old_mem_objs)
+ 
+                             logger.debug(
+-                                f"Evicting {len(old_mem_objs)} chunks from cpu memory"
++                                "Evicting %d per-layer objects from cpu memory, "
++                                "freeing %.3f MiB",
++                                len(old_mem_objs),
++                                victim_bytes / 1024**2,
+                             )
+                     else:
++                        # _sr_pressure_snapshot() takes cpu_lock itself, so defer it.
++                        no_evict_candidates = True
+                         self.stats_monitor.update_local_cpu_evict_failed_count(
+                             num_candidates
+                         )
+ 
++                if no_evict_candidates:
++                    self._sr_pressure_snapshot(
++                        reason="no_evict_candidates_batched",
++                        requested_bytes=requested_bytes,
++                    )
++
+             if wait_other_requests:
+                 if not busy_loop:
+                     logger.debug(
+@@ -790,6 +1049,11 @@ class LocalCPUBackend(AllocatorBackendInterface):
+             memory_objs = self.memory_allocator.batched_allocate(
+                 shapes, dtypes, batch_size, fmt
+             )
++            if memory_objs is None:
++                self._sr_pressure_snapshot(
++                    reason="batched_allocate_retry_failed",
++                    requested_bytes=requested_bytes,
++                )
+             if memory_objs:
+                 break
+ 
+@@ -798,6 +1062,12 @@ class LocalCPUBackend(AllocatorBackendInterface):
+                 f"Unable to allocate memory object after {num_attempts}"
+                 " attempts of local cpu backend batched_allocate()"
+             )
++        if memory_objs is None:
++            self._sr_pressure_snapshot(
++                reason="batched_allocate_returning_none",
++                requested_bytes=requested_bytes,
++                force=True,
++            )
+         self.stats_monitor.update_local_cpu_evict_metrics(evict_keys_count)
+         return memory_objs
+ 
+diff --git a/lmcache/v1/storage_backend/local_disk_backend.py b/lmcache/v1/storage_backend/local_disk_backend.py
+index 6ccb4038e0ad4a79e37a8221ce9f5b1f5d7ee2c1..898e7f4e2e693a2041f159c2ba091879d941b4dc 100644
+--- a/lmcache/v1/storage_backend/local_disk_backend.py
++++ b/lmcache/v1/storage_backend/local_disk_backend.py
+@@ -35,6 +35,31 @@ if TYPE_CHECKING:
+ logger = init_logger(__name__)
+ 
+ 
++def _kvio_trace_enabled() -> bool:
++    return os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1"
++
++
++def _kvio_proc_io_snapshot() -> dict[str, int]:
++    values: dict[str, int] = {}
++    if not _kvio_trace_enabled():
++        return values
++    try:
++        with open("/proc/self/io", "r", encoding="utf-8") as f:
++            for line in f:
++                key, value = line.split(":", 1)
++                values[key.strip()] = int(value.strip())
++    except Exception as exc:
++        logger.warning("[KVIO_PROC_IO_ERROR] pid=%d error=%r", os.getpid(), exc)
++    return values
++
++
++def _kvio_io_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, int]:
++    return {
++        key: after.get(key, 0) - before.get(key, 0)
++        for key in set(before) | set(after)
++    }
++
++
+ # TODO(Jiayi): handle cases where cache is repetitvely prefetched.
+ class LocalDiskWorker:
+     def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+@@ -48,6 +73,9 @@ class LocalDiskWorker:
+         self.executor = AsyncPQThreadPoolExecutor(loop, max_workers=4)
+         self.loop = loop
+         self._closed = False
++        # Observability-only counters. They do not gate or reorder work.
++        self._kvio_state_lock = threading.Lock()
++        self._kvio_active = {"prefetch": 0, "put": 0, "delete": 0}
+ 
+     async def submit_task(
+         self,
+@@ -66,8 +94,73 @@ class LocalDiskWorker:
+         else:
+             raise ValueError(f"Unknown task type: {task_type}")
+ 
++        kvio_id = str(kwargs.pop("_kvio_id", "unknown"))
++        enqueued_at = time.monotonic()
++        queue_depth_before = self.executor._queue.qsize()
++        if _kvio_trace_enabled():
++            with self._kvio_state_lock:
++                active_snapshot = dict(self._kvio_active)
++            logger.warning(
++                "[KVIO_DISKQ_ENQUEUE] pid=%d id=%s task_type=%s "
++                "task=%s priority=%d queue_depth_before=%d active=%s "
++                "put_tasks=%d mono=%.6f",
++                os.getpid(),
++                kvio_id,
++                task_type,
++                getattr(task, "__name__", repr(task)),
++                priority,
++                queue_depth_before,
++                active_snapshot,
++                len(self.put_tasks),
++                enqueued_at,
++            )
++
++        def traced_task(*task_args, **task_kwargs):
++            started_at = time.monotonic()
++            with self._kvio_state_lock:
++                self._kvio_active[task_type] += 1
++                active_snapshot = dict(self._kvio_active)
++            if _kvio_trace_enabled():
++                logger.warning(
++                    "[KVIO_DISKQ_START] pid=%d id=%s task_type=%s "
++                    "task=%s queue_wait=%.6f queue_depth_now=%d "
++                    "active=%s put_tasks=%d thread=%s",
++                    os.getpid(),
++                    kvio_id,
++                    task_type,
++                    getattr(task, "__name__", repr(task)),
++                    started_at - enqueued_at,
++                    self.executor._queue.qsize(),
++                    active_snapshot,
++                    len(self.put_tasks),
++                    threading.current_thread().name,
++                )
++            try:
++                return task(*task_args, **task_kwargs)
++            finally:
++                finished_at = time.monotonic()
++                with self._kvio_state_lock:
++                    self._kvio_active[task_type] -= 1
++                    active_after = dict(self._kvio_active)
++                if _kvio_trace_enabled():
++                    logger.warning(
++                        "[KVIO_DISKQ_DONE] pid=%d id=%s task_type=%s "
++                        "task=%s service=%.6f total=%.6f "
++                        "queue_depth_now=%d active=%s put_tasks=%d thread=%s",
++                        os.getpid(),
++                        kvio_id,
++                        task_type,
++                        getattr(task, "__name__", repr(task)),
++                        finished_at - started_at,
++                        finished_at - enqueued_at,
++                        self.executor._queue.qsize(),
++                        active_after,
++                        len(self.put_tasks),
++                        threading.current_thread().name,
++                    )
++
+         return await self.executor.submit_job(
+-            task,
++            traced_task,
+             *args,
+             priority=priority,
+             **kwargs,
+@@ -77,12 +170,27 @@ class LocalDiskWorker:
+         with self.put_lock:
+             if key in self.put_tasks:
+                 self.put_tasks.remove(key)
++                if _kvio_trace_enabled():
++                    logger.warning(
++                        "[KVIO_PUT_TASK_REMOVE] pid=%d key_hash=%s "
++                        "remaining_put_tasks=%d",
++                        os.getpid(),
++                        key.chunk_hash,
++                        len(self.put_tasks),
++                    )
+             else:
+                 logger.warning(f"Key {key} not found in put tasks.")
+ 
+     def insert_put_task(self, key: CacheEngineKey):
+         with self.put_lock:
+             self.put_tasks.append(key)
++            if _kvio_trace_enabled():
++                logger.warning(
++                    "[KVIO_PUT_TASK_INSERT] pid=%d key_hash=%s put_tasks=%d",
++                    os.getpid(),
++                    key.chunk_hash,
++                    len(self.put_tasks),
++                )
+ 
+     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
+         with self.put_lock:
+@@ -92,8 +200,26 @@ class LocalDiskWorker:
+         # Gracefully shut down the executor
+         if self._closed:
+             return
++        if _kvio_trace_enabled():
++            with self._kvio_state_lock:
++                active_snapshot = dict(self._kvio_active)
++            logger.warning(
++                "[KVIO_DISKQ_CLOSE_ENTER] pid=%d queue_depth=%d "
++                "active=%s put_tasks=%d",
++                os.getpid(),
++                self.executor._queue.qsize(),
++                active_snapshot,
++                len(self.put_tasks),
++            )
+         self._closed = True
+         self.executor.shutdown(wait=True)
++        if _kvio_trace_enabled():
++            logger.warning(
++                "[KVIO_DISKQ_CLOSE_DONE] pid=%d queue_depth=%d put_tasks=%d",
++                os.getpid(),
++                self.executor._queue.qsize(),
++                len(self.put_tasks),
++            )
+ 
+ 
+ class LocalDiskBackend(StorageBackendInterface):
+@@ -363,6 +489,7 @@ class LocalDiskBackend(StorageBackendInterface):
+                 key=key,
+                 memory_obj=memory_obj,
+                 on_complete_callback=on_complete_callback,
++                _kvio_id=f"put:{key.chunk_hash}",
+             ),
+             self.loop,
+         )
+@@ -444,58 +571,148 @@ class LocalDiskBackend(StorageBackendInterface):
+     ) -> list[MemoryObj]:
+         mem_objs: list[MemoryObj] = []
+         paths: list[str] = []
++        started = time.monotonic()
++        debug_enabled = os.environ.get("SRIRAM_KV_MEM_DEBUG", "0") == "1"
+ 
+-        logger.debug(f"lookup_id: {lookup_id}; Prefetching {len(keys)} keys from disk.")
+-        for key in keys:
+-            self.disk_lock.acquire()
+-            assert key in self.dict, f"Key {key} not found in disk cache after pinning"
+-
+-            path = self.dict[key].path
+-            dtype = self.dict[key].dtype
+-            shape = self.dict[key].shape
+-            fmt = self.dict[key].fmt
++        if debug_enabled:
++            logger.warning(
++                "[KVDBG_DISK_LOAD_START] "
++                "pid=%d lookup_id=%s requested_keys=%d thread=%s",
++                os.getpid(),
++                lookup_id,
++                len(keys),
++                threading.current_thread().name,
++            )
+ 
+-            assert dtype is not None
+-            assert shape is not None
++        logger.debug(
++            "lookup_id: %s; Prefetching %d keys from disk.",
++            lookup_id,
++            len(keys),
++        )
+ 
+-            # busy_loop=False prevents spinning on the event loop thread;
+-            # if staging memory is exhausted the caller will get a logged
+-            # error rather than a silent deadlock.
+-            memory_obj = self.local_cpu_backend.allocate(
+-                shape,
+-                dtype,
+-                fmt,
+-                busy_loop=False,
+-            )
++        for key_index, key in enumerate(keys):
++            # Use a context manager so every exit path releases disk_lock.
++            # The previous code returned on allocation failure while still
++            # holding this lock, freezing subsequent disk operations.
++            with self.disk_lock:
++                assert key in self.dict, (
++                    f"Key {key} not found in disk cache after pinning"
++                )
+ 
+-            if memory_obj is None:
+-                logger.error(
+-                    "Memory allocation failed during async disk load for key %s. "
+-                    "CPU staging pool may be exhausted (unpin() not called after "
+-                    "a previous retrieve). Returning partial results.",
+-                    key,
++                path = self.dict[key].path
++                dtype = self.dict[key].dtype
++                shape = self.dict[key].shape
++                fmt = self.dict[key].fmt
++
++                assert dtype is not None
++                assert shape is not None
++
++                # busy_loop=False prevents spinning on the event-loop thread.
++                allocation_started = time.monotonic()
++                memory_obj = self.local_cpu_backend.allocate(
++                    shape,
++                    dtype,
++                    fmt,
++                    busy_loop=False,
+                 )
+-                return mem_objs
++                allocation_elapsed = time.monotonic() - allocation_started
++                if _kvio_trace_enabled():
++                    logger.warning(
++                        "[KVIO_STAGE_ALLOC] pid=%d lookup_id=%s "
++                        "key_index=%d/%d key_hash=%s shape=%s dtype=%s fmt=%s "
++                        "success=%s elapsed=%.6f",
++                        os.getpid(),
++                        lookup_id,
++                        key_index,
++                        len(keys),
++                        key.chunk_hash,
++                        shape,
++                        dtype,
++                        fmt,
++                        memory_obj is not None,
++                        allocation_elapsed,
++                    )
+ 
+-            self.dict[key].pin()
++                if memory_obj is None:
++                    logger.error(
++                        "[KVDBG_DISK_STAGE_FAIL] "
++                        "pid=%d lookup_id=%s key_index=%d/%d "
++                        "allocated_so_far=%d elapsed=%.3fs thread=%s. "
++                        "Memory allocation failed during async disk load "
++                        "for key %s. CPU staging pool may be exhausted. "
++                        "Returning partial results.",
++                        os.getpid(),
++                        lookup_id,
++                        key_index,
++                        len(keys),
++                        len(mem_objs),
++                        time.monotonic() - started,
++                        threading.current_thread().name,
++                        key,
++                    )
++                    return mem_objs
+ 
+-            # NOTE(Jiayi): Currently, we consider prefetch as cache hit.
+-            # Update cache recency
+-            self.cache_policy.update_on_hit(key, self.dict)
++                # Extra disk pin for the physical read. The lookup pin is
++                # released separately by lookup_unpin().
++                self.dict[key].pin()
+ 
+-            self.disk_lock.release()
+-            logger.debug(f"Prefetching {key} from disk.")
++                # NOTE(Jiayi): Currently, we consider prefetch as cache hit.
++                self.cache_policy.update_on_hit(key, self.dict)
++
++            logger.debug("Prefetching %s from disk.", key)
+             memory_obj.pin()
+             mem_objs.append(memory_obj)
+             paths.append(path)
+ 
+-        return await self.disk_worker.submit_task(
+-            "prefetch",
+-            self.batched_async_load_bytes_from_disk,
+-            paths=paths,
+-            keys=keys,
+-            memory_objs=mem_objs,
+-        )
++        if _kvio_trace_enabled():
++            logger.warning(
++                "[KVIO_STAGE_BATCH_DONE] pid=%d lookup_id=%s "
++                "requested_keys=%d staged=%d elapsed=%.6f",
++                os.getpid(),
++                lookup_id,
++                len(keys),
++                len(mem_objs),
++                time.monotonic() - started,
++            )
++
++        try:
++            results = await self.disk_worker.submit_task(
++                "prefetch",
++                self.batched_async_load_bytes_from_disk,
++                paths=paths,
++                keys=keys,
++                memory_objs=mem_objs,
++                lookup_id=lookup_id,
++                _kvio_id=lookup_id,
++            )
++        except Exception:
++            logger.exception(
++                "[KVDBG_DISK_LOAD_FAILED] "
++                "pid=%d lookup_id=%s requested_keys=%d "
++                "allocated=%d elapsed=%.3fs thread=%s",
++                os.getpid(),
++                lookup_id,
++                len(keys),
++                len(mem_objs),
++                time.monotonic() - started,
++                threading.current_thread().name,
++            )
++            raise
++
++        if debug_enabled or time.monotonic() - started >= 1.0:
++            logger.warning(
++                "[KVDBG_DISK_LOAD_DONE] "
++                "pid=%d lookup_id=%s requested_keys=%d returned=%d "
++                "elapsed=%.3fs thread=%s",
++                os.getpid(),
++                lookup_id,
++                len(keys),
++                len(results),
++                time.monotonic() - started,
++                threading.current_thread().name,
++            )
++
++        return results
+ 
+     async def batched_async_contains(
+         self,
+@@ -539,7 +756,7 @@ class LocalDiskBackend(StorageBackendInterface):
+         self.stats_monitor.update_local_storage_usage(self.usage)
+ 
+         # TODO(Jiayi): need to add ref count in disk memory object
+-        self.write_file(buffer, path)
++        self.write_file(buffer, path, key=key)
+ 
+         # ref count down here because there's a ref_count_up in
+         # `submit_put_task` above.
+@@ -571,16 +788,38 @@ class LocalDiskBackend(StorageBackendInterface):
+         keys: list[CacheEngineKey],
+         memory_objs: list[MemoryObj],
+         write_back: bool = False,
++        lookup_id: str = "unknown",
+     ) -> list[MemoryObj]:
+         """
+         Async load bytearray from disk.
+         """
+ 
+         logger.debug("Executing `async_load_bytes` from disk.")
++        batch_started = time.monotonic()
++        if _kvio_trace_enabled():
++            logger.warning(
++                "[KVIO_READ_BATCH_START] pid=%d lookup_id=%s files=%d "
++                "bytes=%d thread=%s mono=%.6f",
++                os.getpid(),
++                lookup_id,
++                len(paths),
++                sum(len(mem_obj.byte_array) for mem_obj in memory_objs),
++                threading.current_thread().name,
++                batch_started,
++            )
+         # TODO (Jiayi): handle the case where loading fails.
+-        for path, key, mem_obj in zip(paths, keys, memory_objs, strict=False):
++        for file_index, (path, key, mem_obj) in enumerate(
++            zip(paths, keys, memory_objs, strict=False)
++        ):
+             buffer = mem_obj.byte_array
+-            self.read_file(key, buffer, path)
++            self.read_file(
++                key,
++                buffer,
++                path,
++                lookup_id=lookup_id,
++                file_index=file_index,
++                total_files=len(paths),
++            )
+ 
+             # TODO(Jiayi): Please recover the metadata in a more
+             # elegant way in the future.
+@@ -591,6 +830,16 @@ class LocalDiskBackend(StorageBackendInterface):
+             self.dict[key].unpin()
+             self.disk_lock.release()
+ 
++        if _kvio_trace_enabled():
++            logger.warning(
++                "[KVIO_READ_BATCH_DONE] pid=%d lookup_id=%s files=%d "
++                "elapsed=%.6f thread=%s",
++                os.getpid(),
++                lookup_id,
++                len(paths),
++                time.monotonic() - batch_started,
++                threading.current_thread().name,
++            )
+         return memory_objs
+ 
+     def load_bytes_from_disk(
+@@ -618,24 +867,66 @@ class LocalDiskBackend(StorageBackendInterface):
+ 
+         return memory_obj
+ 
+-    def write_file(self, buffer, path):
+-        start_time = time.time()
++    def write_file(self, buffer, path, key: Optional[CacheEngineKey] = None):
++        total_started = time.monotonic()
+         size = len(buffer)
++        io_before = _kvio_proc_io_snapshot()
++        open_elapsed = 0.0
++        write_elapsed = 0.0
++        bytes_written = 0
++
+         if size % self.os_disk_bs != 0 or not self.use_odirect:
++            open_started = time.monotonic()
+             with open(path, "wb") as f:
+-                f.write(buffer)
++                open_elapsed = time.monotonic() - open_started
++                write_started = time.monotonic()
++                bytes_written = f.write(buffer)
++                write_elapsed = time.monotonic() - write_started
+         else:
++            open_started = time.monotonic()
+             fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_DIRECT, 0o644)
+-            os.write(fd, buffer)
+-            os.close(fd)
+-        disk_write_time = time.time() - start_time
++            open_elapsed = time.monotonic() - open_started
++            try:
++                write_started = time.monotonic()
++                bytes_written = os.write(fd, buffer)
++                write_elapsed = time.monotonic() - write_started
++            finally:
++                os.close(fd)
++
++        total_elapsed = time.monotonic() - total_started
++        io_after = _kvio_proc_io_snapshot()
+         logger.debug(
+             f"Disk write size: {size} bytes, "
+-            f"Bandwidth: {size / disk_write_time / 1e6:.2f} MB/s"
++            f"Bandwidth: {size / max(total_elapsed, 1e-9) / 1e6:.2f} MB/s"
+         )
++        if _kvio_trace_enabled():
++            logger.warning(
++                "[KVIO_FILE_WRITE] pid=%d key_hash=%s bytes_expected=%d "
++                "bytes_written=%d open=%.6f write=%.6f total=%.6f "
++                "odirect=%s proc_io_delta=%s thread=%s path=%s",
++                os.getpid(),
++                getattr(key, "chunk_hash", "unknown"),
++                size,
++                bytes_written,
++                open_elapsed,
++                write_elapsed,
++                total_elapsed,
++                self.use_odirect,
++                _kvio_io_delta(io_before, io_after),
++                threading.current_thread().name,
++                path,
++            )
+ 
+-    def read_file(self, key, buffer, path):
+-        start_time = time.time()
++    def read_file(
++        self,
++        key,
++        buffer,
++        path,
++        lookup_id: str = "unknown",
++        file_index: int = -1,
++        total_files: int = -1,
++    ):
++        total_started = time.monotonic()
+         size = len(buffer)
+         fblock_aligned = size % self.os_disk_bs == 0
+         if not fblock_aligned and self.use_odirect:
+@@ -644,25 +935,74 @@ class LocalDiskBackend(StorageBackendInterface):
+                 "size is not aligned to disk block size."
+             )
+ 
++        io_before = _kvio_proc_io_snapshot()
++        open_elapsed = 0.0
++        read_elapsed = 0.0
++        bytes_read = 0
++        effective_odirect = fblock_aligned and self.use_odirect
++
+         try:
+-            if not fblock_aligned or not self.use_odirect:
++            if not effective_odirect:
++                open_started = time.monotonic()
+                 with open(path, "rb") as f:
+-                    f.readinto(buffer)
++                    open_elapsed = time.monotonic() - open_started
++                    read_started = time.monotonic()
++                    bytes_read = f.readinto(buffer)
++                    read_elapsed = time.monotonic() - read_started
+             else:
++                open_started = time.monotonic()
+                 fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
++                open_elapsed = time.monotonic() - open_started
+                 with os.fdopen(fd, "rb", buffering=0) as fdo:
+-                    fdo.readinto(buffer)
++                    read_started = time.monotonic()
++                    bytes_read = fdo.readinto(buffer)
++                    read_elapsed = time.monotonic() - read_started
+         except FileNotFoundError:
+             logger.warning(f"File not found on disk: {path}")
+             if self.dict.get(key, None):
+                 self.dict.pop(key)
++            if _kvio_trace_enabled():
++                logger.warning(
++                    "[KVIO_FILE_READ_MISSING] pid=%d lookup_id=%s "
++                    "file_index=%d/%d key_hash=%s elapsed=%.6f path=%s",
++                    os.getpid(),
++                    lookup_id,
++                    file_index,
++                    total_files,
++                    getattr(key, "chunk_hash", "unknown"),
++                    time.monotonic() - total_started,
++                    path,
++                )
+             return
+ 
+-        disk_read_time = time.time() - start_time
++        total_elapsed = time.monotonic() - total_started
++        io_after = _kvio_proc_io_snapshot()
+         logger.debug(
+             f"Disk read size: {size} bytes, "
+-            f"Bandwidth: {size / disk_read_time / 1e6:.2f} MB/s"
++            f"Bandwidth: {size / max(total_elapsed, 1e-9) / 1e6:.2f} MB/s"
+         )
++        if _kvio_trace_enabled():
++            logger.warning(
++                "[KVIO_FILE_READ] pid=%d lookup_id=%s file_index=%d/%d "
++                "key_hash=%s bytes_expected=%d bytes_read=%d "
++                "open=%.6f read=%.6f total=%.6f bandwidth_MBps=%.3f "
++                "odirect=%s proc_io_delta=%s thread=%s path=%s",
++                os.getpid(),
++                lookup_id,
++                file_index,
++                total_files,
++                getattr(key, "chunk_hash", "unknown"),
++                size,
++                bytes_read,
++                open_elapsed,
++                read_elapsed,
++                total_elapsed,
++                bytes_read / max(read_elapsed, 1e-9) / 1e6,
++                effective_odirect,
++                _kvio_io_delta(io_before, io_after),
++                threading.current_thread().name,
++                path,
++            )
+ 
+     def get_allocator_backend(self) -> LocalCPUBackend:
+         return self.local_cpu_backend
+diff --git a/lmcache/v1/storage_backend/storage_manager.py b/lmcache/v1/storage_backend/storage_manager.py
+index 030e1924df49d80645a11693b5af3fbe777c07aa..3cdb78f2ea78e234bf0a0abb7d71742d27925808 100644
+--- a/lmcache/v1/storage_backend/storage_manager.py
++++ b/lmcache/v1/storage_backend/storage_manager.py
+@@ -54,6 +54,39 @@ if TYPE_CHECKING:
+ 
+ logger = init_logger(__name__)
+ 
++# ===== SRIRAM LOOKUP DEBUG START =====
++import os as _sr_os
++import time as _sr_time
++import traceback as _sr_traceback
++from collections import defaultdict as _sr_defaultdict
++
++_SR_LOOKUP_SEEN = _sr_defaultdict(lambda: {"count": 0, "last": 0.0})
++
++
++def _sr_lookup_debug(lookup_id, retrieved_length=None, extra=""):
++    try:
++        now = _sr_time.time()
++        s = _SR_LOOKUP_SEEN[str(lookup_id)]
++        s["count"] += 1
++        dt = now - s["last"] if s["last"] else 0.0
++        s["last"] = now
++
++        print(
++            f"[SRIRAM_LOOKUPDBG] pid={_sr_os.getpid()} lookup_id={lookup_id} "
++            f"count={s['count']} dt={dt:.3f} retrieved_length={retrieved_length} "
++            f"extra={extra}",
++            flush=True,
++        )
++
++        if s["count"] in (2, 5, 10):
++            print(
++                "[SRIRAM_LOOKUPDBG_STACK]\n"
++                + "".join(_sr_traceback.format_stack(limit=12)),
++                flush=True,
++            )
++    except Exception as e:
++        print(f"[SRIRAM_LOOKUPDBG_ERROR] {e!r}", flush=True)
++# ===== SRIRAM LOOKUP DEBUG END =====
+ 
+ # Helper function to get the class name of the backend
+ def get_backend_cname(backend: StorageBackendInterface) -> str:
+@@ -183,11 +216,45 @@ class AsyncMultiSerializer:
+         self,
+         coro_fn: Coroutine[Any, Any, Any],
+         num_chunks: int,
++        **kwargs: Any,
+     ) -> Any:
++        trace_enabled = _sr_os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1"
++        lookup_id = kwargs.get("_kvio_lookup_id", "unknown")
++        backend_name = kwargs.get("_kvio_backend_name", "unknown")
++        queued_at = _sr_time.monotonic()
++        if trace_enabled:
++            logger.warning(
++                "[KVIO_MULTI_SERIALIZER_ENQUEUE] lookup_id=%s backend=%s "
++                "chunks=%d mono=%.6f",
++                lookup_id,
++                backend_name,
++                num_chunks,
++                queued_at,
++            )
+         await self._sem.acquire(num_chunks)
++        acquired_at = _sr_time.monotonic()
++        if trace_enabled:
++            logger.warning(
++                "[KVIO_MULTI_SERIALIZER_ACQUIRE] lookup_id=%s backend=%s "
++                "chunks=%d queue_wait=%.6f",
++                lookup_id,
++                backend_name,
++                num_chunks,
++                acquired_at - queued_at,
++            )
+         try:
+             return await coro_fn
+         finally:
++            if trace_enabled:
++                logger.warning(
++                    "[KVIO_MULTI_SERIALIZER_RELEASE] lookup_id=%s backend=%s "
++                    "chunks=%d held=%.6f total=%.6f",
++                    lookup_id,
++                    backend_name,
++                    num_chunks,
++                    _sr_time.monotonic() - acquired_at,
++                    _sr_time.monotonic() - queued_at,
++                )
+             await self._sem.release(num_chunks)
+ 
+ 
+@@ -201,14 +268,90 @@ class AsyncSingleSerializer:
+         self.loop = loop
+         # lazy init in run
+         self.lock: Optional[asyncio.Lock] = None
++        # Observability-only counters; they do not gate admission.
++        self._kvio_waiters = 0
++        self._kvio_active_lookup_id: Optional[str] = None
++        self._kvio_active_backend: Optional[str] = None
+ 
+     async def run(self, coro_fn: Coroutine[Any, Any, Any], *args, **kwargs) -> Any:
+         # we need to lazily initialize the lock to
+         # place it on the calling event loop
+         if self.lock is None:
+             self.lock = asyncio.Lock()
+-        async with self.lock:  # type: ignore
+-            return await coro_fn
++
++        trace_enabled = _sr_os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1"
++        lookup_id = str(kwargs.get("_kvio_lookup_id", "unknown"))
++        backend_name = str(kwargs.get("_kvio_backend_name", "unknown"))
++        num_chunks = int(kwargs.get("_kvio_num_chunks", args[0] if args else -1))
++        queued_at = _sr_time.monotonic()
++        acquired = False
++
++        if trace_enabled:
++            self._kvio_waiters += 1
++            logger.warning(
++                "[KVIO_SERIALIZER_ENQUEUE] lookup_id=%s backend=%s chunks=%d "
++                "waiters=%d active_lookup_id=%s active_backend=%s mono=%.6f",
++                lookup_id,
++                backend_name,
++                num_chunks,
++                self._kvio_waiters,
++                self._kvio_active_lookup_id,
++                self._kvio_active_backend,
++                queued_at,
++            )
++
++        try:
++            async with self.lock:  # type: ignore
++                acquired = True
++                acquired_at = _sr_time.monotonic()
++                if trace_enabled:
++                    self._kvio_waiters -= 1
++                    previous_lookup_id = self._kvio_active_lookup_id
++                    previous_backend = self._kvio_active_backend
++                    self._kvio_active_lookup_id = lookup_id
++                    self._kvio_active_backend = backend_name
++                    logger.warning(
++                        "[KVIO_SERIALIZER_ACQUIRE] lookup_id=%s backend=%s "
++                        "chunks=%d queue_wait=%.6f waiters=%d "
++                        "previous_lookup_id=%s previous_backend=%s",
++                        lookup_id,
++                        backend_name,
++                        num_chunks,
++                        acquired_at - queued_at,
++                        self._kvio_waiters,
++                        previous_lookup_id,
++                        previous_backend,
++                    )
++                try:
++                    return await coro_fn
++                finally:
++                    if trace_enabled:
++                        now = _sr_time.monotonic()
++                        logger.warning(
++                            "[KVIO_SERIALIZER_RELEASE] lookup_id=%s backend=%s "
++                            "chunks=%d held=%.6f total=%.6f waiters=%d",
++                            lookup_id,
++                            backend_name,
++                            num_chunks,
++                            now - acquired_at,
++                            now - queued_at,
++                            self._kvio_waiters,
++                        )
++                        self._kvio_active_lookup_id = None
++                        self._kvio_active_backend = None
++        finally:
++            if trace_enabled and not acquired:
++                self._kvio_waiters -= 1
++                logger.warning(
++                    "[KVIO_SERIALIZER_WAIT_ENDED_WITHOUT_ACQUIRE] "
++                    "lookup_id=%s backend=%s chunks=%d waited=%.6f "
++                    "waiters=%d",
++                    lookup_id,
++                    backend_name,
++                    num_chunks,
++                    _sr_time.monotonic() - queued_at,
++                    self._kvio_waiters,
++                )
+ 
+ 
+ AsyncSerializer = Union[AsyncSingleSerializer, AsyncMultiSerializer]
+@@ -543,13 +686,63 @@ class StorageManager:
+         future: asyncio.Future,
+         keys: list[CacheEngineKey],
+         backend_name: str,
++        lookup_id: str,
++        started: float,
+     ) -> None:
+-        """
+-        Callback function when a single prefetch task
+-        (i.e., prefetching from a single backend) is done.
+-        """
+-        # TODO(Jiayi): support write-back policy here
+-        pass
++        """Log completion, partial completion, or failure of one tier load."""
++        elapsed = _sr_time.monotonic() - started
++        debug_enabled = _sr_os.environ.get("SRIRAM_KV_MEM_DEBUG", "0") == "1"
++
++        if future.cancelled():
++            logger.error(
++                "[KVDBG_LOAD_CANCELLED] "
++                "pid=%d lookup_id=%s backend=%s "
++                "requested_keys=%d elapsed=%.3fs",
++                _sr_os.getpid(),
++                lookup_id,
++                backend_name,
++                len(keys),
++                elapsed,
++            )
++            return
++
++        try:
++            results = future.result()
++            returned = len(results)
++            none_count = sum(memory_obj is None for memory_obj in results)
++
++            if (
++                debug_enabled
++                or backend_name == "LocalDiskBackend"
++                or elapsed >= 1.0
++                or none_count > 0
++                or returned != len(keys)
++            ):
++                logger.warning(
++                    "[KVDBG_LOAD_DONE] "
++                    "pid=%d lookup_id=%s backend=%s "
++                    "requested_keys=%d returned=%d none=%d "
++                    "partial=%s elapsed=%.3fs",
++                    _sr_os.getpid(),
++                    lookup_id,
++                    backend_name,
++                    len(keys),
++                    returned,
++                    none_count,
++                    returned != len(keys),
++                    elapsed,
++                )
++        except Exception:
++            logger.exception(
++                "[KVDBG_LOAD_FAILED] "
++                "pid=%d lookup_id=%s backend=%s "
++                "requested_keys=%d elapsed=%.3fs",
++                _sr_os.getpid(),
++                lookup_id,
++                backend_name,
++                len(keys),
++                elapsed,
++            )
+ 
+     def prefetch_all_done_callback(
+         self,
+@@ -646,6 +839,7 @@ class StorageManager:
+             f"Responding to scheduler for lookup id {lookup_id}"
+             f" with retrieved length {retrieved_length}"
+         )
++        _sr_lookup_debug(lookup_id, retrieved_length=retrieved_length, extra="responding_to_scheduler")
+         self.async_lookup_server.send_response_to_scheduler(lookup_id, retrieved_length)
+ 
+     async def async_lookup_and_prefetch(
+@@ -709,6 +903,21 @@ class StorageManager:
+                 f"len(keys)={len(keys)} is not a multiple of "
+                 f"keys_per_chunk={keys_per_chunk}"
+             )
++        kvio_lookup_started = _sr_time.monotonic()
++        if _sr_os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
++            logger.warning(
++                "[KVIO_STORAGE_LOOKUP_ENTER] pid=%d lookup_id=%s keys=%d "
++                "chunks=%d keys_per_chunk=%d pin=%s search_range=%s mono=%.6f",
++                _sr_os.getpid(),
++                lookup_id,
++                len(keys),
++                len(keys) // keys_per_chunk,
++                keys_per_chunk,
++                pin,
++                search_range,
++                kvio_lookup_started,
++            )
++
+         num_total_chunks = len(keys) // keys_per_chunk
+         num_total_hit_chunks = 0
+         # cum_chunk_lengths_total: A copy of the original cumulative chunk lengths
+@@ -726,9 +935,22 @@ class StorageManager:
+         for backend_name, backend in self.get_active_storage_backends(
+             search_range=search_range
+         ):
++            contains_started = _sr_time.monotonic()
+             num_hit_keys_raw = await backend.batched_async_contains(
+                 lookup_id, keys, pin
+             )
++            if _sr_os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
++                logger.warning(
++                    "[KVIO_CONTAINS_DONE] pid=%d lookup_id=%s backend=%s "
++                    "input_keys=%d hit_keys_raw=%d pin=%s elapsed=%.6f",
++                    _sr_os.getpid(),
++                    lookup_id,
++                    backend_name,
++                    len(keys),
++                    num_hit_keys_raw,
++                    pin,
++                    _sr_time.monotonic() - contains_started,
++                )
+             # Round down to a whole-chunk boundary. If a backend has only
+             # some of a chunk's per-layer keys (e.g., partial eviction),
+             # we treat the chunk as a miss to keep the chunk-level
+@@ -758,6 +980,20 @@ class StorageManager:
+                 "async_lookup_and_prefetch."
+             )
+             # num_hit_chunks is only used for the multi serializer
++            load_started = _sr_time.monotonic()
++            if _sr_os.environ.get("SRIRAM_KV_MEM_DEBUG", "0") == "1":
++                logger.warning(
++                    "[KVDBG_LOAD_START] "
++                    "pid=%d lookup_id=%s backend=%s "
++                    "hit_chunks=%d requested_keys=%d pin=%s",
++                    _sr_os.getpid(),
++                    lookup_id,
++                    backend_name,
++                    num_hit_chunks,
++                    len(backend_keys),
++                    pin,
++                )
++
+             get_coro = self.async_serializer.run(
+                 backend.batched_get_non_blocking(
+                     lookup_id,
+@@ -765,13 +1001,18 @@ class StorageManager:
+                     {"cum_chunk_lengths": cum_chunk_lengths[: num_hit_chunks + 1]},
+                 ),
+                 num_hit_chunks,
++                _kvio_lookup_id=lookup_id,
++                _kvio_backend_name=backend_name,
++                _kvio_num_chunks=num_hit_chunks,
+             )
+             loading_task = asyncio.create_task(get_coro)
+             loading_task.add_done_callback(
+                 functools.partial(
+                     self.prefetch_single_done_callback,
+-                    keys=keys,
++                    keys=backend_keys,
+                     backend_name=backend_name,
++                    lookup_id=lookup_id,
++                    started=load_started,
+                 )
+             )
+ 
+@@ -785,6 +1026,14 @@ class StorageManager:
+ 
+         # If no chunks were hit across all backends, respond immediately and return.
+         if num_total_hit_chunks == 0:
++            if _sr_os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
++                logger.warning(
++                    "[KVIO_STORAGE_LOOKUP_NO_HIT] pid=%d lookup_id=%s "
++                    "elapsed=%.6f",
++                    _sr_os.getpid(),
++                    lookup_id,
++                    _sr_time.monotonic() - kvio_lookup_started,
++                )
+             if self.async_lookup_server is not None:
+                 self.async_lookup_server.send_response_to_scheduler(lookup_id, 0)
+             return
+@@ -814,6 +1063,16 @@ class StorageManager:
+             lookup_id,
+             all_done,
+         )
++        if _sr_os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
++            logger.warning(
++                "[KVIO_STORAGE_EVENT_REGISTER] pid=%d lookup_id=%s "
++                "loading_tasks=%d expected_chunks=%s elapsed=%.6f",
++                _sr_os.getpid(),
++                lookup_id,
++                len(loading_tasks),
++                tier_expected_chunks,
++                _sr_time.monotonic() - kvio_lookup_started,
++            )
+ 
+         all_done.add_done_callback(
+             lambda future: self.prefetch_all_done_callback(

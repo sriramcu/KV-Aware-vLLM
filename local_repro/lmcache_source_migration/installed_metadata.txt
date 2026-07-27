@@ -1,0 +1,19 @@
+python_version: 3.12.3 (main, Jun 19 2026, 12:46:00) [GCC 13.3.0]
+python_executable: /mnt/shared/gpfs/home/sriramc2/venvs/kvaware/bin/python
+lmcache_version: 0.4.6
+lmcache_package: /mnt/shared/gpfs/home/sriramc2/venvs/kvaware/lib/python3.12/site-packages/lmcache
+lmcache_dist_info: /mnt/shared/gpfs/home/sriramc2/venvs/kvaware/lib/python3.12/site-packages/lmcache-0.4.6.dist-info
+torch_version: 2.9.1+cu128
+torch_cuda: 12.8
+vllm_version: 0.1.dev13728+gb4ed7a78a.d20260711
+direct_url_json: <none>
+Name: lmcache
+Version: 0.4.6
+Summary: A LLM serving engine extension to reduce TTFT and increase throughput, especially under long-context scenarios.
+Home-page: https://docs.lmcache.ai
+Author: 
+Author-email: LMCache Team <lmcacheteam@gmail.com>
+License-Expression: Apache-2.0
+Location: /mnt/shared/gpfs/home/sriramc2/venvs/kvaware/lib/python3.12/site-packages
+Requires: aiofile, aiofiles, aiohttp, awscrt, blake3, cufile-python, cupy-cuda13x, fastapi, httptools, httpx, huggingface_hub, msgspec, nixl, numba, numpy, nvtx, opentelemetry-api, opentelemetry-exporter-otlp, opentelemetry-exporter-prometheus, opentelemetry-sdk, prometheus_client, psutil, py-cpuinfo, pytest, pyyaml, pyzmq, redis, safetensors, setuptools, setuptools_scm, sortedcontainers, torch, transformers, uvicorn
+Required-by: 

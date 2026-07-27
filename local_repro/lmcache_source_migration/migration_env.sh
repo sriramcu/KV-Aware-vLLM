@@ -1,0 +1,5 @@
+export MIGRATION_DIR="/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM/local_repro/lmcache_source_migration"
+export BACKUP_DIR="/mnt/shared/gpfs/home/sriramc2/runs/lmcache_source_migration/20260726_232731"
+export LMCACHE_PKG="/mnt/shared/gpfs/home/sriramc2/venvs/kvaware/lib/python3.12/site-packages/lmcache"
+export SITE_PACKAGES="/mnt/shared/gpfs/home/sriramc2/venvs/kvaware/lib/python3.12/site-packages"
+export LMCACHE_DIST_INFO="/mnt/shared/gpfs/home/sriramc2/venvs/kvaware/lib/python3.12/site-packages/lmcache-0.4.6.dist-info"
