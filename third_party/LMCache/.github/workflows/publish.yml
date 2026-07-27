@@ -1,0 +1,450 @@
+name: Build and Publish to PyPI
+
+on:
+    # Trigger the workflow on push to the dev and any release branches,
+    # and on release tag pushes / GitHub release publication.
+    # Per-PR verification lives in test.yml, code_quality_checks.yml, and
+    # pr_full_build.yml — this workflow is the release pipeline.
+    push:
+        branches:
+            - dev
+            - "release-**"
+        tags:
+            - "v*"
+    release:
+        types:
+            - published
+
+env:
+    LC_ALL: en_US.UTF-8
+
+defaults:
+    run:
+        shell: bash
+
+permissions:
+    contents: read
+    pull-requests: read
+
+jobs:
+    changes:
+        name: Detect changes
+        runs-on: ubuntu-latest
+        permissions:
+            pull-requests: read
+        outputs:
+            # Skip the whole pipeline for operator releases (tags like `operator-v*`).
+            # operator_release.yml handles those; this workflow is lmcache-only.
+            lmcache: ${{ !startsWith(github.ref_name, 'operator-') && (github.event_name == 'release' || startsWith(github.ref, 'refs/tags/') || steps.filter.outputs.lmcache == 'true') }}
+        steps:
+            - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+              if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
+              with:
+                fetch-depth: 2
+
+            - uses: dorny/paths-filter@v3
+              if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
+              id: filter
+              with:
+                filters: |
+                    lmcache:
+                        - '**.py'
+                        - 'pyproject.toml'
+                        - 'pyproject_cli.toml'
+                        - 'requirements/**.txt'
+                        - 'docker/**'
+                        - '.github/workflows/test.yml'
+                        - '.github/workflows/code_quality_checks.yml'
+                        - '.github/workflows/publish.yml'
+                        - '.github/workflows/build_main_artifacts.yml'
+                        - '.github/workflows/build_cli_artifacts.yml'
+                        - '.github/workflows/build_cu129_artifacts.yml'
+                        - '!operator/**'
+
+    # Build each artifact group in its own reusable workflow so that a
+    # failure in one (e.g. cu129) does not block publishing of the others.
+
+    build-main:
+        needs: changes
+        if: needs.changes.outputs.lmcache == 'true'
+        name: Build main
+        uses: ./.github/workflows/build_main_artifacts.yml
+
+    build-cli:
+        needs: changes
+        if: needs.changes.outputs.lmcache == 'true'
+        name: Build CLI
+        uses: ./.github/workflows/build_cli_artifacts.yml
+
+    build-cu129:
+        needs: changes
+        if: needs.changes.outputs.lmcache == 'true'
+        name: Build cu129
+        uses: ./.github/workflows/build_cu129_artifacts.yml
+        # DockerHub creds needed for the cu12.9 manylinux image pull;
+        # reusable workflows do not auto-inherit secrets.
+        secrets: inherit
+
+    # Run tests and code quality checks before publishing
+    test:
+        needs: changes
+        if: needs.changes.outputs.lmcache == 'true'
+        name: Run tests
+        uses: ./.github/workflows/test.yml
+
+    code-quality:
+        needs: changes
+        if: needs.changes.outputs.lmcache == 'true'
+        name: Run code quality checks
+        uses: ./.github/workflows/code_quality_checks.yml
+
+    # Push to Test PyPI when:
+    # - a new GitHub release is published
+    # - a commit lands on dev (PR merged)
+    publish-test-pypi:
+        name: Publish packages to test.pypi.org
+        if: |
+            !failure() && !cancelled() &&
+            needs.changes.outputs.lmcache == 'true' &&
+            github.repository_owner == 'LMCache' &&
+            github.event_name == 'push' && github.ref == 'refs/heads/dev'
+        permissions:
+            contents: read
+            # see https://docs.pypi.org/trusted-publishers/
+            id-token: write
+        runs-on: ubuntu-latest
+        needs: [changes, build-main, test, code-quality]
+
+        steps:
+            - name: Harden Runner
+              uses: step-security/harden-runner@20cf305ff2072d973412fa9b1e3a4f227bda3c76 # v2.14.0
+              with:
+                disable-sudo-and-containers: false
+                egress-policy: audit
+
+            - name: Fetch release artifacts
+              uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+              with:
+                  name: release-artifacts
+                  path: dist
+
+            - name: Upload to Test PyPI
+              uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+              with:
+                  repository-url: https://test.pypi.org/legacy/
+                  verbose: true
+
+    publish-cli-test-pypi:
+        name: Publish lmcache-cli packages to test.pypi.org
+        if: |
+            !failure() && !cancelled() &&
+            needs.changes.outputs.lmcache == 'true' &&
+            github.repository_owner == 'LMCache' &&
+            github.event_name == 'push' && github.ref == 'refs/heads/dev'
+        permissions:
+            contents: read
+            id-token: write
+        runs-on: ubuntu-latest
+        needs: [changes, build-cli, test, code-quality]
+
+        steps:
+            - name: Harden Runner
+              uses: step-security/harden-runner@20cf305ff2072d973412fa9b1e3a4f227bda3c76 # v2.14.0
+              with:
+                disable-sudo-and-containers: false
+                egress-policy: audit
+
+            - name: Fetch CLI release artifacts
+              uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+              with:
+                  name: release-cli-artifacts
+                  path: dist
+
+            - name: Upload lmcache-cli to Test PyPI
+              uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+              with:
+                  repository-url: https://test.pypi.org/legacy/
+                  verbose: true
+
+    # Push to PyPI (production) when:
+    # - a new GitHub release is created
+    publish-pypi:
+        name: Publish release to pypi.org
+        if: |
+            !failure() && !cancelled() &&
+            needs.changes.outputs.lmcache == 'true' &&
+            github.repository_owner == 'LMCache' && github.event.action == 'published'
+        permissions:
+            # see https://docs.pypi.org/trusted-publishers/
+            id-token: write
+            # allow gh release upload
+            contents: write
+
+        runs-on: ubuntu-latest
+        needs: [changes, build-main, test, code-quality]
+
+        steps:
+            - name: Harden Runner
+              uses: step-security/harden-runner@20cf305ff2072d973412fa9b1e3a4f227bda3c76 # v2.14.0
+              with:
+                  disable-sudo-and-containers: false
+                  egress-policy: audit
+
+            - name: Fetch release artifacts
+              uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+              with:
+                  name: release-artifacts
+                  path: dist
+
+            - name: Upload release artifacts to GitHub release
+              env:
+                  GITHUB_TOKEN: ${{ github.token }}
+              run: >-
+                  gh release upload '${{ github.ref_name }}' dist/* --repo '${{ github.repository }}'
+
+            - name: Upload to PyPI
+              uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+              with:
+                verbose: true
+
+    publish-cli-pypi:
+        name: Publish lmcache-cli release to pypi.org
+        if: |
+            !failure() && !cancelled() &&
+            needs.changes.outputs.lmcache == 'true' &&
+            github.repository_owner == 'LMCache' && github.event.action == 'published'
+        permissions:
+            id-token: write
+            contents: write
+        runs-on: ubuntu-latest
+        needs: [changes, build-cli, test, code-quality]
+
+        steps:
+            - name: Harden Runner
+              uses: step-security/harden-runner@20cf305ff2072d973412fa9b1e3a4f227bda3c76 # v2.14.0
+              with:
+                  disable-sudo-and-containers: false
+                  egress-policy: audit
+
+            - name: Fetch CLI release artifacts
+              uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+              with:
+                  name: release-cli-artifacts
+                  path: dist
+
+            - name: Upload lmcache-cli release artifacts to GitHub release
+              env:
+                  GITHUB_TOKEN: ${{ github.token }}
+              run: >-
+                  gh release upload '${{ github.ref_name }}' dist/* --repo '${{ github.repository }}'
+
+            - name: Upload lmcache-cli to PyPI
+              uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+              with:
+                verbose: true
+
+    # Publish cu12.9 wheel to GitHub Release (not PyPI) when a release is published
+    publish-cu129-github-release:
+        name: Publish cu129 wheel to GitHub Release
+        if: |
+            !failure() && !cancelled() &&
+            needs.changes.outputs.lmcache == 'true' &&
+            github.repository_owner == 'LMCache' && github.event.action == 'published'
+        permissions:
+            contents: write
+        runs-on: ubuntu-latest
+        needs: [changes, build-cu129, test, code-quality]
+
+        steps:
+            - name: Harden Runner
+              uses: step-security/harden-runner@20cf305ff2072d973412fa9b1e3a4f227bda3c76 # v2.14.0
+              with:
+                  disable-sudo-and-containers: false
+                  egress-policy: audit
+
+            - name: Fetch cu12.9 release artifacts
+              uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+              with:
+                  name: release-cu129-artifacts
+                  path: dist
+
+            - name: Publish cu12.9 wheel to dedicated GitHub Release
+              env:
+                  GITHUB_TOKEN: ${{ github.token }}
+              run: |
+                  gh release create "${{ github.ref_name }}-cu129" \
+                    --repo ${{ github.repository }} \
+                    --latest=false \
+                    --title "Release ${{ github.ref_name }} · CUDA 12.9" \
+                    --notes "CUDA 12.9 wheel for LMCache ${{ github.ref_name }}.
+
+                  \`\`\`
+                  VERSION=${{ github.ref_name }}
+                  uv pip install lmcache==${VERSION#v} \\
+                    --extra-index-url https://download.pytorch.org/whl/cu129 \\
+                    --find-links https://github.com/${{ github.repository }}/releases/expanded_assets/${VERSION}-cu129 \\
+                    --index-strategy unsafe-best-match
+                  \`\`\`" \
+                    dist/*.whl
+
+    # Build container image and push to DockerHub when:
+    # - a new GitHub release is created
+    publish-image:
+        name: Publish image to DockerHub
+        if: |
+            needs.publish-pypi.result == 'success' &&
+            !cancelled() &&
+            github.repository_owner == 'LMCache' && github.event.action == 'published'
+
+        runs-on: ubuntu-latest
+        needs: [publish-pypi, publish-cu129-github-release]
+
+        steps:
+            - name: "Harden Runner"
+              uses: step-security/harden-runner@20cf305ff2072d973412fa9b1e3a4f227bda3c76 # v2.14.0
+              with:
+                disable-sudo-and-containers: false
+                egress-policy: audit
+
+            - name: Login to DockerHub
+              uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+              with:
+                username: ${{ vars.DOCKERHUB_USERNAME }}
+                password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+            - name: Checkout code
+              uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+              with:
+                # for setuptools-scm
+                fetch-depth: 0
+
+            - name: Free disk space
+              uses: ./.github/actions/free-disk-space
+
+            - name: Get the latest tag (corresponds to release cut in publish-pypi job)
+              run: |
+                echo "LATEST_TAG=$(git tag --list 'v[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)" >> "$GITHUB_ENV"
+
+            - name: Build lmcache/vllm-openai container image (cu13)
+              run: |
+                docker build \
+                --build-arg BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:25.09-cuda13.0-devel-ubuntu24.04 \
+                --build-arg CUDA_VERSION=13.0 \
+                --build-arg torch_cuda_arch_list='7.5 8.0 8.6 8.9 9.0 10.0 12.0+PTX' \
+                --target image-release \
+                --tag lmcache/vllm-openai:latest --tag lmcache/vllm-openai:${{ env.LATEST_TAG }} \
+                --file docker/Dockerfile .
+
+            # `lmcache --help` exercises eager CLI subcommand discovery,
+            # so a missing runtime dep fails the build before the image ships.
+            - name: Smoke test lmcache/vllm-openai (cu13)
+              run: |
+                docker run --rm --entrypoint lmcache lmcache/vllm-openai:${{ env.LATEST_TAG }} --help
+
+            - name: Push lmcache/vllm-openai container image to DockerHub
+              run: |
+                docker push lmcache/vllm-openai:latest
+                docker push lmcache/vllm-openai:${{ env.LATEST_TAG }}
+
+            - name: Clean up Docker layers and cache
+              run: |
+                docker system prune -f --all
+                docker builder prune -af
+
+            - name: Build lmcache/vllm-openai:lightweight
+              run: |
+                docker build \
+                --tag lmcache/vllm-openai:lightweight --tag lmcache/vllm-openai:${{ env.LATEST_TAG }}-lightweight \
+                --file docker/Dockerfile.lightweight .
+
+            - name: Smoke test lmcache/vllm-openai:lightweight
+              run: |
+                docker run --rm --entrypoint lmcache lmcache/vllm-openai:${{ env.LATEST_TAG }}-lightweight --help
+
+            - name: Push lmcache/vllm-openai:lightweight image to DockerHub
+              run: |
+                docker push lmcache/vllm-openai:lightweight
+                docker push lmcache/vllm-openai:${{ env.LATEST_TAG }}-lightweight
+
+            - name: Clean up Docker layers and cache
+              run: |
+                docker system prune -f --all
+                docker builder prune -af
+
+            - name: Build lmcache/standalone container image (cu13)
+              run: |
+                docker build \
+                --build-arg BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:25.09-cuda13.0-devel-ubuntu24.04 \
+                --build-arg CUDA_VERSION=13.0 \
+                --build-arg torch_cuda_arch_list='7.5 8.0 8.6 8.9 9.0 10.0 12.0+PTX' \
+                --target lmcache-final \
+                --tag lmcache/standalone:latest --tag lmcache/standalone:${{ env.LATEST_TAG }} \
+                --tag lmcache/standalone:latest-cu130 --tag lmcache/standalone:${{ env.LATEST_TAG }}-cu130 \
+                --file docker/Dockerfile.standalone .
+
+            - name: Smoke test lmcache/standalone (cu13)
+              run: |
+                docker run --rm --entrypoint lmcache lmcache/standalone:${{ env.LATEST_TAG }} --help
+
+            - name: Push lmcache/standalone container image to DockerHub
+              run: |
+                docker push lmcache/standalone:latest
+                docker push lmcache/standalone:${{ env.LATEST_TAG }}
+                docker push lmcache/standalone:latest-cu130
+                docker push lmcache/standalone:${{ env.LATEST_TAG }}-cu130
+
+            - name: Clean up Docker layers and cache
+              run: |
+                docker system prune -f --all
+                docker builder prune -af
+
+            - name: Build lmcache/vllm-openai container image (cu12.9)
+              if: needs.publish-cu129-github-release.result == 'success'
+              run: |
+                docker build \
+                --build-arg BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:25.05-cuda12.9-devel-ubuntu24.04 \
+                --build-arg CUDA_VERSION=12.9 \
+                --build-arg LMCACHE_VERSION=${{ env.LATEST_TAG }} \
+                --target image-release-cu129 \
+                --tag lmcache/vllm-openai:latest-cu129 --tag lmcache/vllm-openai:${{ env.LATEST_TAG }}-cu129 \
+                --file docker/Dockerfile .
+
+            - name: Smoke test lmcache/vllm-openai (cu12.9)
+              if: needs.publish-cu129-github-release.result == 'success'
+              run: |
+                docker run --rm --entrypoint lmcache lmcache/vllm-openai:${{ env.LATEST_TAG }}-cu129 --help
+
+            - name: Push lmcache/vllm-openai cu129 container image to DockerHub
+              if: needs.publish-cu129-github-release.result == 'success'
+              run: |
+                docker push lmcache/vllm-openai:latest-cu129
+                docker push lmcache/vllm-openai:${{ env.LATEST_TAG }}-cu129
+
+            - name: Clean up Docker layers and cache
+              run: |
+                docker system prune -f --all
+                docker builder prune -af
+
+            - name: Build lmcache/standalone container image (cu12.9)
+              if: needs.publish-cu129-github-release.result == 'success'
+              run: |
+                docker build \
+                --build-arg BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:25.05-cuda12.9-devel-ubuntu24.04 \
+                --build-arg CUDA_VERSION=12.9 \
+                --target lmcache-final \
+                --tag lmcache/standalone:latest-cu129 --tag lmcache/standalone:${{ env.LATEST_TAG }}-cu129 \
+                --file docker/Dockerfile.standalone .
+
+            - name: Smoke test lmcache/standalone (cu12.9)
+              if: needs.publish-cu129-github-release.result == 'success'
+              run: |
+                docker run --rm --entrypoint lmcache lmcache/standalone:${{ env.LATEST_TAG }}-cu129 --help
+
+            - name: Push lmcache/standalone cu129 container image to DockerHub
+              if: needs.publish-cu129-github-release.result == 'success'
+              run: |
+                docker push lmcache/standalone:latest-cu129
+                docker push lmcache/standalone:${{ env.LATEST_TAG }}-cu129

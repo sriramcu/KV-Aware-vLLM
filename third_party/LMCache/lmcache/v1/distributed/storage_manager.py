@@ -1,0 +1,683 @@
+# SPDX-License-Identifier: Apache-2.0
+"""
+Distributed multi-tier storage manager for MP mode
+"""
+
+# Standard
+from contextlib import contextmanager
+from typing import Iterator, Literal
+import time
+
+# First Party
+from lmcache.logging import init_logger
+from lmcache.v1.distributed.api import (
+    MemoryLayoutDesc,
+    ObjectKey,
+    PrefetchHandle,
+)
+from lmcache.v1.distributed.config import StorageManagerConfig
+from lmcache.v1.distributed.error import L1Error, strerror
+from lmcache.v1.distributed.l1_manager import L1Manager
+from lmcache.v1.distributed.l2_adapters import create_l2_adapter
+from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface
+from lmcache.v1.distributed.l2_adapters.serde_wrapper import SerdeL2AdapterWrapper
+from lmcache.v1.distributed.quota_manager import QuotaManager
+from lmcache.v1.distributed.serde import create_serde_processor
+from lmcache.v1.distributed.storage_controllers import (
+    L1EvictionController,
+    L2AdapterEvictionState,
+    L2EvictionController,
+    PrefetchController,
+    StoreController,
+)
+from lmcache.v1.distributed.storage_controllers.prefetch_policy import (
+    create_prefetch_policy,
+)
+from lmcache.v1.distributed.storage_controllers.store_policy import (
+    AdapterDescriptor,
+    create_store_policy,
+)
+from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.mp_observability.event import Event, EventType
+from lmcache.v1.mp_observability.event_bus import get_event_bus
+from lmcache.v1.mp_observability.otel_init import register_gauge
+from lmcache.v1.mp_observability.trace.decorator import (
+    enable_tracing,
+    is_tracing_enabled,
+    publish_call_event,
+)
+
+logger = init_logger(__name__)
+
+
+class StorageManager:
+    def __init__(self, config: StorageManagerConfig):
+        self._l1_manager = L1Manager(config.l1_manager_config)
+        self._event_bus = get_event_bus()
+
+        # L1 eviction controller
+        self._eviction_controller = L1EvictionController(
+            l1_manager=self._l1_manager,
+            eviction_config=config.eviction_config,
+        )
+        self._eviction_controller.start()
+
+        # L2 adapters and store controller. When an adapter config carries
+        # a ``serde_config``, the adapter is wrapped with
+        # ``SerdeL2AdapterWrapper`` so controllers see a plain L2 adapter
+        # and serde is transparent.
+        l1_memory_desc = self._l1_manager.get_l1_memory_desc()
+        self._l2_adapters: list[L2AdapterInterface] = []
+        for ac in config.l2_adapter_config.adapters:
+            adapter: L2AdapterInterface = create_l2_adapter(ac, l1_memory_desc)
+            if ac.serde_config is not None:
+                adapter = SerdeL2AdapterWrapper(
+                    inner=adapter,
+                    serde=create_serde_processor(ac.serde_config),
+                    l1_manager=self._l1_manager,
+                )
+            self._l2_adapters.append(adapter)
+
+        # Per-cache_salt quota registry. Shared across the L2 eviction
+        # controller (reads quotas each cycle) and the HTTP quota
+        # endpoints (CRUD). Present even when no adapter uses
+        # IsolatedLRU so the HTTP layer has a stable ``quota_manager``
+        # reference. No explicit cleanup on close — the registry is
+        # just a dict protected by a lock and has no OS resources.
+        self._quota_manager = QuotaManager()
+
+        # Unified L2 eviction controller for all adapters with eviction
+        # config. Aggregate-usage policies (``LRU``, ``noop``) need
+        # ``max_capacity_bytes > 0`` to compute a usage fraction;
+        # adapters without capacity are skipped for those. Isolated
+        # policies (``IsolatedLRU``) operate on per cache_salt byte
+        # counts which the base class tracks regardless of capacity,
+        # so they are wired up unconditionally.
+        l2_eviction_states: list[L2AdapterEvictionState] = []
+        for adapter, ac in zip(
+            self._l2_adapters, config.l2_adapter_config.adapters, strict=True
+        ):
+            if ac.eviction_config is None:
+                continue
+            policy_name = ac.eviction_config.eviction_policy
+            if policy_name != "IsolatedLRU" and not adapter.supports_global_eviction:
+                logger.warning(
+                    "L2 adapter %s configured with '%s' eviction but does "
+                    "not support global eviction (max_capacity_bytes=0); "
+                    "skipping aggregate-usage eviction setup.",
+                    type(adapter).__name__,
+                    policy_name,
+                )
+                continue
+            l2_eviction_states.append(
+                L2AdapterEvictionState(
+                    adapter=adapter,
+                    eviction_config=ac.eviction_config,
+                )
+            )
+        self._l2_eviction_controller = L2EvictionController(
+            l2_eviction_states, quota_manager=self._quota_manager
+        )
+        self._l2_eviction_controller.start()
+
+        self._adapter_descriptors = [
+            AdapterDescriptor(index=i, config=ac)
+            for i, ac in enumerate(config.l2_adapter_config.adapters)
+        ]
+
+        self._store_controller = StoreController(
+            l1_manager=self._l1_manager,
+            l2_adapters=self._l2_adapters,
+            adapter_descriptors=self._adapter_descriptors,
+            policy=create_store_policy(config.store_policy),
+        )
+        self._store_controller.start()
+
+        # Prefetch controller
+        self._prefetch_controller = PrefetchController(
+            l1_manager=self._l1_manager,
+            l2_adapters=self._l2_adapters,
+            adapter_descriptors=self._adapter_descriptors,
+            policy=create_prefetch_policy(config.prefetch_policy),
+            max_in_flight=config.prefetch_max_in_flight,
+        )
+        self._prefetch_controller.start()
+
+        # L2 usage gauge — one observation per adapter, tagged by
+        # ``l2_name``.  Parallel to L1Manager's ``l1_memory_usage_bytes``.
+        register_gauge(
+            "lmcache.l2",
+            "lmcache_mp.l2_usage_bytes",
+            (
+                "Bytes currently held in each L2 adapter, tagged by "
+                "``l2_name`` (one observation per adapter)."
+            ),
+            self.get_l2_usages,
+        )
+
+    # External APIs for serving engine integration code to call
+    @enable_tracing()
+    def reserve_write(
+        self,
+        keys: list[ObjectKey],
+        layout_desc: MemoryLayoutDesc,
+        mode: Literal["new", "update", "all"],
+    ) -> dict[ObjectKey, MemoryObj]:
+        """
+        Reserve the object for writing into the storage manager.
+
+        Args:
+            keys (list[ObjectKey]): List of object keys to reserve for writing.
+            layout_desc (MemoryLayoutDesc): Description of the memory layout
+                for the objects to be reserved.
+            mode (Literal["new", "update", "all"]): Reservation mode.
+            - "new": Reserve only new objects that do not exist.
+            - "update": Reserve only existing objects for update.
+            - "all": Reserve all writable objects regardless of existence.
+
+        Returns:
+            dict[ObjectKey, MemoryObj]: A dictionary mapping object keys to their
+                reserved memory objects. Note that not all requested keys could be
+                reserved (e.g., out of memory or write conflict)
+        """
+        reserve_result = self._l1_manager.reserve_write(
+            keys=keys,
+            is_temporary=[False] * len(keys),
+            layout_desc=layout_desc,
+            mode=mode,
+        )
+
+        result = {k: m for k, (e, m) in reserve_result.items() if m is not None}
+        successful_keys = list(result.keys())
+        failed_keys = [k for k, (e, m) in reserve_result.items() if m is None]
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.SM_WRITE_RESERVED,
+                metadata={
+                    "succeeded_keys": successful_keys,
+                    "failed_keys": failed_keys,
+                },
+            )
+        )
+
+        oom_keys = [
+            k for k, (e, _) in reserve_result.items() if e == L1Error.OUT_OF_MEMORY
+        ]
+        if oom_keys:
+            self._event_bus.publish(
+                Event(
+                    event_type=EventType.L1_ALLOCATION_FAILED,
+                    metadata={"during": "l1_store", "keys": oom_keys},
+                )
+            )
+
+        return result
+
+    @enable_tracing()
+    def finish_write(
+        self,
+        keys: list[ObjectKey],
+    ) -> None:
+        """
+        Finish writing the objects into the storage manager.
+
+        Args:
+            keys (list[ObjectKey]): List of object keys that have been written.
+        """
+        finish_result = self._l1_manager.finish_write(keys)
+        successful_keys = [k for k, e in finish_result.items() if e == L1Error.SUCCESS]
+        failed_keys = [k for k, e in finish_result.items() if e != L1Error.SUCCESS]
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.SM_WRITE_FINISHED,
+                metadata={
+                    "succeeded_keys": successful_keys,
+                    "failed_keys": failed_keys,
+                },
+            )
+        )
+
+        # TODO: global key states update
+
+    @contextmanager
+    def read_prefetched_results(
+        self,
+        keys: list[ObjectKey],
+    ) -> Iterator[list[MemoryObj] | None]:
+        """
+        Read the memory objects from L1 storage that has been prefetched beforehand.
+        Yielding an optional list of memory objects corresponding to the requested
+        keys. If any the object is not found in L1, None is yielded.
+
+        Args:
+            keys (list[ObjectKey]): List of object keys to reserve for reading.
+
+        Returns:
+            Iterator[list[MemoryObj] | None]: An iterator yielding an optional list of
+                memory objects corresponding to the requested keys.
+
+        Note:
+            If any object is not found in L1 storage, None is yielded. In this case,
+            this function will release release the read lock of all successfully read
+            memory objects when exiting the context.
+
+            If the caller raised exception during the processing of the yielded memory
+            objects, this function will ensure that the read locks will be decreased.
+        """
+        # Manual TRACE_CALL emission for the context manager.  The
+        # ``@enable_tracing`` decorator cannot wrap a ``@contextmanager``
+        # generator function (it would publish the call to the wrapper
+        # rather than to ``__enter__``).  Emit enter/exit events
+        # directly, gated on the tracing flag for zero overhead when
+        # disabled.
+        if is_tracing_enabled():
+            publish_call_event(
+                "lmcache.v1.distributed.storage_manager."
+                "StorageManager.read_prefetched_results.__enter__",
+                {"keys": keys},
+            )
+        read_results = self._l1_manager.unsafe_read(keys)
+        good_keys: list[ObjectKey] = []
+        good_objs: list[MemoryObj] = []
+        bad_keys: list[ObjectKey] = []
+        not_found_keys: list[ObjectKey] = []
+        write_locked_keys: list[ObjectKey] = []
+        all_good = True
+        for k, (e, o) in read_results.items():
+            if o is None:
+                logger.error(
+                    "Failed to read prefetched object %s from L1 storage: %s",
+                    k,
+                    strerror(e),
+                )
+                bad_keys.append(k)
+                all_good = False
+                if e == L1Error.KEY_NOT_EXIST:
+                    not_found_keys.append(k)
+                elif e == L1Error.KEY_NOT_READABLE:
+                    write_locked_keys.append(k)
+                continue
+
+            good_keys.append(k)
+            good_objs.append(o)
+
+        # L1 read-failure anomaly reporting: unsafe_read is required to be
+        # called post-reserve_read, so any failure here is a lock/eviction
+        # race, not a normal cache miss.
+        if not_found_keys:
+            self._event_bus.publish(
+                Event(
+                    event_type=EventType.L1_READ_FAILED,
+                    metadata={
+                        "during": "l1_retrieve",
+                        "reason": "not_found",
+                        "keys": not_found_keys,
+                    },
+                )
+            )
+        if write_locked_keys:
+            self._event_bus.publish(
+                Event(
+                    event_type=EventType.L1_READ_FAILED,
+                    metadata={
+                        "during": "l1_retrieve",
+                        "reason": "write_locked",
+                        "keys": write_locked_keys,
+                    },
+                )
+            )
+
+        successfully_yielded = False
+
+        try:
+            yield good_objs if all_good else None
+            successfully_yielded = True
+        except Exception:
+            logger.exception(
+                "Exception occurred while processing read prefetched results",
+            )
+            raise
+        finally:
+            # Decrease the read lock for all successfully read memory objects
+            # if None is yielded or exception occurs during caller's processing
+            if not all_good or not successfully_yielded:
+                self._l1_manager.finish_read(good_keys)
+                self._event_bus.publish(
+                    Event(
+                        event_type=EventType.SM_READ_PREFETCHED_FINISHED,
+                        metadata={
+                            "succeeded_keys": good_keys,
+                            "failed_keys": bad_keys,
+                        },
+                    )
+                )
+            if is_tracing_enabled():
+                publish_call_event(
+                    "lmcache.v1.distributed.storage_manager."
+                    "StorageManager.read_prefetched_results.__exit__",
+                    {"keys": keys},
+                )
+
+    @enable_tracing()
+    def finish_read_prefetched(
+        self,
+        keys: list[ObjectKey],
+        extra_count: int = 0,
+    ) -> None:
+        """Finish reading prefetched objects.
+
+        Args:
+            keys: Object keys that have been read.
+            extra_count: Extra read locks to release per key
+                (on top of the default 1).
+        """
+        finish_result = self._l1_manager.finish_read(keys, extra_count=extra_count)
+        successful_keys = [k for k, e in finish_result.items() if e == L1Error.SUCCESS]
+        failed_keys = [k for k, e in finish_result.items() if e != L1Error.SUCCESS]
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.SM_READ_PREFETCHED_FINISHED,
+                metadata={
+                    "succeeded_keys": successful_keys,
+                    "failed_keys": failed_keys,
+                },
+            )
+        )
+
+    @enable_tracing()
+    def submit_prefetch_task(
+        self,
+        keys: list[ObjectKey],
+        layout_desc: MemoryLayoutDesc,
+        extra_count: int = 0,
+        external_request_id: str = "",
+    ) -> PrefetchHandle:
+        """Prefetch objects into L1 asynchronously.
+
+        Args:
+            keys: Object keys to prefetch.
+            layout_desc: Memory layout description.
+            extra_count: Extra workers (on top of the default
+                1) that will independently retrieve the same
+                key.  Total locks = 1 + extra_count.
+            external_request_id: Request ID from the caller
+                for end-to-end log tracing.
+
+        Returns:
+            PrefetchHandle to track the task.
+        """
+        # NOTE: now we only have L1, so the prefetch is essentially checking how many
+        # objects are already in L1, and adding read locks to them.
+
+        l1_read_result = self._l1_manager.reserve_read(keys, extra_count=extra_count)
+        hit_count = 0
+        for key in keys:
+            entry = l1_read_result.get(key, None)
+            if entry is None:
+                break
+
+            err, obj = entry
+            if err != L1Error.SUCCESS:
+                break
+
+            hit_count += 1
+
+        # NOTE: For L1, there will be cases that "object in the middle" is not found.
+        # In this case, we need to `finish_read` for the latter objects so that
+        # there won't be dangling read locks.
+        skipped_keys = []
+        for key in keys[hit_count:]:
+            if key in l1_read_result and l1_read_result[key][1] is not None:
+                # this key is actually reserved, need to release the read lock
+                skipped_keys.append(key)
+
+        if skipped_keys:
+            self._l1_manager.finish_read(skipped_keys, extra_count=extra_count)
+
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.SM_READ_PREFETCHED,
+                metadata={
+                    "succeeded_keys": keys[:hit_count],
+                    "failed_keys": keys[hit_count:],
+                },
+            )
+        )
+
+        # Submit remaining keys to L2 prefetch controller
+        remaining_keys = keys[hit_count:]
+        prefetch_request_id = -1
+        if remaining_keys and self._l2_adapters:
+            prefetch_request_id = self._prefetch_controller.submit_prefetch_request(
+                remaining_keys,
+                layout_desc,
+                extra_count=extra_count,
+            )
+
+        submit_time = time.monotonic()
+        logger.debug(
+            "Prefetch request submitted: "
+            "%d total keys, %d L1 prefix hits, "
+            "%d remaining for L2 "
+            "(external_request_id=%s, "
+            "prefetch_request_id=%d)",
+            len(keys),
+            hit_count,
+            len(remaining_keys),
+            external_request_id,
+            prefetch_request_id,
+        )
+
+        return PrefetchHandle(
+            prefetch_request_id=prefetch_request_id,
+            external_request_id=external_request_id,
+            l1_prefix_hit_count=hit_count,
+            total_requested_keys=len(keys),
+            submit_time=submit_time,
+        )
+
+    def query_prefetch_lookup_hits(
+        self,
+        handle: PrefetchHandle,
+    ) -> int | None:
+        """
+        Query the number of prefix hit chunks for a prefetch task before
+        the L2 prefetching is done.
+
+        Args:
+            handle (PrefetchHandle): The handle of the lookup task.
+
+        Returns:
+            the number of prefix hit chunks if the lookup is done, None if
+            it's still in progress,  or the prefetch task is already done.
+
+        Note:
+            This function is designed for the scenario where the caller wants
+            to check the L1 prefix hits as soon as possible without waiting for
+            the whole prefetch task to be done.
+            When the prefetch task is already done and the prefetch task result
+            has already been queried by `query_prefetch_status`, this function
+            will return None forever for the same prefetch handle.
+            Therefore, it's the caller’s responsibility to make sure not calling
+            this function after the prefetch task is done.
+        """
+        if handle.prefetch_request_id == -1:
+            # No L2 request, the prefix hit count is final
+            return handle.l1_prefix_hit_count
+
+        # Have L2 request, need to check the status from prefetch controller
+        l2_r = self._prefetch_controller.query_lookup_result(handle.prefetch_request_id)
+
+        if l2_r is None:
+            # L2 prefetch is still in progress or it's already done and
+            # the result has been consumed by `query_prefetch_status`
+            return None
+
+        # L2 lookup is done, return the total prefix hit count (L1 + L2)
+        return handle.l1_prefix_hit_count + l2_r
+
+    def query_prefetch_status(
+        self,
+        handle: PrefetchHandle,
+    ) -> int | None:
+        """
+        Query the status of the prefetch task.
+
+        Args:
+            handle (PrefetchHandle): The handle of the prefetch task.
+
+        Returns:
+            the number of prefix hit chunks if the prefetch is done, None if
+            it's still in progress.
+        """
+        l2_result: int = 0
+
+        # Have L2 request, need to check the result from prefetch controller
+        if handle.prefetch_request_id != -1:
+            l2_r = self._prefetch_controller.query_prefetch_result(
+                handle.prefetch_request_id
+            )
+
+            if l2_r is None:
+                return None
+            l2_result = l2_r  # Just to make linter happy
+
+        total_hits = handle.l1_prefix_hit_count + l2_result
+        elapsed_ms = (time.monotonic() - handle.submit_time) * 1000
+
+        if total_hits > 0:
+            logger.info(
+                "Prefetch request completed (L1+L2): "
+                "%d/%d prefix hits (%d L1, %d L2) "
+                "in %.1f ms "
+                "(external_request_id=%s, "
+                "prefetch_request_id=%d)",
+                total_hits,
+                handle.total_requested_keys,
+                handle.l1_prefix_hit_count,
+                l2_result,
+                elapsed_ms,
+                handle.external_request_id,
+                handle.prefetch_request_id,
+            )
+        return total_hits
+
+    def touch_l1_keys(self, keys: list[ObjectKey]):
+        """
+        Touch the keys in L1 storage, marking the keys
+        as accessed(retrieved or stored).
+
+        Args:
+            keys (list[ObjectKey]): List of object keys to touch.
+        """
+        self._l1_manager.touch_keys(keys)
+
+    @property
+    def quota_manager(self) -> QuotaManager:
+        """Per-cache_salt quota registry.
+
+        Exposed so the HTTP layer can serve CRUD endpoints without
+        reaching into private state. Always non-``None`` — the
+        storage manager creates the registry at construction time.
+        """
+        return self._quota_manager
+
+    def get_l2_usages(
+        self,
+    ) -> list[tuple[int | float, dict[str, object]]]:
+        """Per-adapter L2 usage in OTel-observation shape.
+
+        Backing data for the ``lmcache_mp.l2_usage_bytes`` observable
+        gauge.  One entry per configured adapter.
+
+        Returns:
+            A list of ``(total_bytes_used, {"l2_name": <type_name>})``
+            tuples — empty when no L2 adapters are configured.  Adapters
+            whose ``get_usage()`` raises are skipped (the gauge prefers
+            silence over a poison observation).
+        """
+        out: list[tuple[int | float, dict[str, object]]] = []
+        for adapter, desc in zip(
+            self._l2_adapters, self._adapter_descriptors, strict=True
+        ):
+            try:
+                usage = adapter.get_usage()
+            except Exception:
+                logger.exception(
+                    "L2 adapter %s get_usage() failed; skipping in gauge",
+                    desc.type_name,
+                )
+                continue
+            out.append((int(usage.total_bytes_used), {"l2_name": desc.type_name}))
+        return out
+
+    def get_usage_bytes_by_cache_salt(self) -> dict[str, int]:
+        """Aggregate ``cache_salt`` byte usage across every L2 adapter.
+
+        Used by the HTTP quota endpoints to report ``current_usage_gb``
+        alongside the configured limit. Aggregation is a simple sum:
+        each adapter tracks the same salt independently so the totals
+        are additive.
+        """
+        totals: dict[str, int] = {}
+        for adapter in self._l2_adapters:
+            snap = adapter.get_usage().bytes_by_cache_salt
+            for salt, used in snap.items():
+                totals[salt] = totals.get(salt, 0) + used
+        return totals
+
+    def clear(self, force: bool = False):
+        """
+        Clear data in the storage manager.
+
+        Args:
+            force: If True, clear ALL objects including locked ones.
+                This may corrupt in-flight store/prefetch operations.
+                If False (default), only clear unlocked objects, keeping
+                write-locked and read-locked objects intact.
+        """
+        self._l1_manager.clear(force=force)
+
+    def close(self):
+        """
+        Close the storage manager and release all resources.
+        """
+        self._prefetch_controller.stop()
+        self._store_controller.stop()
+        self._eviction_controller.stop()
+        self._l2_eviction_controller.stop()
+
+        for adapter in self._l2_adapters:
+            adapter.close()
+
+        self._l1_manager.close()
+
+    def report_status(self) -> dict:
+        """Return a status dict aggregating all sub-component statuses."""
+        l1 = self._l1_manager.report_status()
+        store = self._store_controller.report_status()
+        prefetch = self._prefetch_controller.report_status()
+        l1_eviction = self._eviction_controller.report_status()
+        l2_eviction = self._l2_eviction_controller.report_status()
+        adapters = [a.report_status() for a in self._l2_adapters]
+        children = [l1, store, prefetch, l1_eviction, l2_eviction] + adapters
+        return {
+            "is_healthy": all(c["is_healthy"] for c in children),
+            "l1_manager": l1,
+            "store_controller": store,
+            "prefetch_controller": prefetch,
+            "l1_eviction_controller": l1_eviction,
+            "l2_eviction_controller": l2_eviction,
+            "l2_adapters": adapters,
+            "num_l2_adapters": len(self._l2_adapters),
+        }
+
+    # Functions for debugging and testing
+    def memcheck(self) -> bool:
+        """
+        Perform memory check for all storage tiers.
+
+        Returns:
+            True if memory is consistent, False otherwise.
+        """
+        return self._l1_manager.memcheck()
