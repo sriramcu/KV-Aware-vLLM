@@ -77,6 +77,180 @@ class LocalDiskWorker:
         self._kvio_state_lock = threading.Lock()
         self._kvio_active = {"prefetch": 0, "put": 0, "delete": 0}
 
+        # P0-B: bound disk puts before LocalDiskBackend takes an extra
+        # MemoryObj ref and before work enters the executor's unbounded queue.
+        # A value of 0 disables P0-B.
+        self._p0_put_limit = int(
+            os.environ.get(
+                "LMCACHE_P0_DISK_PUT_MAX_PENDING",
+                "8",
+            )
+        )
+        if self._p0_put_limit < 0:
+            raise ValueError(
+                "LMCACHE_P0_DISK_PUT_MAX_PENDING must be >= 0, "
+                f"got {self._p0_put_limit}"
+            )
+        self._p0_put_admission = (
+            threading.BoundedSemaphore(self._p0_put_limit)
+            if self._p0_put_limit > 0
+            else None
+        )
+        self._p0_put_state_lock = threading.Lock()
+        self._p0_put_inflight = 0
+        self._p0_put_waiters = 0
+        self._p0_put_peak = 0
+
+        logger.info(
+            "P0 disk put admission: limit=%d (0 disables P0-B)",
+            self._p0_put_limit,
+        )
+
+    def acquire_put_admission(self, key: CacheEngineKey) -> bool:
+        """Block before ref_count_up until one bounded put slot is free.
+
+        A disabled gate returns True immediately so callers continue through
+        the original LMCache write path without admission throttling.
+        """
+        semaphore = self._p0_put_admission
+        if semaphore is None:
+            return True
+
+        queued_at = time.monotonic()
+        trace_enabled = _kvio_trace_enabled()
+        with self._p0_put_state_lock:
+            self._p0_put_waiters += 1
+            waiters = self._p0_put_waiters
+            inflight = self._p0_put_inflight
+
+        if trace_enabled:
+            logger.warning(
+                "[P0_PUT_ADMISSION_WAIT] pid=%d key_hash=%s "
+                "limit=%d inflight=%d waiters=%d queue_depth=%d "
+                "thread=%s",
+                os.getpid(),
+                key.chunk_hash,
+                self._p0_put_limit,
+                inflight,
+                waiters,
+                self.executor._queue.qsize(),
+                threading.current_thread().name,
+            )
+
+        # Blocking the storage-manager event-loop thread would prevent queued
+        # puts from completing and releasing slots. That path is not expected
+        # for normal vLLM stores, so reject rather than deadlock if it occurs.
+        on_event_loop = threading.get_ident() == getattr(
+            self.loop,
+            "_thread_id",
+            None,
+        )
+        if on_event_loop:
+            acquired = semaphore.acquire(blocking=False)
+            if not acquired:
+                with self._p0_put_state_lock:
+                    self._p0_put_waiters -= 1
+                    waiters = self._p0_put_waiters
+                    inflight = self._p0_put_inflight
+                logger.error(
+                    "[P0_PUT_ADMISSION_REJECT_LOOP_THREAD] "
+                    "pid=%d key_hash=%s waited=%.6f limit=%d "
+                    "inflight=%d waiters=%d queue_depth=%d",
+                    os.getpid(),
+                    key.chunk_hash,
+                    time.monotonic() - queued_at,
+                    self._p0_put_limit,
+                    inflight,
+                    waiters,
+                    self.executor._queue.qsize(),
+                )
+                return False
+        else:
+            while not semaphore.acquire(timeout=5.0):
+                logger.warning(
+                    "[P0_PUT_ADMISSION_STALLED] pid=%d key_hash=%s "
+                    "waited=%.6f limit=%d queue_depth=%d "
+                    "put_tasks=%d thread=%s",
+                    os.getpid(),
+                    key.chunk_hash,
+                    time.monotonic() - queued_at,
+                    self._p0_put_limit,
+                    self.executor._queue.qsize(),
+                    len(self.put_tasks),
+                    threading.current_thread().name,
+                )
+
+        with self._p0_put_state_lock:
+            self._p0_put_waiters -= 1
+            self._p0_put_inflight += 1
+            self._p0_put_peak = max(
+                self._p0_put_peak,
+                self._p0_put_inflight,
+            )
+            waiters = self._p0_put_waiters
+            inflight = self._p0_put_inflight
+            peak = self._p0_put_peak
+
+        if trace_enabled:
+            logger.warning(
+                "[P0_PUT_ADMISSION_ACQUIRE] pid=%d key_hash=%s "
+                "waited=%.6f limit=%d inflight=%d waiters=%d "
+                "peak=%d queue_depth=%d put_tasks=%d thread=%s",
+                os.getpid(),
+                key.chunk_hash,
+                time.monotonic() - queued_at,
+                self._p0_put_limit,
+                inflight,
+                waiters,
+                peak,
+                self.executor._queue.qsize(),
+                len(self.put_tasks),
+                threading.current_thread().name,
+            )
+        return True
+
+    def release_put_admission(
+        self,
+        key: CacheEngineKey,
+        reason: str,
+        error: Optional[BaseException] = None,
+    ) -> None:
+        """Release a put slot after completion or failed submission."""
+        semaphore = self._p0_put_admission
+        if semaphore is None:
+            return
+
+        with self._p0_put_state_lock:
+            self._p0_put_inflight -= 1
+            if self._p0_put_inflight < 0:
+                self._p0_put_inflight = 0
+                raise RuntimeError(
+                    f"P0 put admission underflow for key={key}"
+                )
+            inflight = self._p0_put_inflight
+            waiters = self._p0_put_waiters
+            peak = self._p0_put_peak
+
+        semaphore.release()
+        if _kvio_trace_enabled() or error is not None:
+            logger.warning(
+                "[P0_PUT_ADMISSION_RELEASE] pid=%d key_hash=%s "
+                "reason=%s error=%r limit=%d inflight=%d "
+                "waiters=%d peak=%d queue_depth=%d put_tasks=%d "
+                "thread=%s",
+                os.getpid(),
+                key.chunk_hash,
+                reason,
+                error,
+                self._p0_put_limit,
+                inflight,
+                waiters,
+                peak,
+                self.executor._queue.qsize(),
+                len(self.put_tasks),
+                threading.current_thread().name,
+            )
+
     async def submit_task(
         self,
         task_type: str,
@@ -181,8 +355,10 @@ class LocalDiskWorker:
             else:
                 logger.warning(f"Key {key} not found in put tasks.")
 
-    def insert_put_task(self, key: CacheEngineKey):
+    def insert_put_task(self, key: CacheEngineKey) -> bool:
         with self.put_lock:
+            if key in self.put_tasks:
+                return False
             self.put_tasks.append(key)
             if _kvio_trace_enabled():
                 logger.warning(
@@ -191,6 +367,7 @@ class LocalDiskWorker:
                     key.chunk_hash,
                     len(self.put_tasks),
                 )
+            return True
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
         with self.put_lock:
@@ -436,6 +613,9 @@ class LocalDiskBackend(StorageBackendInterface):
         """
         Submit a single put task to store KV cache to disk asynchronously.
 
+        P0-B acquires a bounded admission slot before incrementing the
+        MemoryObj refcount or placing the write in the executor queue.
+
         :param key: The cache key for this KV chunk.
         :param memory_obj: The memory object containing the KV data.
         :param on_complete_callback: Optional callback invoked once per key
@@ -444,12 +624,26 @@ class LocalDiskBackend(StorageBackendInterface):
         """
         assert memory_obj.tensor is not None
 
-        # skip repeated save
+        # Fast duplicate check avoids waiting for a slot for work that is
+        # already pending. insert_put_task() repeats the check atomically after
+        # admission to close the race between concurrent submitters.
         if self.exists_in_put_tasks(key):
             logger.debug(f"Put task for {key} is already in progress.")
             return None
 
-        self.disk_worker.insert_put_task(key)
+        if not self.disk_worker.acquire_put_admission(key):
+            logger.warning(
+                "Skipping disk put for %s because bounded admission rejected it.",
+                key,
+            )
+            return None
+
+        if not self.disk_worker.insert_put_task(key):
+            self.disk_worker.release_put_admission(
+                key,
+                reason="duplicate_after_wait",
+            )
+            return None
 
         # TODO(Jiayi): Fragmentation is not considered here.
         required_size = memory_obj.get_physical_size()
@@ -478,21 +672,58 @@ class LocalDiskBackend(StorageBackendInterface):
                 self.cache_policy.update_on_put(key)
 
         if not evict_success:
+            self.disk_worker.remove_put_task(key)
+            self.disk_worker.release_put_admission(
+                key,
+                reason="disk_capacity_rejected",
+            )
             return None
 
+        # This extra ref is now taken only after bounded admission succeeds.
         memory_obj.ref_count_up()
 
-        asyncio.run_coroutine_threadsafe(
-            self.disk_worker.submit_task(
-                "put",
-                self.async_save_bytes_to_disk,
-                key=key,
-                memory_obj=memory_obj,
-                on_complete_callback=on_complete_callback,
-                _kvio_id=f"put:{key.chunk_hash}",
-            ),
-            self.loop,
-        )
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self.disk_worker.submit_task(
+                    "put",
+                    self.async_save_bytes_to_disk,
+                    key=key,
+                    memory_obj=memory_obj,
+                    on_complete_callback=on_complete_callback,
+                    _kvio_id=f"put:{key.chunk_hash}",
+                ),
+                self.loop,
+            )
+        except BaseException as exc:
+            memory_obj.ref_count_down()
+            self.disk_worker.remove_put_task(key)
+            self.disk_worker.release_put_admission(
+                key,
+                reason="submit_failed",
+                error=exc,
+            )
+            raise
+
+        def release_admission(done_future: Future) -> None:
+            error: Optional[BaseException] = None
+            reason = "completed"
+            if done_future.cancelled():
+                reason = "cancelled"
+            else:
+                try:
+                    error = done_future.exception()
+                except BaseException as exc:
+                    error = exc
+                if error is not None:
+                    reason = "failed"
+            self.disk_worker.release_put_admission(
+                key,
+                reason=reason,
+                error=error,
+            )
+
+        future.add_done_callback(release_admission)
+        return future
 
     # TODO(Jiayi): enable real batching
     def batched_submit_put_task(

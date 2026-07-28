@@ -411,6 +411,34 @@ class StorageManager:
         )
         self.async_serializer: Optional[AsyncSerializer] = None
 
+        # P0-A: admit async lookups before any backend pins keys or allocates
+        # staging buffers. A value of 0 disables P0-A and restores the
+        # original fire-and-forget async lookup/prefetch behavior.
+        self._p0_lookup_limit = int(
+            _sr_os.environ.get(
+                "LMCACHE_P0_LOOKUP_MAX_INFLIGHT",
+                "1",
+            )
+        )
+        if self._p0_lookup_limit < 0:
+            raise ValueError(
+                "LMCACHE_P0_LOOKUP_MAX_INFLIGHT must be >= 0, "
+                f"got {self._p0_lookup_limit}"
+            )
+        self._p0_lookup_admission = (
+            asyncio.Semaphore(self._p0_lookup_limit)
+            if self._p0_lookup_limit > 0
+            else None
+        )
+        self._p0_lookup_inflight = 0
+        self._p0_lookup_waiters = 0
+        self._p0_lookup_peak = 0
+
+        logger.info(
+            "P0 worker lookup admission: limit=%d (0 disables P0-A)",
+            self._p0_lookup_limit,
+        )
+
         # The GPU stream for internal copies during put
         if is_cuda_worker(metadata):
             self.internal_copy_stream = torch_dev.Stream()
@@ -681,6 +709,101 @@ class StorageManager:
             task = asyncio.run_coroutine_threadsafe(coro, self.loop)
             yield task
 
+    async def _p0_acquire_lookup_admission(self, lookup_id: str) -> bool:
+        """Acquire a lookup slot before contains(pin=True) can retain keys.
+
+        Returns True only when a real P0-A permit was acquired. A configured
+        limit of 0 bypasses the gate and returns False.
+        """
+        semaphore = self._p0_lookup_admission
+        if semaphore is None:
+            return False
+
+        queued_at = _sr_time.monotonic()
+        self._p0_lookup_waiters += 1
+        trace_enabled = _sr_os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1"
+
+        if trace_enabled:
+            logger.warning(
+                "[P0_LOOKUP_ADMISSION_WAIT] pid=%d lookup_id=%s "
+                "limit=%d inflight=%d waiters=%d",
+                _sr_os.getpid(),
+                lookup_id,
+                self._p0_lookup_limit,
+                self._p0_lookup_inflight,
+                self._p0_lookup_waiters,
+            )
+
+        try:
+            await semaphore.acquire()
+        except BaseException:
+            self._p0_lookup_waiters -= 1
+            if trace_enabled:
+                logger.warning(
+                    "[P0_LOOKUP_ADMISSION_ABORT] pid=%d lookup_id=%s "
+                    "waited=%.6f inflight=%d waiters=%d",
+                    _sr_os.getpid(),
+                    lookup_id,
+                    _sr_time.monotonic() - queued_at,
+                    self._p0_lookup_inflight,
+                    self._p0_lookup_waiters,
+                )
+            raise
+
+        self._p0_lookup_waiters -= 1
+        self._p0_lookup_inflight += 1
+        self._p0_lookup_peak = max(
+            self._p0_lookup_peak,
+            self._p0_lookup_inflight,
+        )
+        if trace_enabled:
+            logger.warning(
+                "[P0_LOOKUP_ADMISSION_ACQUIRE] pid=%d lookup_id=%s "
+                "waited=%.6f limit=%d inflight=%d waiters=%d peak=%d",
+                _sr_os.getpid(),
+                lookup_id,
+                _sr_time.monotonic() - queued_at,
+                self._p0_lookup_limit,
+                self._p0_lookup_inflight,
+                self._p0_lookup_waiters,
+                self._p0_lookup_peak,
+            )
+        return True
+
+    def _p0_release_lookup_admission(
+        self,
+        lookup_id: str,
+        reason: str,
+        admitted_at: float,
+    ) -> None:
+        """Release one lookup slot on the storage-manager event loop."""
+        semaphore = self._p0_lookup_admission
+        if semaphore is None:
+            return
+
+        self._p0_lookup_inflight -= 1
+        if self._p0_lookup_inflight < 0:
+            self._p0_lookup_inflight = 0
+            raise RuntimeError(
+                f"P0 lookup admission underflow for lookup_id={lookup_id}"
+            )
+        semaphore.release()
+
+        if _sr_os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
+            logger.warning(
+                "[P0_LOOKUP_ADMISSION_RELEASE] pid=%d lookup_id=%s "
+                "reason=%s held=%.6f limit=%d inflight=%d "
+                "waiters=%d peak=%d",
+                _sr_os.getpid(),
+                lookup_id,
+                reason,
+                _sr_time.monotonic() - admitted_at,
+                self._p0_lookup_limit,
+                self._p0_lookup_inflight,
+                self._p0_lookup_waiters,
+                self._p0_lookup_peak,
+            )
+
     def prefetch_single_done_callback(
         self,
         future: asyncio.Future,
@@ -842,7 +965,7 @@ class StorageManager:
         _sr_lookup_debug(lookup_id, retrieved_length=retrieved_length, extra="responding_to_scheduler")
         self.async_lookup_server.send_response_to_scheduler(lookup_id, retrieved_length)
 
-    async def async_lookup_and_prefetch(
+    async def _async_lookup_and_prefetch_impl(
         self,
         lookup_id: str,
         keys: list[CacheEngineKey],
@@ -1083,6 +1206,41 @@ class StorageManager:
                 keys_per_chunk=keys_per_chunk,
             )
         )
+
+        # When P0-A is enabled, keep its permit until physical prefetch work
+        # completes. When disabled, preserve vanilla LMCache's fire-and-forget
+        # behavior and return immediately after registering callbacks.
+        if self._p0_lookup_admission is not None:
+            await all_done
+
+    async def async_lookup_and_prefetch(
+        self,
+        lookup_id: str,
+        keys: list[CacheEngineKey],
+        cum_chunk_lengths: list[int],
+        search_range: Optional[list[str]] = None,
+        pin: bool = False,
+        keys_per_chunk: int = 1,
+    ) -> None:
+        """P0-A wrapper that bounds lookups before any pinning occurs."""
+        admitted = await self._p0_acquire_lookup_admission(lookup_id)
+        admitted_at = _sr_time.monotonic() if admitted else 0.0
+        try:
+            await self._async_lookup_and_prefetch_impl(
+                lookup_id,
+                keys,
+                cum_chunk_lengths,
+                search_range,
+                pin,
+                keys_per_chunk,
+            )
+        finally:
+            if admitted:
+                self._p0_release_lookup_admission(
+                    lookup_id,
+                    reason="prefetch_complete_or_exit",
+                    admitted_at=admitted_at,
+                )
 
     def set_hot_cache(self, enabled: bool) -> None:
         """

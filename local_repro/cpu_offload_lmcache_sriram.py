@@ -164,11 +164,11 @@ sys.path.insert(0, vllm_root)
 #     to_dataframe as kv_to_dataframe,
 # )
 # from kvcache_visualize import visualize as kv_visualize
-
-LM_CACHE_DISK_PATH = os.environ.get(
-    "SRIRAM_LMCACHE_DIR",
-    "/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/lmcache_vllm/manual",
-)
+# LM_CACHE_DISK_PATH = os.environ.get(
+#     "SRIRAM_LMCACHE_DIR",
+#     "/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/lmcache_vllm/manual",
+# )
+LM_CACHE_DISK_PATH = "/scratch/sriramc2/vllm/"
 def setup_environment_variables():
     def write_lmcache_config(path: str):
         import textwrap
@@ -219,6 +219,7 @@ def setup_environment_variables():
     os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "100"
 
     os.makedirs(f"{LM_CACHE_DISK_PATH}", exist_ok=True)
+    print("XYZ created lmcache disk path")
     os.environ["LMCACHE_LOCAL_DISK"] = f"file://{LM_CACHE_DISK_PATH}"
     os.environ["LMCACHE_INTERNAL_API_SERVER_ENABLED"] = "True"
     os.environ["LMCACHE_MAX_LOCAL_DISK_SIZE"] = "450"

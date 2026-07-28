@@ -2,14 +2,22 @@
 set -euo pipefail
 
 # Creates a targeted, full-content "gitingest-like" bundle for debugging
-# KV-Aware-vLLM / LMCache / Hierarchical_KV runs in a new chat.
+# KV-Aware-vLLM / vendored LMCache / Hierarchical_KV runs in a new chat.
+#
+# LMCache is expected to live in:
+#   $REPO/third_party/LMCache
+#
+# and to be installed editable from that source tree. The script records the
+# actual Python import location, but always bundles the vendored source rather
+# than treating site-packages as the authoritative copy.
 #
 # Usage:
 #   cd /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
-#   bash /path/to/make_kvaware_code_bundle_updated.sh
+#   bash /path/to/make_kvaware_code_bundle_updated_v3.sh
 #
 # Optional overrides:
 #   REPO=/path/to/KV-Aware-vLLM
+#   LMCACHE_ROOT=/path/to/vendored/LMCache
 #   OUT=/path/to/kvaware_important_code_bundle.txt
 #   HOME_DIR=/mnt/shared/gpfs/home/sriramc2
 #
@@ -18,9 +26,21 @@ set -euo pipefail
 
 HOME_DIR="${HOME_DIR:-/mnt/shared/gpfs/home/sriramc2}"
 REPO="${REPO:-$HOME_DIR/KV-Aware-vLLM}"
+LMCACHE_ROOT="${LMCACHE_ROOT:-$REPO/third_party/LMCache}"
+LMCACHE_PKG="${LMCACHE_PKG:-$LMCACHE_ROOT/lmcache}"
 OUT="${OUT:-$HOME_DIR/kvaware_important_code_bundle.txt}"
 
 cd "$REPO"
+
+if [[ ! -d "$LMCACHE_ROOT" || ! -f "$LMCACHE_ROOT/pyproject.toml" ]]; then
+  echo "ERROR: vendored LMCache source not found at: $LMCACHE_ROOT" >&2
+  exit 1
+fi
+
+if [[ ! -d "$LMCACHE_PKG" ]]; then
+  echo "ERROR: LMCache Python package not found at: $LMCACHE_PKG" >&2
+  exit 1
+fi
 
 declare -A APPENDED=()
 
@@ -50,8 +70,6 @@ append_file() {
       echo "================================================================================"
       echo "FILE: $f"
       echo "================================================================================"
-      # Full content is intentional. The old script stopped at line 2400,
-      # which omitted relevant scheduler/adapter/backend code.
       cat "$f"
       echo
     } >> "$OUT"
@@ -73,37 +91,85 @@ append_existing_files_from_find() {
 }
 
 {
-  echo "KV-Aware-vLLM / LMCache Important Code Bundle"
+  echo "KV-Aware-vLLM / Vendored LMCache Important Code Bundle"
   echo "Generated: $(date --iso-8601=seconds 2>/dev/null || date)"
   echo "Host: $(hostname)"
   echo "User: $(whoami)"
   echo "Repo: $REPO"
+  echo "Vendored LMCache root: $LMCACHE_ROOT"
+  echo "Vendored LMCache package: $LMCACHE_PKG"
   echo "Output: $OUT"
   echo
-  echo "Git status:"
+
+  echo "Parent repository status:"
   git status --short || true
   echo
-  echo "Git branch/commit:"
+  echo "Parent repository branch/commit/remotes:"
   git branch --show-current || true
   git rev-parse HEAD || true
+  git remote -v || true
   echo
-  echo "Python / package import paths and versions:"
-  python - <<'PY' || true
+  echo "Submodule status:"
+  git submodule status --recursive || true
+  echo
+
+  echo "Vendored LMCache Git identity:"
+  git -C "$LMCACHE_ROOT" rev-parse --show-toplevel 2>/dev/null || true
+  git -C "$LMCACHE_ROOT" branch --show-current 2>/dev/null || true
+  git -C "$LMCACHE_ROOT" rev-parse HEAD 2>/dev/null || true
+  git -C "$LMCACHE_ROOT" status --short 2>/dev/null || true
+  echo
+
+  echo "Python / source import paths / native extensions / versions:"
+  REPO="$REPO" LMCACHE_ROOT="$LMCACHE_ROOT" python - <<'PY' || true
+import importlib
 import os
 import sys
+from pathlib import Path
+
+repo = Path(os.environ["REPO"]).resolve()
+lmcache_root = Path(os.environ["LMCACHE_ROOT"]).resolve()
 
 print("python_executable:", sys.executable)
 print("python_version:", sys.version.replace("\n", " "))
+
 for modname in ["vllm", "lmcache", "torch", "transformers"]:
     try:
-        m = __import__(modname)
+        module = importlib.import_module(modname)
+        path = getattr(module, "__file__", None)
         print(
             f"{modname}: "
-            f"file={getattr(m, '__file__', None)} "
-            f"version={getattr(m, '__version__', None)}"
+            f"file={path} "
+            f"version={getattr(module, '__version__', None)}"
         )
-    except Exception as e:
-        print(f"{modname}: import_error={e!r}")
+        if path:
+            resolved = Path(path).resolve()
+            if modname == "vllm":
+                print("vllm_imports_from_repo:", repo in resolved.parents)
+            elif modname == "lmcache":
+                print(
+                    "lmcache_imports_from_vendored_source:",
+                    lmcache_root in resolved.parents,
+                )
+    except Exception as exc:
+        print(f"{modname}: import_error={exc!r}")
+
+for modname in ["vllm._C", "lmcache.c_ops"]:
+    try:
+        module = importlib.import_module(modname)
+        print(f"{modname}: file={getattr(module, '__file__', None)} import=OK")
+    except Exception as exc:
+        print(f"{modname}: import_error={exc!r}")
+
+try:
+    import torch
+    print("torch_cuda_version:", torch.version.cuda)
+    print("torch_cuda_available:", torch.cuda.is_available())
+    print("torch_cuda_device_count:", torch.cuda.device_count())
+    if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+        print("torch_cuda_device_0:", torch.cuda.get_device_name(0))
+except Exception as exc:
+    print("torch_cuda_probe_error:", repr(exc))
 
 print("selected_environment:")
 for name in sorted(os.environ):
@@ -111,6 +177,7 @@ for name in sorted(os.environ):
         name.startswith("LMCACHE_")
         or name.startswith("VLLM_")
         or name.startswith("SRIRAM_")
+        or name.startswith("DYN_KVBM_")
         or name in {
             "CUDA_VISIBLE_DEVICES",
             "CUDA_DEVICE_ORDER",
@@ -129,14 +196,71 @@ for name in sorted(os.environ):
         print(f"{name}={os.environ.get(name)}")
 PY
   echo
+
   echo "Relevant installed packages:"
   python -m pip show lmcache vllm torch transformers 2>/dev/null || true
+  echo
+  echo "Editable-install metadata:"
+  python -m pip list --editable 2>/dev/null || true
+  echo
+  echo "Dependency consistency:"
+  python -m pip check 2>/dev/null || true
 } > "$OUT"
 
-echo "Adding targeted repo files..."
+section "HIGH-LEVEL DIRECTORY STRUCTURE"
+cat >> "$OUT" <<EOF
+$REPO/
+├── local_repro/
+│   ├── cpu_offload_lmcache_sriram.py
+│   ├── run_driver.sh
+│   └── sbatch/
+├── vllm/
+│   ├── entrypoints/
+│   ├── v1/core/sched/
+│   ├── v1/engine/
+│   └── distributed/kv_transfer/kv_connector/v1/
+├── third_party/LMCache/
+│   ├── pyproject.toml
+│   ├── requirements/
+│   └── lmcache/
+│       ├── integration/vllm/
+│       └── v1/
+│           ├── lookup_client/
+│           ├── storage_backend/
+│           ├── gpu_connector/
+│           ├── cache_engine.py
+│           └── memory_management.py
+├── Hierarchical_KV/
+│   ├── LinearRAG/
+│   ├── data/
+│   └── hierarchical-kv-gnn-3tier-compression/
+├── p0_first_half_bundle/
+├── lmcache_config.yaml
+├── lmcache_hit_hook.py
+├── kvcache_monitor.py
+└── kvcache_visualize.py
+
+Runtime/build paths:
+├── venv: $HOME_DIR/venvs/kvaware
+├── run root: $HOME_DIR/runs/kvaware_repro
+└── LMCache disk data: job-specific directory below the run root
+
+This is intentionally a high-level map, not a recursive listing of every file.
+EOF
+
+section "BUILD AND PACKAGING FILES"
+append_file "pyproject.toml"
+append_file "CMakeLists.txt"
+append_file "requirements/build.txt"
+append_file "$LMCACHE_ROOT/pyproject.toml"
+append_file "$LMCACHE_ROOT/CMakeLists.txt"
+append_file "$LMCACHE_ROOT/setup.py"
+append_file "$LMCACHE_ROOT/requirements/build.txt"
+
+echo "Adding targeted repository files..."
 
 # ---------------------------------------------------------------------------
-# Driver, launch, configuration, monitoring, and all local repro variants.
+# Driver, launch, configuration, monitoring, setup, and local repro variants.
 # ---------------------------------------------------------------------------
 append_file "local_repro/cpu_offload_lmcache_sriram.py"
 append_file "local_repro/run_driver.sh"
@@ -147,8 +271,26 @@ append_file "lmcache_config.yaml"
 
 append_existing_files_from_find < <(
   find local_repro -maxdepth 4 -type f \
-    \( -name '*.py' -o -name '*.sh' -o -name '*.sbatch' -o -name '*.yaml' -o -name '*.yml' \) \
+    \( -name '*.py' -o -name '*.sh' -o -name '*.sbatch' -o -name '*.yaml' -o -name '*.yml' -o -name '*.md' \) \
     | sort
+)
+
+# Include local P0/Gate C bundles, tests, summaries, and documentation when
+# present, but not generated logs or archive payloads.
+append_existing_files_from_find < <(
+  find . -maxdepth 4 -type f \
+    \( \
+      -path './p0_first_half_bundle/*' -o \
+      -iname '*gate*c*.patch' -o \
+      -iname '*p0*.patch' -o \
+      -iname '*bounded*prefetch*.md' -o \
+      -iname '*setup*guide*.md' \
+    \) \
+    ! -name '*.out' \
+    ! -name '*.err' \
+    ! -name '*.tar.gz' \
+    ! -name '*.zip' \
+    -print | sed 's#^\./##' | sort -u
 )
 
 append_existing_files_from_find < <(
@@ -187,6 +329,7 @@ append_file "vllm/entrypoints/llm.py"
 append_file "vllm/engine/arg_utils.py"
 append_file "vllm/config/scheduler.py"
 append_file "vllm/v1/core/sched/scheduler.py"
+append_file "vllm/v1/core/sched/request_queue.py"
 append_file "vllm/v1/core/kv_cache_manager.py"
 append_file "vllm/v1/core/single_type_kv_cache_manager.py"
 append_file "vllm/v1/core/kv_cache_utils.py"
@@ -198,8 +341,6 @@ append_file "vllm/distributed/kv_transfer/kv_connector/v1/lmcache_integration/vl
 append_file "vllm/v1/importance_registry.py"
 append_file "vllm/v1/metrics/loggers.py"
 
-# Include the complete local vLLM KV connector v1 Python surface because
-# request IDs, lookup timing, and scheduler/worker cleanup span several files.
 if [[ -d "vllm/distributed/kv_transfer/kv_connector/v1" ]]; then
   append_existing_files_from_find < <(
     find vllm/distributed/kv_transfer/kv_connector/v1 \
@@ -208,81 +349,79 @@ if [[ -d "vllm/distributed/kv_transfer/kv_connector/v1" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Resolve the *actually imported* LMCache installation and include the full
-# code involved in config parsing, lookup/prefetch lifecycle, storage tiers,
-# pin/ref ownership, disk worker queues, and GPU transfers.
+# Vendored LMCache source. This is authoritative even when Python import
+# metadata is stale or the editable installation is temporarily broken.
 # ---------------------------------------------------------------------------
-LMCACHE_DIR="$(python - <<'PY' 2>/dev/null || true
-import lmcache
-import os
-print(os.path.dirname(lmcache.__file__))
-PY
-)"
+section "VENDORED LMCACHE SOURCE ROOT: $LMCACHE_ROOT"
 
-if [[ -n "${LMCACHE_DIR:-}" && -d "$LMCACHE_DIR" ]]; then
-  section "LMCACHE_DIR: $LMCACHE_DIR"
+append_file "$LMCACHE_PKG/__init__.py"
+append_file "$LMCACHE_PKG/config.py"
+append_file "$LMCACHE_PKG/integration/vllm/vllm_v1_adapter.py"
 
-  append_file "$LMCACHE_DIR/__init__.py"
-  append_file "$LMCACHE_DIR/config.py"
-  append_file "$LMCACHE_DIR/integration/vllm/vllm_v1_adapter.py"
+append_file "$LMCACHE_PKG/v1/config.py"
+append_file "$LMCACHE_PKG/v1/cache_engine.py"
+append_file "$LMCACHE_PKG/v1/event_manager.py"
+append_file "$LMCACHE_PKG/v1/pin_monitor.py"
+append_file "$LMCACHE_PKG/v1/memory_management.py"
 
-  append_file "$LMCACHE_DIR/v1/config.py"
-  append_file "$LMCACHE_DIR/v1/cache_engine.py"
-  append_file "$LMCACHE_DIR/v1/event_manager.py"
-  append_file "$LMCACHE_DIR/v1/pin_monitor.py"
-  append_file "$LMCACHE_DIR/v1/memory_management.py"
+append_file "$LMCACHE_PKG/v1/lookup_client/factory.py"
+append_file "$LMCACHE_PKG/v1/lookup_client/lmcache_async_lookup_client.py"
 
-  append_file "$LMCACHE_DIR/v1/storage_backend/__init__.py"
-  append_file "$LMCACHE_DIR/v1/storage_backend/storage_manager.py"
-  append_file "$LMCACHE_DIR/v1/storage_backend/local_cpu_backend.py"
-  append_file "$LMCACHE_DIR/v1/storage_backend/local_disk_backend.py"
-  append_file "$LMCACHE_DIR/v1/storage_backend/abstract_backend.py"
-  append_file "$LMCACHE_DIR/v1/storage_backend/storage_backend.py"
+append_file "$LMCACHE_PKG/v1/storage_backend/__init__.py"
+append_file "$LMCACHE_PKG/v1/storage_backend/storage_manager.py"
+append_file "$LMCACHE_PKG/v1/storage_backend/local_cpu_backend.py"
+append_file "$LMCACHE_PKG/v1/storage_backend/local_disk_backend.py"
+append_file "$LMCACHE_PKG/v1/storage_backend/abstract_backend.py"
+append_file "$LMCACHE_PKG/v1/storage_backend/storage_backend.py"
 
-  append_file "$LMCACHE_DIR/v1/gpu_connector/gpu_connectors.py"
+append_file "$LMCACHE_PKG/v1/gpu_connector/gpu_connectors.py"
 
-  # Full storage backend tree: includes backend factory, cache policies,
-  # local CPU/disk implementations, and any version-specific helper modules.
-  if [[ -d "$LMCACHE_DIR/v1/storage_backend" ]]; then
-    append_existing_files_from_find < <(
-      find "$LMCACHE_DIR/v1/storage_backend" \
-        -maxdepth 3 -type f -name '*.py' \
-        ! -path '*/__pycache__/*' \
-        ! -path '*/tests/*' \
-        | sort
-    )
-  fi
-
-  # Async lookup server/client, serializers, event helpers, and worker code
-  # move between files across LMCache versions. Include all matching modules.
+if [[ -d "$LMCACHE_PKG/v1/storage_backend" ]]; then
   append_existing_files_from_find < <(
-    find "$LMCACHE_DIR" -maxdepth 5 -type f \
-      \( \
-        -iname '*lookup*.py' -o \
-        -iname '*prefetch*.py' -o \
-        -iname '*serializer*.py' -o \
-        -iname '*event*.py' -o \
-        -iname '*worker*.py' \
-      \) \
+    find "$LMCACHE_PKG/v1/storage_backend" \
+      -maxdepth 3 -type f -name '*.py' \
       ! -path '*/__pycache__/*' \
       ! -path '*/tests/*' \
       | sort
   )
+fi
 
-  # Include all files in the active vLLM integration package, because the
-  # scheduler-side and worker-side APIs are split across version-specific code.
-  if [[ -d "$LMCACHE_DIR/integration/vllm" ]]; then
-    append_existing_files_from_find < <(
-      find "$LMCACHE_DIR/integration/vllm" \
-        -maxdepth 3 -type f -name '*.py' \
-        ! -path '*/__pycache__/*' \
-        ! -path '*/tests/*' \
-        | sort
-    )
-  fi
-else
-  section "LMCACHE IMPORT FAILED OR DIRECTORY MISSING"
-  echo "LMCACHE_DIR=${LMCACHE_DIR:-<empty>}" >> "$OUT"
+append_existing_files_from_find < <(
+  find "$LMCACHE_PKG" -maxdepth 5 -type f \
+    \( \
+      -iname '*lookup*.py' -o \
+      -iname '*prefetch*.py' -o \
+      -iname '*serializer*.py' -o \
+      -iname '*event*.py' -o \
+      -iname '*worker*.py' \
+    \) \
+    ! -path '*/__pycache__/*' \
+    ! -path '*/tests/*' \
+    | sort
+)
+
+if [[ -d "$LMCACHE_PKG/integration/vllm" ]]; then
+  append_existing_files_from_find < <(
+    find "$LMCACHE_PKG/integration/vllm" \
+      -maxdepth 3 -type f -name '*.py' \
+      ! -path '*/__pycache__/*' \
+      ! -path '*/tests/*' \
+      | sort
+  )
+fi
+
+# Target tests related to async lookup, storage admission, and local disk.
+if [[ -d "$LMCACHE_ROOT/tests" ]]; then
+  append_existing_files_from_find < <(
+    find "$LMCACHE_ROOT/tests" -maxdepth 6 -type f -name '*.py' \
+      \( \
+        -iname '*lookup*' -o \
+        -iname '*storage*' -o \
+        -iname '*disk*' -o \
+        -iname '*admission*' -o \
+        -iname '*p0*' \
+      \) | sort
+  )
 fi
 
 # Site-wide debug hooks can materially change behavior/log volume.
@@ -294,26 +433,33 @@ fi
 # ---------------------------------------------------------------------------
 # Metadata snapshots and diffs.
 # ---------------------------------------------------------------------------
-section "DIRECTORY SNAPSHOT: selected repo paths"
+section "CURATED PATH EXISTENCE SNAPSHOT"
 {
-  echo "local_repro:"
-  find local_repro -maxdepth 4 -type f | sort || true
-  echo
-  echo "Selected Hierarchical_KV source files:"
-  find Hierarchical_KV -maxdepth 3 -type f \
-    ! -name '*.pt' \
-    ! -name '*.parquet' \
-    ! -name '*.graphml' \
-    ! -name '*.jsonl' \
-    ! -path '*/results/*' \
-    ! -path '*/import/*' \
-    | sort | head -600 || true
+  for path in \
+    "local_repro" \
+    "local_repro/sbatch" \
+    "vllm/v1/core/sched" \
+    "vllm/distributed/kv_transfer/kv_connector/v1" \
+    "third_party/LMCache" \
+    "third_party/LMCache/lmcache/v1/lookup_client" \
+    "third_party/LMCache/lmcache/v1/storage_backend" \
+    "Hierarchical_KV" \
+    "Hierarchical_KV/LinearRAG" \
+    "p0_first_half_bundle"
+  do
+    if [[ -e "$path" ]]; then
+      printf "PRESENT  %s\n" "$path"
+    else
+      printf "MISSING  %s\n" "$path"
+    fi
+  done
 } >> "$OUT"
 
 section "GIT DIFF: relevant tracked source"
 git diff -- \
   local_repro \
   Hierarchical_KV \
+  third_party/LMCache \
   lmcache_hit_hook.py \
   kvcache_monitor.py \
   kvcache_visualize.py \
@@ -323,18 +469,17 @@ git diff -- \
   vllm/v1/metrics/loggers.py \
   >> "$OUT" 2>&1 || true
 
-section "GREP SUMMARY: lifecycle, debug hooks, and key settings"
+# If LMCache is a Git submodule/repository, its own diff may not be expanded by
+# the parent repository's git diff.
+section "GIT DIFF: vendored LMCache working tree"
+git -C "$LMCACHE_ROOT" diff >> "$OUT" 2>&1 || true
+
+section "GREP SUMMARY: lifecycle, debug hooks, admission controls, and settings"
 grep -R \
-  "SRIRAM_REQDBG\|SRIRAM_LOOKUPDBG\|SRIRAM_MONITOR\|SRIRAM_MEMDBG\|KVDBG_\|VLLM_KV_IMPORTANCE\|max_num_seqs\|submission_batch_size\|enable_async_loading\|lookup_timeout_ms\|pin_timeout_sec\|local_disk\|max_local_disk_size\|SRIRAM_LMCACHE_DIR" \
-  -n local_repro vllm Hierarchical_KV \
+  "SRIRAM_REQDBG\|SRIRAM_LOOKUPDBG\|SRIRAM_MONITOR\|SRIRAM_MEMDBG\|KVDBG_\|KVIO_\|VLLM_KV_IMPORTANCE\|max_num_seqs\|submission_batch_size\|enable_async_loading\|lookup_timeout_ms\|pin_timeout_sec\|local_disk\|max_local_disk_size\|SRIRAM_LMCACHE_DIR\|LMCACHE_P0_CLIENT_LOOKUP_MAX_INFLIGHT\|LMCACHE_P0_CLIENT_LOOKUP_ADMISSION_TIMEOUT_MS\|LMCACHE_P0_LOOKUP_MAX_INFLIGHT\|LMCACHE_P0_DISK_PUT_MAX_PENDING\|P0_CLIENT_LOOKUP_ADMISSION\|P0_LOOKUP_ADMISSION\|P0_PUT_ADMISSION" \
+  -n local_repro vllm Hierarchical_KV third_party/LMCache \
   lmcache_hit_hook.py kvcache_monitor.py kvcache_visualize.py lmcache_config.yaml \
   2>/dev/null >> "$OUT" || true
-
-if [[ -n "${LMCACHE_DIR:-}" && -d "$LMCACHE_DIR" ]]; then
-  grep -R \
-    "KVDBG_\|SRIRAM_REQDBG\|SRIRAM_LOOKUPDBG\|prefetch_tasks\|AsyncSingleSerializer\|AsyncMultiSerializer\|WeightedSemaphore\|lookup_timeout\|pin_timeout\|submit_put_task\|ref_count_up\|ref_count_down\|cannot schedule new futures" \
-    -n "$LMCACHE_DIR" 2>/dev/null >> "$OUT" || true
-fi
 
 section "END OF BUNDLE"
 
