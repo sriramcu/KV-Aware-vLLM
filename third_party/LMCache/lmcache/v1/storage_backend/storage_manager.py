@@ -834,9 +834,8 @@ class StorageManager:
             returned = len(results)
             none_count = sum(memory_obj is None for memory_obj in results)
 
-            if (
-                debug_enabled
-                or backend_name == "LocalDiskBackend"
+            if debug_enabled and (                
+                backend_name == "LocalDiskBackend"
                 or elapsed >= 1.0
                 or none_count > 0
                 or returned != len(keys)
