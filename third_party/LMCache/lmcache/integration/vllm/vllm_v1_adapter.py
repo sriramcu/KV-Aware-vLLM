@@ -527,12 +527,13 @@ class LMCacheConnectorV1Impl:
             VLLM_VERSION,
             getattr(self.lmcache_engine, "metadata", None),
         )
-        logger.warning(
-            "[SC] ACTIVE PATCHED ADAPTER file=%s gnn_enabled=%s tiers_file=%s",
-            __file__,
-            os.environ.get("VLLM_KV_IMPORTANCE_ENABLE"),
-            os.environ.get("VLLM_KV_IMPORTANCE_TIERS"),
-        )
+        if os.environ.get("SRIRAM_TIER_DEBUG", "0") == "1":
+            logger.warning(
+                "[SC] ACTIVE PATCHED ADAPTER file=%s gnn_enabled=%s tiers_file=%s",
+                __file__,
+                os.environ.get("VLLM_KV_IMPORTANCE_ENABLE"),
+                os.environ.get("VLLM_KV_IMPORTANCE_TIERS"),
+            )
 
     def _apply_extra_config(
         self, config: LMCacheEngineConfig, vllm_config: "VllmConfig"
@@ -670,13 +671,13 @@ class LMCacheConnectorV1Impl:
                 tiers = candidate_tiers
                 matched_key = candidate_id
                 break
-
-        logger.warning(
-            "[SC] tier lookup req_id=%s matched_key=%s blocks=%d",
-            full_req_id,
-            matched_key,
-            len(tiers),
-        )
+        if os.environ.get("SRIRAM_TIER_DEBUG", "0") == "1":
+            logger.warning(
+                "[SC] tier lookup req_id=%s matched_key=%s blocks=%d",
+                full_req_id,
+                matched_key,
+                len(tiers),
+            )
 
         output: dict[int, str] = {}
         for block_index, value in tiers.items():
@@ -707,7 +708,8 @@ class LMCacheConnectorV1Impl:
         """Choose one LMCache destination for each LMCache chunk."""
         block_tiers = self._get_request_block_tiers(req_id)
         if not block_tiers:
-            logger.warning("[SC] No block tiers found for request %s", req_id)
+            if os.environ.get("SRIRAM_TIER_DEBUG", "0") == "1":
+                logger.warning("[SC] No block tiers found for request %s", req_id)
             return None
 
         gnn_block_size = int(os.environ.get("GNN_KV_BLOCK_SIZE", "16"))
@@ -734,13 +736,13 @@ class LMCacheConnectorV1Impl:
             target_locations.append(
                 self._tier_to_lmcache_location(target_tier)
             )
-
-        logger.warning(
-            "[SC] req_id=%s target_tiers_count=%d sample=%s",
-            req_id,
-            len(target_locations),
-            target_locations[:8],
-        )
+        if os.environ.get("SRIRAM_TIER_DEBUG", "0") == "1":
+            logger.warning(
+                "[SC] req_id=%s target_tiers_count=%d sample=%s",
+                req_id,
+                len(target_locations),
+                target_locations[:8],
+            )
         return target_locations
 
     def _check_legacy_register_kv_caches(self) -> None:
