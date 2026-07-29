@@ -21,12 +21,13 @@ export LMCACHE_P0_CLIENT_LOOKUP_MAX_INFLIGHT=0
 export LMCACHE_P0_LOOKUP_MAX_INFLIGHT=0  # default 4
 export LMCACHE_P0_DISK_PUT_MAX_PENDING=0 # default 8
 export MAX_QUESTIONS=250
-export SUBMISSION_BATCH_SIZE="$MAX_QUESTIONS"
+# export SUBMISSION_BATCH_SIZE="$MAX_QUESTIONS"
+export SUBMISSION_BATCH_SIZE=50
 # export CUDA_DEVICE_ORDER=PCI_BUS_ID
 # export CUDA_VISIBLE_DEVICES=0
 
 
-DATASET_NAME="medical"
+export DATASET_NAME="medical"
 
 mkdir -p /mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/logs
 /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM/local_repro/run_driver.sh wo_gnn 2>&1
