@@ -164,11 +164,11 @@ sys.path.insert(0, vllm_root)
 #     to_dataframe as kv_to_dataframe,
 # )
 # from kvcache_visualize import visualize as kv_visualize
-# LM_CACHE_DISK_PATH = os.environ.get(
-#     "SRIRAM_LMCACHE_DIR",
-#     "/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/lmcache_vllm/manual",
-# )
-LM_CACHE_DISK_PATH = "/scratch/sriramc2/vllm/"
+LM_CACHE_DISK_PATH = os.environ.get(
+    "SRIRAM_LMCACHE_DIR",
+    "/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/lmcache_vllm/manual",
+)
+# LM_CACHE_DISK_PATH = "/scratch/sriramc2/vllm/"
 def setup_environment_variables():
     def write_lmcache_config(path: str):
         import textwrap
@@ -183,14 +183,6 @@ def setup_environment_variables():
         pre_caching_hash_algorithm: builtin
         enable_async_loading: true
         """).strip()
-        # config = textwrap.dedent(f"""
-        # chunk_size: 512
-        # local_cpu: true
-        # max_local_cpu_size: 100.0
-        # enable_kv_events: true
-        # pre_caching_hash_algorithm: builtin
-        # enable_async_loading: false
-        # """).strip()
         Path(path).write_text(config + "\n", encoding="utf-8")
 
     cfg_path = "./lmcache_config.yaml"

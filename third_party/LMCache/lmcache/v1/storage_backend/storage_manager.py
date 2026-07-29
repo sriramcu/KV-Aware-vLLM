@@ -962,7 +962,8 @@ class StorageManager:
             f"Responding to scheduler for lookup id {lookup_id}"
             f" with retrieved length {retrieved_length}"
         )
-        _sr_lookup_debug(lookup_id, retrieved_length=retrieved_length, extra="responding_to_scheduler")
+        if _sr_os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
+            _sr_lookup_debug(lookup_id, retrieved_length=retrieved_length, extra="responding_to_scheduler")
         self.async_lookup_server.send_response_to_scheduler(lookup_id, retrieved_length)
 
     async def _async_lookup_and_prefetch_impl(

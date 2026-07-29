@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+import os
 from typing import List, Optional, Tuple, Union
 import abc
 
@@ -285,7 +286,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
                 except Exception:
                     _sr_mem_snapshot = None
                     
-                if _sr_mem_snapshot is not None:
+                if _sr_mem_snapshot is not None and os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
                     _sr_mem_snapshot(
                         "GPU_CONNECTOR_TENSOR_NONE_BEFORE_ASSERT",
                         memory_obj,

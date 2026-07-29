@@ -1605,14 +1605,15 @@ class LMCacheConnectorV1Impl:
                 min_retrieve,
             )
         else:
-            _sr_req_loop_debug(
-                req_id,
-                total_tokens=request.num_tokens,
-                computed=num_computed_tokens,
-                hit=num_external_hit_tokens,
-                need=max(need_to_allocate, 0),
-                extra="before/after get_num_new_matched_tokens",
-            )
+            if os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
+                _sr_req_loop_debug(
+                    req_id,
+                    total_tokens=request.num_tokens,
+                    computed=num_computed_tokens,
+                    hit=num_external_hit_tokens,
+                    need=max(need_to_allocate, 0),
+                    extra="before/after get_num_new_matched_tokens",
+                )
             logger.info(
                 "Reqid: %s, Total tokens %d, Inference Engine computed tokens: %d, "
                 "LMCache hit tokens: %d, need to load: %d",
