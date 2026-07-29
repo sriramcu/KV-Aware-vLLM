@@ -375,7 +375,8 @@ class LMCacheEngine:
         When target_tiers is absent, preserve normal LMCache behavior.
         This keeps wo_gnn unchanged.
         """
-        logger.info("Entered _put_with_optional_target_tiers")
+        if os.environ.get("SRIRAM_TIER_DEBUG", "0") == "1":
+            logger.info("[SC] Entered _put_with_optional_target_tiers")
         assert self.storage_manager is not None
 
         # wo_gnn: preserve normal replication across enabled backends.
@@ -386,7 +387,8 @@ class LMCacheEngine:
                 transfer_spec=transfer_spec,
                 location=self.store_location,
             )
-            logger.info("target_tiers = False inside _put_with_optional_target_tiers")
+            if os.environ.get("SRIRAM_TIER_DEBUG", "0") == "1":
+                logger.info("[SC] target_tiers = False inside _put_with_optional_target_tiers")
             return
 
         if len(target_tiers) < len(keys):
