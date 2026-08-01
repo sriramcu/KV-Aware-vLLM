@@ -1,0 +1,3525 @@
+From 27062136187331879b48b6e91d0b77a310976f96 Mon Sep 17 00:00:00 2001
+From: OpenAI <oai@example.com>
+Date: Sat, 1 Aug 2026 23:26:43 +0000
+Subject: [PATCH] Refactor SC LMCache experiment controls
+
+Rename legacy P0 and SRIRAM controls, split gates from tracing, centralize shell defaults, and make scheduler, worker, and disk-put admission independently configurable.
+---
+ local_repro/SC_LMCACHE_KNOBS.md               |  86 ++++
+ local_repro/cpu_offload_lmcache_sriram.py     | 136 ++++---
+ local_repro/run_driver.sh                     |  31 +-
+ local_repro/sbatch/01_h100_with_gnn.sbatch    |   5 +
+ local_repro/sbatch/02_h100_wo_gnn.sbatch      |   6 +-
+ .../sbatch/03_h100_all_datasets_250.sbatch    |   5 +
+ local_repro/sbatch/2_l40_wo_gnn.sbatch        |   6 +-
+ local_repro/sc_lmcache_knobs.sh               | 131 ++++++
+ .../integration/vllm/vllm_v1_adapter.py       |  37 +-
+ .../LMCache/lmcache/v1/cache_engine.py        |  61 +--
+ .../v1/gpu_connector/gpu_connectors.py        |  18 +-
+ .../lmcache_async_lookup_client.py            | 279 +++++++------
+ .../LMCache/lmcache/v1/memory_management.py   | 121 +++---
+ third_party/LMCache/lmcache/v1/sc_config.py   |  87 ++++
+ .../v1/storage_backend/local_cpu_backend.py   |  71 ++--
+ .../v1/storage_backend/local_disk_backend.py  | 379 +++++++++---------
+ .../v1/storage_backend/storage_manager.py     | 348 ++++++++--------
+ 17 files changed, 1087 insertions(+), 720 deletions(-)
+ create mode 100644 local_repro/SC_LMCACHE_KNOBS.md
+ create mode 100755 local_repro/sc_lmcache_knobs.sh
+ create mode 100644 third_party/LMCache/lmcache/v1/sc_config.py
+
+diff --git a/local_repro/SC_LMCACHE_KNOBS.md b/local_repro/SC_LMCACHE_KNOBS.md
+new file mode 100644
+index 0000000..f5f7a1b
+--- /dev/null
++++ b/local_repro/SC_LMCACHE_KNOBS.md
+@@ -0,0 +1,86 @@
++# SC LMCache experiment controls
++
++Source `local_repro/sc_lmcache_knobs.sh` from an sbatch file. Values already
++present in the environment are preserved, so Slurm `--export` overrides work
++for grid searches.
++
++```bash
++export SC_LMCACHE_PROFILE=bounded
++export SC_LMCACHE_WORKER_LOOKUP_MAX_INFLIGHT=2
++sbatch --export=ALL local_repro/sbatch/02_h100_wo_gnn.sbatch
++```
++
++Set `SC_LMCACHE_SOURCE_DEFAULT_KNOBS=0` to stop the supplied sbatch files from
++sourcing the defaults file. In that mode, export only the controls needed for
++the experiment; unset controls use disabled/default behavior in Python.
++
++## Profiles
++
++| Profile | Custom gates | Verbose IO/load/memory logs | Driver monitor |
++|---|---:|---:|---:|
++| `vanilla` | off | off | off |
++| `bounded` | on | off | off |
++| `diagnostic` | off | on | on |
++| `bounded_diagnostic` | on | on | on |
++| `custom` | off by default | off by default | off by default |
++
++Every individual variable overrides the profile default.
++
++## Functional controls
++
++| Variable | Default | Meaning |
++|---|---:|---|
++| `SC_LMCACHE_SCHEDULER_LOOKUP_ADMISSION_ENABLE` | `0` | Enable scheduler-side logical lookup admission before worker dispatch. |
++| `SC_LMCACHE_SCHEDULER_LOOKUP_MAX_INFLIGHT` | `4` | Maximum admitted distributed lookups. |
++| `SC_LMCACHE_SCHEDULER_LOOKUP_ADMISSION_WAIT_MS` | `0` | Time to wait for scheduler admission; zero means immediate rejection. |
++| `SC_LMCACHE_WORKER_LOOKUP_ADMISSION_ENABLE` | `0` | Enable per-worker admission before contains/pin/staging work. |
++| `SC_LMCACHE_WORKER_LOOKUP_MAX_INFLIGHT` | `1` | Maximum physical lookups per LMCache worker/rank. |
++| `SC_LMCACHE_DISK_PUT_ADMISSION_ENABLE` | `0` | Enable bounded disk-write admission. |
++| `SC_LMCACHE_DISK_PUT_MAX_PENDING` | `8` | Maximum admitted disk puts per worker. |
++
++The three gates are independent. For example, worker admission can be enabled
++while scheduler admission and disk-put admission remain disabled.
++
++## Observability controls
++
++| Variable | Default | Meaning |
++|---|---:|---|
++| `SC_LMCACHE_IO_TRACE_ENABLE` | `0` | Serializer, disk queue, file IO, scheduler lookup, and cleanup timing. |
++| `SC_LMCACHE_LOAD_TRACE_ENABLE` | `0` | Backend load lifecycle and lookup-unpin traces. |
++| `SC_LMCACHE_MEMORY_TRACE_ENABLE` | `0` | CPU-pool pressure plus long pin/reference lifetime warnings. |
++| `SC_LMCACHE_MEMORY_SNAPSHOT_ENABLE` | `0` | Heavy process/cgroup/GPU/disk snapshot on explicit diagnostic calls. |
++| `SC_LMCACHE_LOOKUP_TRACE_ENABLE` | `0` | Repeated worker lookup response trace and selected stacks. |
++| `SC_LMCACHE_REQUEST_TRACE_ENABLE` | `0` | Repeated vLLM request matching trace and selected stacks. |
++| `SC_LMCACHE_GPU_ASSERT_SNAPSHOT_ENABLE` | `0` | Heavy snapshot immediately before the GPU connector tensor assertion. |
++| `SC_DRIVER_RESOURCE_MONITOR_ENABLE` | `0` | Periodic driver-level process/GPU/disk monitor. |
++
++Related thresholds:
++
++| Variable | Default |
++|---|---:|
++| `SC_LMCACHE_MEMORY_TRACE_INTERVAL_S` | `5` |
++| `SC_LMCACHE_LONG_PIN_THRESHOLD_S` | `10` |
++| `SC_LMCACHE_LONG_REF_THRESHOLD_S` | `10` |
++| `SC_DRIVER_RESOURCE_MONITOR_INTERVAL_S` | `30` |
++
++`SC_LMCACHE_DATA_DIR` optionally overrides the driver's local-disk path.
++
++## Legacy-name migration
++
++| Old | New |
++|---|---|
++| `LMCACHE_P0_CLIENT_LOOKUP_MAX_INFLIGHT` | `SC_LMCACHE_SCHEDULER_LOOKUP_MAX_INFLIGHT` plus the scheduler enable flag |
++| `LMCACHE_P0_CLIENT_LOOKUP_ADMISSION_TIMEOUT_MS` | `SC_LMCACHE_SCHEDULER_LOOKUP_ADMISSION_WAIT_MS` |
++| `LMCACHE_P0_LOOKUP_MAX_INFLIGHT` | `SC_LMCACHE_WORKER_LOOKUP_MAX_INFLIGHT` plus the worker enable flag |
++| `LMCACHE_P0_DISK_PUT_MAX_PENDING` | `SC_LMCACHE_DISK_PUT_MAX_PENDING` plus the disk-put enable flag |
++| `SRIRAM_KV_IO_TRACE` | `SC_LMCACHE_IO_TRACE_ENABLE` |
++| `SRIRAM_KV_MEM_DEBUG` | `SC_LMCACHE_MEMORY_TRACE_ENABLE` |
++| `SRIRAM_KV_MEM_DEBUG_INTERVAL_S` | `SC_LMCACHE_MEMORY_TRACE_INTERVAL_S` |
++| `SRIRAM_LONG_PIN_SECONDS` | `SC_LMCACHE_LONG_PIN_THRESHOLD_S` |
++| `SRIRAM_LONG_REF_SECONDS` | `SC_LMCACHE_LONG_REF_THRESHOLD_S` |
++| `SRIRAM_LMCACHE_DIR` | `SC_LMCACHE_DATA_DIR` |
++| `[SRIRAM_MONITOR]` | `[SC_DRIVER_MONITOR]` controlled by `SC_DRIVER_RESOURCE_MONITOR_ENABLE` |
++
++The refactor intentionally does not read legacy names. This prevents an old
++batch environment from silently enabling an experiment under a new naming
++scheme.
+diff --git a/local_repro/cpu_offload_lmcache_sriram.py b/local_repro/cpu_offload_lmcache_sriram.py
+index 7837535..21739de 100644
+--- a/local_repro/cpu_offload_lmcache_sriram.py
++++ b/local_repro/cpu_offload_lmcache_sriram.py
+@@ -24,38 +24,38 @@ from vllm.engine.arg_utils import EngineArgs
+ 
+ import hashlib
+ 
+-# ===== SRIRAM PROCESS MONITOR START =====
+-import os as _sr_os
+-import time as _sr_time
+-import threading as _sr_threading
+-import shutil as _sr_shutil
+-import subprocess as _sr_subprocess
++# ===== SC DRIVER RESOURCE MONITOR START =====
++import os as _sc_os
++import time as _sc_time
++import threading as _sc_threading
++import shutil as _sc_shutil
++import subprocess as _sc_subprocess
+ 
+ 
+-def _sr_top_processes():
++def _sc_top_processes():
+     try:
+-        return _sr_subprocess.check_output(
++        return _sc_subprocess.check_output(
+             [
+                 "bash",
+                 "-lc",
+                 "ps -u $USER -o pid,ppid,rss,vsz,stat,etime,cmd --sort=-rss | head -20",
+             ],
+-            stderr=_sr_subprocess.STDOUT,
++            stderr=_sc_subprocess.STDOUT,
+             timeout=3,
+             text=True,
+         ).replace("\n", " || ")
+     except Exception as e:
+         return repr(e)
+ 
+-def _sr_disk_usage(path):
++def _sc_disk_usage(path):
+     try:
+-        u = _sr_shutil.disk_usage(path)
++        u = _sc_shutil.disk_usage(path)
+         return f"{path}: used={u.used/1024**3:.1f}G free={u.free/1024**3:.1f}G total={u.total/1024**3:.1f}G"
+     except Exception as e:
+         return f"{path}: {e!r}"
+ 
+ 
+-def _sr_status():
++def _sc_status():
+     vals = {}
+     try:
+         with open("/proc/self/status") as f:
+@@ -68,22 +68,22 @@ def _sr_status():
+     return vals
+ 
+ 
+-def _sr_gpu():
++def _sc_gpu():
+     try:
+-        return _sr_subprocess.check_output(
++        return _sc_subprocess.check_output(
+             [
+                 "nvidia-smi",
+                 "--query-gpu=index,memory.used,memory.free,memory.total,utilization.gpu",
+                 "--format=csv,noheader,nounits",
+             ],
+-            stderr=_sr_subprocess.STDOUT,
++            stderr=_sc_subprocess.STDOUT,
+             timeout=3,
+             text=True,
+         ).replace("\n", " | ")
+     except Exception as e:
+         return repr(e)
+ 
+-def _sr_meminfo():
++def _sc_meminfo():
+     try:
+         keys = ("MemTotal:", "MemFree:", "MemAvailable:", "Buffers:", "Cached:", "SwapTotal:", "SwapFree:")
+         out = []
+@@ -95,27 +95,48 @@ def _sr_meminfo():
+     except Exception as e:
+         return repr(e)
+ 
+-def _sr_monitor_loop():
++def _sc_env_flag(name: str, default: bool = False) -> bool:
++    raw = _sc_os.environ.get(name)
++    if raw is None:
++        return default
++    normalized = raw.strip().lower()
++    if normalized in {"1", "true", "yes", "on"}:
++        return True
++    if normalized in {"0", "false", "no", "off", ""}:
++        return False
++    raise ValueError(f"{name} has invalid boolean value {raw!r}")
++
++
++def _sc_monitor_loop():
++    interval_s = float(
++        _sc_os.environ.get("SC_DRIVER_RESOURCE_MONITOR_INTERVAL_S", "30")
++    )
+     while True:
+         print(
+-            "[SRIRAM_MONITOR] "
+-            f"pid={_sr_os.getpid()} "
+-            f"status={_sr_status()} "
+-            f"tmp={_sr_disk_usage('/tmp')} "
+-            f"shm={_sr_disk_usage('/dev/shm')} "
+-            f"lmcache={_sr_disk_usage(_sr_os.environ.get('SRIRAM_LMCACHE_DIR', '/tmp'))} "
+-            f"gpu={_sr_gpu()}",
+-            f"top_procs={_sr_top_processes()} ",
+-            f"meminfo={_sr_meminfo()} ",
++            "[SC_DRIVER_MONITOR] "
++            f"pid={_sc_os.getpid()} "
++            f"status={_sc_status()} "
++            f"tmp={_sc_disk_usage('/tmp')} "
++            f"shm={_sc_disk_usage('/dev/shm')} "
++            f"lmcache={_sc_disk_usage((_sc_os.environ.get('SC_LMCACHE_DATA_DIR') or '/tmp'))} "
++            f"gpu={_sc_gpu()}",
++            f"top_procs={_sc_top_processes()} ",
++            f"meminfo={_sc_meminfo()} ",
+             flush=True,
+         )
+-        _sr_time.sleep(30)
++        _sc_time.sleep(interval_s)
+ 
+ 
+-def _sr_start_monitor():
+-    t = _sr_threading.Thread(target=_sr_monitor_loop, daemon=True)
++def _sc_start_monitor():
++    if not _sc_env_flag("SC_DRIVER_RESOURCE_MONITOR_ENABLE", False):
++        return
++    t = _sc_threading.Thread(
++        target=_sc_monitor_loop,
++        daemon=True,
++        name="sc-driver-resource-monitor",
++    )
+     t.start()
+-# ===== SRIRAM PROCESS MONITOR END =====
++# ===== SC DRIVER RESOURCE MONITOR END =====
+ 
+ def passage_prefix_signature(sorted_passage, n=2):
+     prefix = "\n".join(sorted_passage[:n])
+@@ -165,10 +186,12 @@ sys.path.insert(0, vllm_root)
+ # )
+ # from kvcache_visualize import visualize as kv_visualize
+ # LM_CACHE_DISK_PATH = os.environ.get(
+-#     "SRIRAM_LMCACHE_DIR",
++#     "SC_LMCACHE_DATA_DIR",
+ #     "/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/lmcache_vllm/manual",
+ # )
+-LM_CACHE_DISK_PATH = "/scratch/sriramc2/vllm/"
++LM_CACHE_DISK_PATH = os.environ.get(
++    "SC_LMCACHE_DATA_DIR", "/scratch/sriramc2/vllm/"
++) or "/scratch/sriramc2/vllm/"
+ def setup_environment_variables():
+     def write_lmcache_config(path: str):
+         import textwrap
+@@ -320,8 +343,17 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
+         enable_prefix_caching=True,
+     )
+ 
+-    print("[SRIRAM BEFORE LLM] CUDA_VISIBLE_DEVICES=", os.environ.get("CUDA_VISIBLE_DEVICES"), flush=True)
+-    print("[SRIRAM BEFORE LLM] CUDA_DEVICE_ORDER=", os.environ.get("CUDA_DEVICE_ORDER"), flush=True)
++    if _sc_io_trace_enabled():
++        print(
++            "[SC_BEFORE_LLM] CUDA_VISIBLE_DEVICES=",
++            os.environ.get("CUDA_VISIBLE_DEVICES"),
++            flush=True,
++        )
++        print(
++            "[SC_BEFORE_LLM] CUDA_DEVICE_ORDER=",
++            os.environ.get("CUDA_DEVICE_ORDER"),
++            flush=True,
++        )
+ 
+     print(
+         "[LMCache configuration] disk path:",
+@@ -335,13 +367,13 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
+     finally:
+         LMCacheEngineBuilder.destroy(ENGINE_NAME)
+ 
+-def _kvio_trace_enabled() -> bool:
+-    return os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1"
++def _sc_io_trace_enabled() -> bool:
++    return _sc_env_flag("SC_LMCACHE_IO_TRACE_ENABLE", False)
+ 
+ 
+-def _kvio_proc_io_snapshot() -> dict[str, int]:
++def _sc_io_proc_snapshot() -> dict[str, int]:
+     values: dict[str, int] = {}
+-    if not _kvio_trace_enabled():
++    if not _sc_io_trace_enabled():
+         return values
+     try:
+         with open("/proc/self/io", "r", encoding="utf-8") as f:
+@@ -349,7 +381,7 @@ def _kvio_proc_io_snapshot() -> dict[str, int]:
+                 key, value = line.split(":", 1)
+                 values[key.strip()] = int(value.strip())
+     except Exception as exc:
+-        print(f"[KVIO_DRIVER_PROC_IO_ERROR] error={exc!r}", flush=True)
++        print(f"[SC_IO_DRIVER_PROC_IO_ERROR] error={exc!r}", flush=True)
+     return values
+ 
+ 
+@@ -394,10 +426,10 @@ def generate_in_submission_batches(
+ 
+         batch_start = time.time()
+         batch_start_mono = time.monotonic()
+-        batch_io_before = _kvio_proc_io_snapshot()
+-        if _kvio_trace_enabled():
++        batch_io_before = _sc_io_proc_snapshot()
++        if _sc_io_trace_enabled():
+             print(
+-                "[KVIO_DRIVER_BATCH_START] "
++                "[SC_IO_DRIVER_BATCH_START] "
+                 f"phase={phase_name} batch={batch_number}/{total_batches} "
+                 f"requests={start_idx}:{end_idx} wall={batch_start:.6f} "
+                 f"mono={batch_start_mono:.6f} proc_io={batch_io_before}",
+@@ -412,14 +444,14 @@ def generate_in_submission_batches(
+         batch_end = time.time()
+         batch_end_mono = time.monotonic()
+         batch_elapsed = batch_end - batch_start
+-        batch_io_after = _kvio_proc_io_snapshot()
+-        if _kvio_trace_enabled():
++        batch_io_after = _sc_io_proc_snapshot()
++        if _sc_io_trace_enabled():
+             io_delta = {
+                 key: batch_io_after.get(key, 0) - batch_io_before.get(key, 0)
+                 for key in set(batch_io_before) | set(batch_io_after)
+             }
+             print(
+-                "[KVIO_DRIVER_BATCH_DONE] "
++                "[SC_IO_DRIVER_BATCH_DONE] "
+                 f"phase={phase_name} batch={batch_number}/{total_batches} "
+                 f"requests={start_idx}:{end_idx} wall={batch_end:.6f} "
+                 f"mono={batch_end_mono:.6f} elapsed={batch_end_mono - batch_start_mono:.6f} "
+@@ -675,7 +707,7 @@ def main():
+     if not args.question and not args.questions_json:
+         raise ValueError("provide either --question or --questions_json")
+     
+-    _sr_start_monitor()
++    _sc_start_monitor()
+     setup_environment_variables()
+ 
+     questions = load_questions(args)
+@@ -809,20 +841,20 @@ def main():
+             f"first generation took {cold_time_taken:.2f} seconds.",
+             flush=True,
+         )
+-        if _kvio_trace_enabled():
++        if _sc_io_trace_enabled():
+             print(
+-                "[KVIO_PHASE_BOUNDARY] "
++                "[SC_IO_PHASE_BOUNDARY] "
+                 f"phase=cold_done wall={time.time():.6f} "
+-                f"mono={time.monotonic():.6f} proc_io={_kvio_proc_io_snapshot()}",
++                f"mono={time.monotonic():.6f} proc_io={_sc_io_proc_snapshot()}",
+                 flush=True,
+             )
+ 
+         print("Warm run starting...", flush=True)
+-        if _kvio_trace_enabled():
++        if _sc_io_trace_enabled():
+             print(
+-                "[KVIO_PHASE_BOUNDARY] "
++                "[SC_IO_PHASE_BOUNDARY] "
+                 f"phase=warm_start wall={time.time():.6f} "
+-                f"mono={time.monotonic():.6f} proc_io={_kvio_proc_io_snapshot()}",
++                f"mono={time.monotonic():.6f} proc_io={_sc_io_proc_snapshot()}",
+                 flush=True,
+             )
+         warm_start = time.time()
+diff --git a/local_repro/run_driver.sh b/local_repro/run_driver.sh
+index dc2d76d..a16de6f 100644
+--- a/local_repro/run_driver.sh
++++ b/local_repro/run_driver.sh
+@@ -22,11 +22,10 @@ QUESTIONS_JSON="$REPO/Hierarchical_KV/LinearRAG/dataset/${DATASET_NAME}/question
+ 
+ source "$HOME_DIR/venvs/kvaware/bin/activate"
+ 
+-export SRIRAM_KV_MEM_DEBUG=1
+-export SRIRAM_KV_MEM_DEBUG_INTERVAL_S=5
+-export SRIRAM_KV_IO_TRACE="${SRIRAM_KV_IO_TRACE:-1}"
+-export SRIRAM_LONG_PIN_SECONDS=10
+-export SRIRAM_LONG_REF_SECONDS=10
++# LMCache experimental controls are intentionally not hard-coded here.
++# Source local_repro/sc_lmcache_knobs.sh in the sbatch script, or export any
++# SC_* variables before invoking this driver. Unset controls use Python defaults
++# that keep custom gates and custom tracing disabled.
+ 
+ mkdir -p "$RUN_ROOT/logs"
+ mkdir -p "$RUN_ROOT/sidecars"
+@@ -75,15 +74,18 @@ if [[ "${CLEAN_OLD_LMCACHE:-1}" == "1" ]]; then
+   fi
+ fi
+ 
+-# export SRIRAM_LMCACHE_DIR="$RUN_ROOT/lmcache_vllm/${JOB_TAG}"
++# export SC_LMCACHE_DATA_DIR="$RUN_ROOT/lmcache_vllm/${JOB_TAG}"
+ export LMCACHE_HOOK_LOG_DIR="$RUN_ROOT/lmcache_hit_hook/${JOB_TAG}"
+ export PROMETHEUS_MULTIPROC_DIR="$RUN_ROOT/prometheus_vllm/${JOB_TAG}"
++if [[ -n "${SC_LMCACHE_DATA_DIR:-}" ]]; then
++  mkdir -p "$SC_LMCACHE_DATA_DIR"
++fi
+ 
+-# rm -rf "$SRIRAM_LMCACHE_DIR" "$LMCACHE_HOOK_LOG_DIR" "$PROMETHEUS_MULTIPROC_DIR"
+-# mkdir -p "$SRIRAM_LMCACHE_DIR" "$LMCACHE_HOOK_LOG_DIR" "$PROMETHEUS_MULTIPROC_DIR"
++# rm -rf "$SC_LMCACHE_DATA_DIR" "$LMCACHE_HOOK_LOG_DIR" "$PROMETHEUS_MULTIPROC_DIR"
++# mkdir -p "$SC_LMCACHE_DATA_DIR" "$LMCACHE_HOOK_LOG_DIR" "$PROMETHEUS_MULTIPROC_DIR"
+ 
+ # Use short node-local path only for sockets/temp files.
+-export TMPDIR="/tmp/sr_${SLURM_JOB_ID:-manual}"
++export TMPDIR="/tmp/sc_${SLURM_JOB_ID:-manual}"
+ export TEMP="$TMPDIR"
+ export TMP="$TMPDIR"
+ rm -rf "$TMPDIR"
+@@ -100,18 +102,15 @@ echo "MAX_QUESTIONS=$MAX_QUESTIONS"
+ echo "QUESTIONS_JSON=$QUESTIONS_JSON"
+ echo "VLLM_KV_IMPORTANCE_ENABLE=$VLLM_KV_IMPORTANCE_ENABLE"
+ echo "VLLM_KV_IMPORTANCE_TIERS=$VLLM_KV_IMPORTANCE_TIERS"
+-# echo "SRIRAM_LMCACHE_DIR=$SRIRAM_LMCACHE_DIR"
++# echo "SC_LMCACHE_DATA_DIR=$SC_LMCACHE_DATA_DIR"
+ echo "LMCACHE_HOOK_LOG_DIR=$LMCACHE_HOOK_LOG_DIR"
+ echo "PROMETHEUS_MULTIPROC_DIR=$PROMETHEUS_MULTIPROC_DIR"
+ echo "TMPDIR=$TMPDIR"
+ echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
+ echo "CUDA_DEVICE_ORDER=${CUDA_DEVICE_ORDER:-unset}"
+-echo "SRIRAM_KV_MEM_DEBUG=$SRIRAM_KV_MEM_DEBUG"
+-echo "SRIRAM_KV_MEM_DEBUG_INTERVAL_S=$SRIRAM_KV_MEM_DEBUG_INTERVAL_S"
+-echo "SRIRAM_KV_IO_TRACE=$SRIRAM_KV_IO_TRACE"
+-echo "SRIRAM_LONG_PIN_SECONDS=$SRIRAM_LONG_PIN_SECONDS"
+-echo "SRIRAM_LONG_REF_SECONDS=$SRIRAM_LONG_REF_SECONDS"
+ echo "SUBMISSION_BATCH_SIZE=$SUBMISSION_BATCH_SIZE"
++echo "=== SC LMCACHE KNOBS ==="
++env | LC_ALL=C sort | grep '^SC_' || true
+ 
+ if [[ ! -f "$QUESTIONS_JSON" ]]; then
+   echo "Missing questions file: $QUESTIONS_JSON"
+@@ -164,7 +163,7 @@ else:
+ PY
+ 
+ echo "=== CACHE SIZE ==="
+-# du -sh "$SRIRAM_LMCACHE_DIR" || true
++# du -sh "$SC_LMCACHE_DATA_DIR" || true
+ 
+ echo "=== DONE ==="
+ date
+diff --git a/local_repro/sbatch/01_h100_with_gnn.sbatch b/local_repro/sbatch/01_h100_with_gnn.sbatch
+index e07b49e..06cce3e 100644
+--- a/local_repro/sbatch/01_h100_with_gnn.sbatch
++++ b/local_repro/sbatch/01_h100_with_gnn.sbatch
+@@ -11,6 +11,11 @@
+ 
+ set -euxo pipefail
+ export PYTHONPATH=/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM:${PYTHONPATH:-}
++REPO=/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
++if [[ "${SC_LMCACHE_SOURCE_DEFAULT_KNOBS:-1}" == "1" ]]; then
++  # Existing environment values win over defaults in this file.
++  source "$REPO/local_repro/sc_lmcache_knobs.sh"
++fi
+ # export CUDA_DEVICE_ORDER=PCI_BUS_ID
+ 
+ mkdir -p /mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/logs
+diff --git a/local_repro/sbatch/02_h100_wo_gnn.sbatch b/local_repro/sbatch/02_h100_wo_gnn.sbatch
+index c358369..2afb343 100644
+--- a/local_repro/sbatch/02_h100_wo_gnn.sbatch
++++ b/local_repro/sbatch/02_h100_wo_gnn.sbatch
+@@ -11,8 +11,12 @@
+ 
+ set -euxo pipefail
+ export PYTHONPATH=/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM:${PYTHONPATH:-}
++REPO=/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
++if [[ "${SC_LMCACHE_SOURCE_DEFAULT_KNOBS:-1}" == "1" ]]; then
++  # Existing environment values win over defaults in this file.
++  source "$REPO/local_repro/sc_lmcache_knobs.sh"
++fi
+ export PYTHONFAULTHANDLER=1
+-export SRIRAM_STACK_DUMP_INTERVAL=120
+ # export CUDA_DEVICE_ORDER=PCI_BUS_ID
+ # export CUDA_VISIBLE_DEVICES=0
+ 
+diff --git a/local_repro/sbatch/03_h100_all_datasets_250.sbatch b/local_repro/sbatch/03_h100_all_datasets_250.sbatch
+index 56e420e..a53d632 100644
+--- a/local_repro/sbatch/03_h100_all_datasets_250.sbatch
++++ b/local_repro/sbatch/03_h100_all_datasets_250.sbatch
+@@ -14,6 +14,11 @@ cd /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
+ source /mnt/shared/gpfs/home/sriramc2/venvs/kvaware/bin/activate
+ 
+ export PYTHONPATH=/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM:${PYTHONPATH:-}
++REPO=/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
++if [[ "${SC_LMCACHE_SOURCE_DEFAULT_KNOBS:-1}" == "1" ]]; then
++  # Existing environment values win over defaults in this file.
++  source "$REPO/local_repro/sc_lmcache_knobs.sh"
++fi
+ export HF_HOME=/mnt/shared/gpfs/home/sriramc2/.cache/huggingface
+ export HUGGINGFACE_HUB_CACHE=/mnt/shared/gpfs/home/sriramc2/.cache/huggingface/hub
+ export TRANSFORMERS_CACHE=/mnt/shared/gpfs/home/sriramc2/.cache/huggingface/transformers
+diff --git a/local_repro/sbatch/2_l40_wo_gnn.sbatch b/local_repro/sbatch/2_l40_wo_gnn.sbatch
+index 4ae8978..68e9c8c 100644
+--- a/local_repro/sbatch/2_l40_wo_gnn.sbatch
++++ b/local_repro/sbatch/2_l40_wo_gnn.sbatch
+@@ -18,8 +18,12 @@ grep -E \
+ set -euxo pipefail
+ 
+ export PYTHONPATH=/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM:${PYTHONPATH:-}
++REPO=/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
++if [[ "${SC_LMCACHE_SOURCE_DEFAULT_KNOBS:-1}" == "1" ]]; then
++  # Existing environment values win over defaults in this file.
++  source "$REPO/local_repro/sc_lmcache_knobs.sh"
++fi
+ export PYTHONFAULTHANDLER=1
+-export SRIRAM_STACK_DUMP_INTERVAL=120
+ 
+ export MAX_QUESTIONS=2
+ export SUBMISSION_BATCH_SIZE=2
+diff --git a/local_repro/sc_lmcache_knobs.sh b/local_repro/sc_lmcache_knobs.sh
+new file mode 100755
+index 0000000..bcbca09
+--- /dev/null
++++ b/local_repro/sc_lmcache_knobs.sh
+@@ -0,0 +1,131 @@
++#!/usr/bin/env bash
++# Source this file from an sbatch script. Values already present in the
++# environment win, so `sbatch --export=ALL,SC_...=...` remains suitable for
++# grid searches.
++
++_sc_default() {
++  local name="$1"
++  local value="$2"
++  if [[ ! -v "$name" ]]; then
++    printf -v "$name" '%s' "$value"
++    export "$name"
++  fi
++}
++
++_sc_bool() {
++  case "${1,,}" in
++    0|1|false|true|no|yes|off|on) return 0 ;;
++    *) return 1 ;;
++  esac
++}
++
++SC_LMCACHE_PROFILE="${SC_LMCACHE_PROFILE:-vanilla}"
++export SC_LMCACHE_PROFILE
++
++case "$SC_LMCACHE_PROFILE" in
++  vanilla)
++    _sc_profile_gates=0
++    _sc_profile_logs=0
++    ;;
++  bounded)
++    _sc_profile_gates=1
++    _sc_profile_logs=0
++    ;;
++  diagnostic)
++    _sc_profile_gates=0
++    _sc_profile_logs=1
++    ;;
++  bounded_diagnostic)
++    _sc_profile_gates=1
++    _sc_profile_logs=1
++    ;;
++  custom)
++    _sc_profile_gates=0
++    _sc_profile_logs=0
++    ;;
++  *)
++    echo "Unknown SC_LMCACHE_PROFILE=$SC_LMCACHE_PROFILE" >&2
++    return 2 2>/dev/null || exit 2
++    ;;
++esac
++
++# Functional controls. Enable flags and capacities are intentionally separate.
++_sc_default SC_LMCACHE_SCHEDULER_LOOKUP_ADMISSION_ENABLE "$_sc_profile_gates"
++_sc_default SC_LMCACHE_SCHEDULER_LOOKUP_MAX_INFLIGHT 4
++_sc_default SC_LMCACHE_SCHEDULER_LOOKUP_ADMISSION_WAIT_MS 0
++
++_sc_default SC_LMCACHE_WORKER_LOOKUP_ADMISSION_ENABLE "$_sc_profile_gates"
++_sc_default SC_LMCACHE_WORKER_LOOKUP_MAX_INFLIGHT 1
++
++_sc_default SC_LMCACHE_DISK_PUT_ADMISSION_ENABLE "$_sc_profile_gates"
++_sc_default SC_LMCACHE_DISK_PUT_MAX_PENDING 8
++
++# Independent observability controls.
++_sc_default SC_LMCACHE_IO_TRACE_ENABLE "$_sc_profile_logs"
++_sc_default SC_LMCACHE_LOAD_TRACE_ENABLE "$_sc_profile_logs"
++_sc_default SC_LMCACHE_MEMORY_TRACE_ENABLE "$_sc_profile_logs"
++_sc_default SC_LMCACHE_MEMORY_SNAPSHOT_ENABLE 0
++_sc_default SC_LMCACHE_LOOKUP_TRACE_ENABLE 0
++_sc_default SC_LMCACHE_REQUEST_TRACE_ENABLE 0
++_sc_default SC_LMCACHE_GPU_ASSERT_SNAPSHOT_ENABLE 0
++
++_sc_default SC_LMCACHE_MEMORY_TRACE_INTERVAL_S 5
++_sc_default SC_LMCACHE_LONG_PIN_THRESHOLD_S 10
++_sc_default SC_LMCACHE_LONG_REF_THRESHOLD_S 10
++
++# Driver-side resource monitor, separate from LMCache logging.
++_sc_default SC_DRIVER_RESOURCE_MONITOR_ENABLE "$_sc_profile_logs"
++_sc_default SC_DRIVER_RESOURCE_MONITOR_INTERVAL_S 30
++
++# Optional override for the LMCache local-disk path. Empty means the driver's
++# existing default path is used.
++_sc_default SC_LMCACHE_DATA_DIR ""
++
++# Validate booleans early; numeric validation is repeated in Python where used.
++for _sc_name in \
++  SC_LMCACHE_SCHEDULER_LOOKUP_ADMISSION_ENABLE \
++  SC_LMCACHE_WORKER_LOOKUP_ADMISSION_ENABLE \
++  SC_LMCACHE_DISK_PUT_ADMISSION_ENABLE \
++  SC_LMCACHE_IO_TRACE_ENABLE \
++  SC_LMCACHE_LOAD_TRACE_ENABLE \
++  SC_LMCACHE_MEMORY_TRACE_ENABLE \
++  SC_LMCACHE_MEMORY_SNAPSHOT_ENABLE \
++  SC_LMCACHE_LOOKUP_TRACE_ENABLE \
++  SC_LMCACHE_REQUEST_TRACE_ENABLE \
++  SC_LMCACHE_GPU_ASSERT_SNAPSHOT_ENABLE \
++  SC_DRIVER_RESOURCE_MONITOR_ENABLE; do
++  if ! _sc_bool "${!_sc_name}"; then
++    echo "Invalid boolean ${_sc_name}=${!_sc_name}" >&2
++    return 2 2>/dev/null || exit 2
++  fi
++done
++
++sc_lmcache_print_knobs() {
++  local name
++  echo "SC_LMCACHE_PROFILE=$SC_LMCACHE_PROFILE"
++  for name in \
++    SC_LMCACHE_SCHEDULER_LOOKUP_ADMISSION_ENABLE \
++    SC_LMCACHE_SCHEDULER_LOOKUP_MAX_INFLIGHT \
++    SC_LMCACHE_SCHEDULER_LOOKUP_ADMISSION_WAIT_MS \
++    SC_LMCACHE_WORKER_LOOKUP_ADMISSION_ENABLE \
++    SC_LMCACHE_WORKER_LOOKUP_MAX_INFLIGHT \
++    SC_LMCACHE_DISK_PUT_ADMISSION_ENABLE \
++    SC_LMCACHE_DISK_PUT_MAX_PENDING \
++    SC_LMCACHE_IO_TRACE_ENABLE \
++    SC_LMCACHE_LOAD_TRACE_ENABLE \
++    SC_LMCACHE_MEMORY_TRACE_ENABLE \
++    SC_LMCACHE_MEMORY_SNAPSHOT_ENABLE \
++    SC_LMCACHE_LOOKUP_TRACE_ENABLE \
++    SC_LMCACHE_REQUEST_TRACE_ENABLE \
++    SC_LMCACHE_GPU_ASSERT_SNAPSHOT_ENABLE \
++    SC_LMCACHE_MEMORY_TRACE_INTERVAL_S \
++    SC_LMCACHE_LONG_PIN_THRESHOLD_S \
++    SC_LMCACHE_LONG_REF_THRESHOLD_S \
++    SC_DRIVER_RESOURCE_MONITOR_ENABLE \
++    SC_DRIVER_RESOURCE_MONITOR_INTERVAL_S \
++    SC_LMCACHE_DATA_DIR; do
++    printf '%s=%s\n' "$name" "${!name}"
++  done
++}
++
++unset _sc_profile_gates _sc_profile_logs _sc_name
+diff --git a/third_party/LMCache/lmcache/integration/vllm/vllm_v1_adapter.py b/third_party/LMCache/lmcache/integration/vllm/vllm_v1_adapter.py
+index de3c5e0..ddad84c 100644
+--- a/third_party/LMCache/lmcache/integration/vllm/vllm_v1_adapter.py
++++ b/third_party/LMCache/lmcache/integration/vllm/vllm_v1_adapter.py
+@@ -44,6 +44,7 @@ from lmcache.v1.compute.blend import LMCBlenderBuilder
+ from lmcache.v1.config import LMCacheEngineConfig
+ from lmcache.v1.config_base import validate_and_set_config_value
+ from lmcache.v1.manager import LMCacheManager
++from lmcache.v1.sc_config import request_trace_enabled
+ 
+ if TYPE_CHECKING:
+     # Third Party
+@@ -59,28 +60,30 @@ if TYPE_CHECKING:
+ 
+ logger = init_logger(__name__)
+ 
+-# ===== SRIRAM REQ LOOP DEBUG START =====
+-import os as _sr_os
+-import time as _sr_time
+-import traceback as _sr_traceback
+-import builtins as _sr_builtins
+-from collections import defaultdict as _sr_defaultdict
++# ===== SC REQUEST TRACE START =====
++import os as _sc_os
++import time as _sc_time
++import traceback as _sc_traceback
++import builtins as _sc_builtins
++from collections import defaultdict as _sc_defaultdict
+ 
+-if not hasattr(_sr_builtins, "_SR_REQ_SEEN"):
+-    _sr_builtins._SR_REQ_SEEN = _sr_defaultdict(lambda: {"count": 0, "last": 0.0})
++if not hasattr(_sc_builtins, "_SC_REQUEST_TRACE_STATE"):
++    _sc_builtins._SC_REQUEST_TRACE_STATE = _sc_defaultdict(lambda: {"count": 0, "last": 0.0})
+ 
+ 
+-def _sr_req_loop_debug(req_id, total_tokens=None, computed=None, hit=None, need=None, extra=""):
++def _sc_request_trace(req_id, total_tokens=None, computed=None, hit=None, need=None, extra=""):
++    if not request_trace_enabled():
++        return
+     try:
+-        now = _sr_time.time()
+-        table = _sr_builtins._SR_REQ_SEEN
++        now = _sc_time.time()
++        table = _sc_builtins._SC_REQUEST_TRACE_STATE
+         s = table[str(req_id)]
+         s["count"] += 1
+         dt = now - s["last"] if s["last"] else 0.0
+         s["last"] = now
+ 
+         print(
+-            f"[SRIRAM_REQDBG] pid={_sr_os.getpid()} req_id={req_id} "
++            f"[SC_REQUEST_TRACE] pid={_sc_os.getpid()} req_id={req_id} "
+             f"count={s['count']} dt={dt:.3f} "
+             f"total={total_tokens} computed={computed} hit={hit} need={need} "
+             f"extra={extra}",
+@@ -89,13 +92,13 @@ def _sr_req_loop_debug(req_id, total_tokens=None, computed=None, hit=None, need=
+ 
+         if s["count"] in (2, 5, 10, 20, 50, 100):
+             print(
+-                "[SRIRAM_REQDBG_STACK]\n"
+-                + "".join(_sr_traceback.format_stack(limit=18)),
++                "[SC_REQUEST_TRACE_STACK]\n"
++                + "".join(_sc_traceback.format_stack(limit=18)),
+                 flush=True,
+             )
+     except Exception as e:
+-        print(f"[SRIRAM_REQDBG_ERROR] {e!r}", flush=True)
+-# ===== SRIRAM REQ LOOP DEBUG END =====
++        print(f"[SC_REQUEST_TRACE_ERROR] {e!r}", flush=True)
++# ===== SC REQUEST TRACE END =====
+ @dataclass
+ class LoadSpec:
+     # Number of tokens cached in vLLM
+@@ -1605,7 +1608,7 @@ class LMCacheConnectorV1Impl:
+                 min_retrieve,
+             )
+         else:
+-            _sr_req_loop_debug(
++            _sc_request_trace(
+                 req_id,
+                 total_tokens=request.num_tokens,
+                 computed=num_computed_tokens,
+diff --git a/third_party/LMCache/lmcache/v1/cache_engine.py b/third_party/LMCache/lmcache/v1/cache_engine.py
+index aa928de..24e3def 100644
+--- a/third_party/LMCache/lmcache/v1/cache_engine.py
++++ b/third_party/LMCache/lmcache/v1/cache_engine.py
+@@ -56,6 +56,7 @@ from lmcache.v1.memory_management import (  # noqa: E501
+ )
+ from lmcache.v1.metadata import LMCacheMetadata
+ from lmcache.v1.pin_monitor import PinMonitor
++from lmcache.v1.sc_config import io_trace_enabled, load_trace_enabled
+ from lmcache.v1.storage_backend.storage_manager import StorageManager
+ from lmcache.v1.system_detection import NUMADetector, NUMAMapping
+ from lmcache.v1.token_database import (
+@@ -207,8 +208,8 @@ class LMCacheEngine:
+             lambda: defaultdict(list)
+         )
+ 
+-        # SRIRAM DEBUG: lookup_id -> first pin/lookup timestamp.
+-        self._sr_lookup_start_times: dict[str, float] = {}
++        # SC load tracing: lookup_id -> first pin/lookup timestamp.
++        self._sc_lookup_start_times: dict[str, float] = {}
+ 
+         InitializeUsageContext(config, metadata)
+         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
+@@ -1182,7 +1183,7 @@ class LMCacheEngine:
+         assert self.storage_manager is not None
+ 
+         if pin and lookup_id is not None:
+-            self._sr_lookup_start_times.setdefault(
++            self._sc_lookup_start_times.setdefault(
+                 lookup_id,
+                 time.monotonic(),
+             )
+@@ -1356,7 +1357,7 @@ class LMCacheEngine:
+         assert self.storage_manager is not None
+ 
+         if pin:
+-            self._sr_lookup_start_times.setdefault(
++            self._sc_lookup_start_times.setdefault(
+                 lookup_id,
+                 time.monotonic(),
+             )
+@@ -1387,8 +1388,8 @@ class LMCacheEngine:
+                 keys.append(key)
+             cum_chunk_lengths.append(end)
+ 
+-        kvio_submitted_at = time.monotonic()
+-        kvio_future = asyncio.run_coroutine_threadsafe(
++        sc_io_submitted_at = time.monotonic()
++        sc_io_future = asyncio.run_coroutine_threadsafe(
+             self.storage_manager.async_lookup_and_prefetch(
+                 lookup_id,
+                 keys,
+@@ -1400,9 +1401,9 @@ class LMCacheEngine:
+             self.storage_manager.loop,
+         )
+ 
+-        if os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
++        if io_trace_enabled():
+             logger.warning(
+-                "[KVIO_ENGINE_SUBMIT] lookup_id=%s keys=%d chunks=%d "
++                "[SC_IO_ENGINE_SUBMIT] lookup_id=%s keys=%d chunks=%d "
+                 "keys_per_chunk=%d pin=%s search_range=%s mono=%.6f",
+                 lookup_id,
+                 len(keys),
+@@ -1410,16 +1411,16 @@ class LMCacheEngine:
+                 keys_per_chunk,
+                 pin,
+                 search_range,
+-                kvio_submitted_at,
++                sc_io_submitted_at,
+             )
+ 
+-            def _kvio_engine_done(done_future):
+-                elapsed = time.monotonic() - kvio_submitted_at
++            def _sc_io_engine_done(done_future):
++                elapsed = time.monotonic() - sc_io_submitted_at
+                 try:
+                     exc = done_future.exception()
+                 except Exception as callback_exc:
+                     logger.warning(
+-                        "[KVIO_ENGINE_FUTURE_INSPECT_ERROR] "
++                        "[SC_IO_ENGINE_FUTURE_INSPECT_ERROR] "
+                         "lookup_id=%s elapsed=%.6f error=%r",
+                         lookup_id,
+                         elapsed,
+@@ -1427,7 +1428,7 @@ class LMCacheEngine:
+                     )
+                     return
+                 logger.warning(
+-                    "[KVIO_ENGINE_FUTURE_DONE] lookup_id=%s elapsed=%.6f "
++                    "[SC_IO_ENGINE_FUTURE_DONE] lookup_id=%s elapsed=%.6f "
+                     "cancelled=%s exception=%r",
+                     lookup_id,
+                     elapsed,
+@@ -1435,7 +1436,7 @@ class LMCacheEngine:
+                     exc,
+                 )
+ 
+-            kvio_future.add_done_callback(_kvio_engine_done)
++            sc_io_future.add_done_callback(_sc_io_engine_done)
+ 
+     def cleanup_memory_objs(self, lookup_id: str) -> None:
+         """
+@@ -1449,9 +1450,9 @@ class LMCacheEngine:
+             event_status = self.event_manager.get_event_status(
+                 EventType.LOADING, lookup_id
+             )
+-            if os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
++            if io_trace_enabled():
+                 logger.warning(
+-                    "[KVIO_ENGINE_CLEANUP_ENTER] lookup_id=%s "
++                    "[SC_IO_ENGINE_CLEANUP_ENTER] lookup_id=%s "
+                     "event_status=%s",
+                     lookup_id,
+                     event_status,
+@@ -1462,9 +1463,9 @@ class LMCacheEngine:
+                 logger.debug(
+                     "No completed event found for lookup_id=%s to clean up.", lookup_id
+                 )
+-                if os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
++                if io_trace_enabled():
+                     logger.warning(
+-                        "[KVIO_ENGINE_CLEANUP_DEFER] lookup_id=%s "
++                        "[SC_IO_ENGINE_CLEANUP_DEFER] lookup_id=%s "
+                         "event_status=%s elapsed=%.6f",
+                         lookup_id,
+                         event_status,
+@@ -1477,9 +1478,9 @@ class LMCacheEngine:
+             memory_objs = future.result()
+             # Flatten nested lists (each backend returns a list of chunks)
+             memory_objs_flat = [mm for m in memory_objs for mm in m]
+-            if os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
++            if io_trace_enabled():
+                 logger.warning(
+-                    "[KVIO_ENGINE_CLEANUP_OBJECTS] lookup_id=%s "
++                    "[SC_IO_ENGINE_CLEANUP_OBJECTS] lookup_id=%s "
+                     "tiers=%d objects=%d",
+                     lookup_id,
+                     len(memory_objs),
+@@ -1495,9 +1496,9 @@ class LMCacheEngine:
+                     memory_obj.ref_count_down()
+                 except Exception as e:
+                     logger.error(f"Error releasing memory object: {e}")
+-            if os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
++            if io_trace_enabled():
+                 logger.warning(
+-                    "[KVIO_ENGINE_CLEANUP_DONE] lookup_id=%s objects=%d "
++                    "[SC_IO_ENGINE_CLEANUP_DONE] lookup_id=%s objects=%d "
+                     "elapsed=%.6f",
+                     lookup_id,
+                     len(memory_objs_flat),
+@@ -1631,13 +1632,13 @@ class LMCacheEngine:
+ 
+     @_lmcache_nvtx_annotate
+     def lookup_unpin(self, lookup_id: str) -> None:
+-        started = self._sr_lookup_start_times.pop(lookup_id, None)
++        started = self._sc_lookup_start_times.pop(lookup_id, None)
+         age = (
+             time.monotonic() - started
+             if started is not None
+             else -1.0
+         )
+-        debug_enabled = os.environ.get("SRIRAM_KV_MEM_DEBUG", "0") == "1"
++        trace_enabled = load_trace_enabled()
+ 
+         if lookup_id in self.lookup_pins:
+             assert self.storage_manager is not None
+@@ -1647,9 +1648,9 @@ class LMCacheEngine:
+                 for location, keys in mapping.items()
+             }
+ 
+-            if debug_enabled:
++            if trace_enabled:
+                 logger.warning(
+-                    "[KVDBG_LOOKUP_UNPIN] "
++                    "[SC_LOAD_LOOKUP_UNPIN] "
+                     "pid=%d lookup_id=%s age=%.3fs "
+                     "branch=lookup_pins locations=%s total_keys=%d",
+                     os.getpid(),
+@@ -1671,9 +1672,9 @@ class LMCacheEngine:
+                 EventType.LOADING,
+                 lookup_id,
+             )
+-            if debug_enabled:
++            if trace_enabled:
+                 logger.warning(
+-                    "[KVDBG_LOOKUP_UNPIN] "
++                    "[SC_LOAD_LOOKUP_UNPIN] "
+                     "pid=%d lookup_id=%s age=%.3fs "
+                     "branch=async_cleanup event_status=%s",
+                     os.getpid(),
+@@ -1683,9 +1684,9 @@ class LMCacheEngine:
+                 )
+             self.cleanup_memory_objs(lookup_id)
+ 
+-        elif debug_enabled:
++        elif trace_enabled:
+             logger.warning(
+-                "[KVDBG_LOOKUP_UNPIN] "
++                "[SC_LOAD_LOOKUP_UNPIN] "
+                 "pid=%d lookup_id=%s age=%.3fs "
+                 "branch=no_tracked_state",
+                 os.getpid(),
+diff --git a/third_party/LMCache/lmcache/v1/gpu_connector/gpu_connectors.py b/third_party/LMCache/lmcache/v1/gpu_connector/gpu_connectors.py
+index 55dcc11..abdac54 100644
+--- a/third_party/LMCache/lmcache/v1/gpu_connector/gpu_connectors.py
++++ b/third_party/LMCache/lmcache/v1/gpu_connector/gpu_connectors.py
+@@ -31,6 +31,7 @@ from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
+ from lmcache.v1.memory_management import GPUMemoryAllocator  # noqa: E501
+ from lmcache.v1.memory_management import MemoryFormat, MemoryObj
+ from lmcache.v1.metadata import LMCacheMetadata
++from lmcache.v1.sc_config import gpu_assert_snapshot_enabled
+ import lmcache.c_ops as lmc_ops
+ 
+ logger = init_logger(__name__)
+@@ -279,21 +280,20 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
+         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
+         """
+         if memory_obj.tensor is None:
+-            try:
++            if gpu_assert_snapshot_enabled():
+                 try:
+-                    from lmcache.v1.memory_management import _sr_mem_snapshot
+-                except Exception:
+-                    _sr_mem_snapshot = None
+-                    
+-                if _sr_mem_snapshot is not None:
+-                    _sr_mem_snapshot(
++                    from lmcache.v1.memory_management import _sc_memory_snapshot
++
++                    _sc_memory_snapshot(
+                         "GPU_CONNECTOR_TENSOR_NONE_BEFORE_ASSERT",
+                         memory_obj,
+                         extra=f"start={start} end={end} kwargs={kwargs}",
+                         stack=True,
+                     )
+-            except Exception as e:
+-                print(f"[SRIRAM_GPUCONNECTOR_ASSERTDBG_ERROR] {e!r}", flush=True)
++                except Exception as exc:
++                    logger.exception(
++                        "[SC_GPU_ASSERT_SNAPSHOT_ERROR] error=%r", exc
++                    )
+             assert memory_obj.tensor is not None
+ 
+         self.initialize_kvcaches_ptr(**kwargs)
+diff --git a/third_party/LMCache/lmcache/v1/lookup_client/lmcache_async_lookup_client.py b/third_party/LMCache/lmcache/v1/lookup_client/lmcache_async_lookup_client.py
+index ba14342..e0e91bf 100644
+--- a/third_party/LMCache/lmcache/v1/lookup_client/lmcache_async_lookup_client.py
++++ b/third_party/LMCache/lmcache/v1/lookup_client/lmcache_async_lookup_client.py
+@@ -21,6 +21,11 @@ from lmcache.v1.lookup_client.async_lookup_message import (
+     LookupResponseMsg,
+ )
+ from lmcache.v1.metadata import LMCacheMetadata
++from lmcache.v1.sc_config import (
++    env_int,
++    io_trace_enabled,
++    scheduler_lookup_admission_enabled,
++)
+ from lmcache.v1.rpc_utils import (
+     get_zmq_context,
+     get_zmq_rpc_path_lmcache,
+@@ -30,10 +35,6 @@ from lmcache.v1.rpc_utils import (
+ logger = init_logger(__name__)
+ 
+ 
+-def _kvio_trace_enabled() -> bool:
+-    return os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1"
+-
+-
+ # NOTE(Jiayi): Prefetch could load extra redundant cache if multiple
+ # workers has different hit tokens.
+ class LMCacheAsyncLookupClient(LookupClientInterface):
+@@ -61,8 +62,8 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
+         self.first_lookup_time: dict[str, float] = {}
+         # Observability-only timestamps/counters. They do not participate in
+         # timeout, cleanup, or scheduling decisions.
+-        self._kvio_lookup_start_mono: dict[str, float] = {}
+-        self._kvio_poll_count: dict[str, int] = {}
++        self._sc_lookup_start_mono: dict[str, float] = {}
++        self._sc_lookup_poll_count: dict[str, int] = {}
+         self.config = config
+ 
+         self.ctx = get_zmq_context(use_asyncio=False)
+@@ -135,54 +136,46 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
+         # (e.g., worker process).
+         self.lock = threading.Lock()
+ 
+-        # P0 Gate C: scheduler-side admission before a logical lookup is
+-        # registered as pending and before messages are sent to workers.
+-        #
+-        # By default, reuse the worker-side P0-A limit so one knob can bound
+-        # both logical lookups and per-rank pre-pin work. Set the client-specific
+-        # value to 0 to disable only Gate C while leaving worker P0-A enabled.
+-        client_limit_raw = os.environ.get(
+-            "LMCACHE_P0_CLIENT_LOOKUP_MAX_INFLIGHT",
+-            os.environ.get("LMCACHE_P0_LOOKUP_MAX_INFLIGHT", "0"),
++        # Optional scheduler-side admission before a logical lookup is
++        # registered as pending or dispatched to workers. This gate is fully
++        # independent from worker-side lookup admission.
++        self._sc_scheduler_lookup_admission_enabled = (
++            scheduler_lookup_admission_enabled()
+         )
+-        self._p0_client_lookup_limit = int(client_limit_raw)
+-        if self._p0_client_lookup_limit < 0:
+-            raise ValueError(
+-                "LMCACHE_P0_CLIENT_LOOKUP_MAX_INFLIGHT must be >= 0, "
+-                f"got {self._p0_client_lookup_limit}"
+-            )
+-
+-        self._p0_client_lookup_wait_ms = int(
+-            os.environ.get(
+-                "LMCACHE_P0_CLIENT_LOOKUP_ADMISSION_TIMEOUT_MS",
+-                "0",
+-            )
++        self._sc_scheduler_lookup_limit = env_int(
++            "SC_LMCACHE_SCHEDULER_LOOKUP_MAX_INFLIGHT", 4, minimum=0
+         )
+-        if self._p0_client_lookup_wait_ms < 0:
++        if (
++            self._sc_scheduler_lookup_admission_enabled
++            and self._sc_scheduler_lookup_limit < 1
++        ):
+             raise ValueError(
+-                "LMCACHE_P0_CLIENT_LOOKUP_ADMISSION_TIMEOUT_MS must be >= 0, "
+-                f"got {self._p0_client_lookup_wait_ms}"
++                "SC_LMCACHE_SCHEDULER_LOOKUP_MAX_INFLIGHT must be >= 1 "
++                "when scheduler lookup admission is enabled"
+             )
+-
+-        self._p0_client_lookup_admission = (
+-            threading.BoundedSemaphore(self._p0_client_lookup_limit)
+-            if self._p0_client_lookup_limit > 0
+-            else None
++        self._sc_scheduler_lookup_wait_ms = env_int(
++            "SC_LMCACHE_SCHEDULER_LOOKUP_ADMISSION_WAIT_MS", 0, minimum=0
+         )
+-        self._p0_client_lookup_state_lock = threading.Lock()
+-        self._p0_client_lookup_admitted: set[str] = set()
+-        self._p0_client_lookup_admitted_at: dict[str, float] = {}
+-        self._p0_client_lookup_inflight = 0
+-        self._p0_client_lookup_waiters = 0
+-        self._p0_client_lookup_peak = 0
+-        self._kvio_lookup_offer_mono: dict[str, float] = {}
+-
+-        logger.info(
+-            "P0 client lookup admission: limit=%d wait_ms=%d "
+-            "(0 limit disables Gate C)",
+-            self._p0_client_lookup_limit,
+-            self._p0_client_lookup_wait_ms,
++        self._sc_scheduler_lookup_admission = (
++            threading.BoundedSemaphore(self._sc_scheduler_lookup_limit)
++            if self._sc_scheduler_lookup_admission_enabled
++            else None
+         )
++        self._sc_scheduler_lookup_state_lock = threading.Lock()
++        self._sc_scheduler_lookup_admitted: set[str] = set()
++        self._sc_scheduler_lookup_admitted_at: dict[str, float] = {}
++        self._sc_scheduler_lookup_inflight = 0
++        self._sc_scheduler_lookup_waiters = 0
++        self._sc_scheduler_lookup_peak = 0
++        self._sc_lookup_offer_mono: dict[str, float] = {}
++
++        if self._sc_scheduler_lookup_admission_enabled or io_trace_enabled():
++            logger.info(
++                "SC scheduler lookup admission: enabled=%s limit=%d wait_ms=%d",
++                self._sc_scheduler_lookup_admission_enabled,
++                self._sc_scheduler_lookup_limit,
++                self._sc_scheduler_lookup_wait_ms,
++            )
+ 
+         # map from lookup_id (i.e., req_id) to req's status.
+         # None indicates ongoing.
+@@ -214,65 +207,65 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
+                 config.extra_config.get("lookup_backoff_time", self.lookup_backoff_time)
+             )
+ 
+-    def _p0_try_admit_client_lookup(self, lookup_id: str) -> bool:
+-        """Acquire Gate C before creating/sending worker lookup work.
++    def _sc_try_admit_scheduler_lookup(self, lookup_id: str) -> bool:
++        """Acquire optional scheduler admission before dispatching lookup work.
+ 
+         The permit remains held until every configured lookup worker responds.
+-        In particular, a scheduler-side lookup timeout does not release it,
+-        because the underlying worker read is still unfinished without P0-D.
++        A scheduler-side lookup timeout does not release it because the worker
++        read remains unfinished without worker-side cancellation support.
+         """
+-        semaphore = self._p0_client_lookup_admission
++        semaphore = self._sc_scheduler_lookup_admission
+         if semaphore is None:
+             return True
+ 
+         started = time.monotonic()
+-        with self._p0_client_lookup_state_lock:
+-            self._p0_client_lookup_waiters += 1
+-            inflight = self._p0_client_lookup_inflight
+-            waiters = self._p0_client_lookup_waiters
++        with self._sc_scheduler_lookup_state_lock:
++            self._sc_scheduler_lookup_waiters += 1
++            inflight = self._sc_scheduler_lookup_inflight
++            waiters = self._sc_scheduler_lookup_waiters
+ 
+-        if _kvio_trace_enabled():
++        if io_trace_enabled():
+             logger.warning(
+-                "[P0_CLIENT_LOOKUP_ADMISSION_WAIT] pid=%d lookup_id=%s "
++                "[SC_SCHEDULER_LOOKUP_ADMISSION_WAIT] pid=%d lookup_id=%s "
+                 "limit=%d inflight=%d waiters=%d timeout_ms=%d",
+                 os.getpid(),
+                 lookup_id,
+-                self._p0_client_lookup_limit,
++                self._sc_scheduler_lookup_limit,
+                 inflight,
+                 waiters,
+-                self._p0_client_lookup_wait_ms,
++                self._sc_scheduler_lookup_wait_ms,
+             )
+ 
+         acquired = semaphore.acquire(
+-            timeout=self._p0_client_lookup_wait_ms / 1000.0
++            timeout=self._sc_scheduler_lookup_wait_ms / 1000.0
+         )
+         waited = time.monotonic() - started
+ 
+-        with self._p0_client_lookup_state_lock:
+-            self._p0_client_lookup_waiters -= 1
++        with self._sc_scheduler_lookup_state_lock:
++            self._sc_scheduler_lookup_waiters -= 1
+             if acquired:
+-                if lookup_id in self._p0_client_lookup_admitted:
++                if lookup_id in self._sc_scheduler_lookup_admitted:
+                     # Defensive: a logical lookup must own at most one permit.
+                     semaphore.release()
+                     raise RuntimeError(
+-                        f"Gate C duplicate admission for lookup_id={lookup_id}"
++                        f"scheduler lookup admission duplicate admission for lookup_id={lookup_id}"
+                     )
+-                self._p0_client_lookup_admitted.add(lookup_id)
+-                self._p0_client_lookup_admitted_at[lookup_id] = time.monotonic()
+-                self._p0_client_lookup_inflight += 1
+-                self._p0_client_lookup_peak = max(
+-                    self._p0_client_lookup_peak,
+-                    self._p0_client_lookup_inflight,
++                self._sc_scheduler_lookup_admitted.add(lookup_id)
++                self._sc_scheduler_lookup_admitted_at[lookup_id] = time.monotonic()
++                self._sc_scheduler_lookup_inflight += 1
++                self._sc_scheduler_lookup_peak = max(
++                    self._sc_scheduler_lookup_peak,
++                    self._sc_scheduler_lookup_inflight,
+                 )
+-            inflight = self._p0_client_lookup_inflight
+-            waiters = self._p0_client_lookup_waiters
+-            peak = self._p0_client_lookup_peak
++            inflight = self._sc_scheduler_lookup_inflight
++            waiters = self._sc_scheduler_lookup_waiters
++            peak = self._sc_scheduler_lookup_peak
+ 
+-        if _kvio_trace_enabled():
++        if io_trace_enabled():
+             marker = (
+-                "P0_CLIENT_LOOKUP_ADMISSION_ACQUIRE"
++                "SC_SCHEDULER_LOOKUP_ADMISSION_ACQUIRE"
+                 if acquired
+-                else "P0_CLIENT_LOOKUP_ADMISSION_REJECT"
++                else "SC_SCHEDULER_LOOKUP_ADMISSION_REJECT"
+             )
+             logger.warning(
+                 "[%s] pid=%d lookup_id=%s waited=%.6f limit=%d "
+@@ -281,47 +274,47 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
+                 os.getpid(),
+                 lookup_id,
+                 waited,
+-                self._p0_client_lookup_limit,
++                self._sc_scheduler_lookup_limit,
+                 inflight,
+                 waiters,
+                 peak,
+-                self._p0_client_lookup_wait_ms,
++                self._sc_scheduler_lookup_wait_ms,
+             )
+ 
+         return acquired
+ 
+-    def _p0_release_client_lookup(self, lookup_id: str, reason: str) -> bool:
+-        """Release one Gate C permit after logical worker completion."""
+-        semaphore = self._p0_client_lookup_admission
++    def _sc_release_scheduler_lookup(self, lookup_id: str, reason: str) -> bool:
++        """Release one scheduler-admission permit after worker completion."""
++        semaphore = self._sc_scheduler_lookup_admission
+         if semaphore is None:
+             return False
+ 
+-        with self._p0_client_lookup_state_lock:
+-            if lookup_id not in self._p0_client_lookup_admitted:
++        with self._sc_scheduler_lookup_state_lock:
++            if lookup_id not in self._sc_scheduler_lookup_admitted:
+                 return False
+-            self._p0_client_lookup_admitted.remove(lookup_id)
+-            admitted_at = self._p0_client_lookup_admitted_at.pop(lookup_id, None)
+-            self._p0_client_lookup_inflight -= 1
+-            inflight = self._p0_client_lookup_inflight
+-            waiters = self._p0_client_lookup_waiters
+-            peak = self._p0_client_lookup_peak
++            self._sc_scheduler_lookup_admitted.remove(lookup_id)
++            admitted_at = self._sc_scheduler_lookup_admitted_at.pop(lookup_id, None)
++            self._sc_scheduler_lookup_inflight -= 1
++            inflight = self._sc_scheduler_lookup_inflight
++            waiters = self._sc_scheduler_lookup_waiters
++            peak = self._sc_scheduler_lookup_peak
+ 
+         semaphore.release()
+ 
+-        if _kvio_trace_enabled():
++        if io_trace_enabled():
+             held = (
+                 time.monotonic() - admitted_at
+                 if admitted_at is not None
+                 else -1.0
+             )
+             logger.warning(
+-                "[P0_CLIENT_LOOKUP_ADMISSION_RELEASE] pid=%d lookup_id=%s "
++                "[SC_SCHEDULER_LOOKUP_ADMISSION_RELEASE] pid=%d lookup_id=%s "
+                 "reason=%s held=%.6f limit=%d inflight=%d waiters=%d peak=%d",
+                 os.getpid(),
+                 lookup_id,
+                 reason,
+                 held,
+-                self._p0_client_lookup_limit,
++                self._sc_scheduler_lookup_limit,
+                 inflight,
+                 waiters,
+                 peak,
+@@ -342,19 +335,19 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
+ 
+         if req_status == -1:
+             offer_mono = time.monotonic()
+-            self._kvio_lookup_offer_mono.setdefault(lookup_id, offer_mono)
++            self._sc_lookup_offer_mono.setdefault(lookup_id, offer_mono)
+ 
+-            # Gate C is intentionally before pending-state creation, the
+-            # retrieval timeout, and worker message dispatch. A rejected
++            # Scheduler admission is intentionally before pending-state creation,
++            # the retrieval timeout, and worker dispatch. A rejected
+             # lookup is cached as a zero-token result so repeated scheduler
+             # probes remain idempotent until update_state_after_alloc clears it.
+-            if not self._p0_try_admit_client_lookup(lookup_id):
++            if not self._sc_try_admit_scheduler_lookup(lookup_id):
+                 with self.lock:
+                     self.reqs_status[lookup_id] = 0
+                     pending = sum(v is None for v in self.reqs_status.values())
+-                if _kvio_trace_enabled():
++                if io_trace_enabled():
+                     logger.warning(
+-                        "[KVIO_LOOKUP_ADMISSION_BYPASS] lookup_id=%s "
++                        "[SC_IO_LOOKUP_ADMISSION_BYPASS] lookup_id=%s "
+                         "offer_age=%.6f status=0 pending=%d",
+                         lookup_id,
+                         time.monotonic() - offer_mono,
+@@ -364,12 +357,12 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
+ 
+             with self.lock:
+                 self.reqs_status[lookup_id] = None
+-                self._kvio_poll_count[lookup_id] = 0
++                self._sc_lookup_poll_count[lookup_id] = 0
+                 pending = sum(v is None for v in self.reqs_status.values())
+                 aborted = len(self.aborted_lookups)
+-            if _kvio_trace_enabled():
++            if io_trace_enabled():
+                 logger.warning(
+-                    "[KVIO_LOOKUP_STATUS_CREATE] lookup_id=%s "
++                    "[SC_IO_LOOKUP_STATUS_CREATE] lookup_id=%s "
+                     "mono=%.6f pending=%d aborted=%d timer_started=0",
+                     lookup_id,
+                     offer_mono,
+@@ -380,26 +373,26 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
+ 
+         if req_status is None:
+             with self.lock:
+-                # Preserve the existing polling behavior. Gate C only changes
++                # Preserve the existing polling behavior. scheduler lookup admission only changes
+                 # when the retrieval clock begins, not the polling cadence.
+                 req_status = self.reqs_status.get(lookup_id, -1)
+                 if req_status is not None:
+                     return req_status
+-                self._kvio_poll_count[lookup_id] = (
+-                    self._kvio_poll_count.get(lookup_id, 0) + 1
++                self._sc_lookup_poll_count[lookup_id] = (
++                    self._sc_lookup_poll_count.get(lookup_id, 0) + 1
+                 )
+                 time.sleep(self.lookup_backoff_time)
+ 
+                 lookup_started = self.first_lookup_time.get(lookup_id)
+                 if lookup_started is None:
+-                    # Gate C admitted the logical lookup, but lookup() has not
++                    # Scheduler admission accepted the logical lookup, but lookup() has not
+                     # started dispatch yet. The retrieval timer is not running.
+                     return None
+ 
+                 if (
+                     time.monotonic() - lookup_started
+                 ) * 1000 > self.config.lookup_timeout_ms:
+-                    age = time.monotonic() - self._kvio_lookup_start_mono.get(
++                    age = time.monotonic() - self._sc_lookup_start_mono.get(
+                         lookup_id, time.monotonic()
+                     )
+                     logger.warning(
+@@ -411,14 +404,14 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
+                         lookup_id,
+                         self.config.lookup_timeout_ms // 1000,
+                     )
+-                    if _kvio_trace_enabled():
++                    if io_trace_enabled():
+                         logger.warning(
+-                            "[KVIO_LOOKUP_TIMEOUT] lookup_id=%s age=%.6f "
++                            "[SC_IO_LOOKUP_TIMEOUT] lookup_id=%s age=%.6f "
+                             "polls=%d pending=%d aborted_before=%d "
+                             "partial_worker_responses=%d/%d",
+                             lookup_id,
+                             age,
+-                            self._kvio_poll_count.get(lookup_id, 0),
++                            self._sc_lookup_poll_count.get(lookup_id, 0),
+                             sum(v is None for v in self.reqs_status.values()),
+                             len(self.aborted_lookups),
+                             len(self.res_for_each_worker.get(lookup_id, [])),
+@@ -459,21 +452,21 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
+ 
+             dispatch_mono = time.monotonic()
+             with self.lock:
+-                if self._p0_client_lookup_admission is not None and (
+-                    lookup_id not in self._p0_client_lookup_admitted
++                if self._sc_scheduler_lookup_admission is not None and (
++                    lookup_id not in self._sc_scheduler_lookup_admitted
+                 ):
+                     raise RuntimeError(
+-                        f"Gate C permit missing for lookup_id={lookup_id}"
++                        f"scheduler lookup admission permit missing for lookup_id={lookup_id}"
+                     )
+-                # lookup_timeout_ms starts only after Gate C admission and
++                # lookup_timeout_ms starts only after scheduler admission and
+                 # immediately before dispatching the lookup to workers.
+                 self.first_lookup_time[lookup_id] = dispatch_mono
+-                self._kvio_lookup_start_mono[lookup_id] = dispatch_mono
+-                self._kvio_poll_count[lookup_id] = 1
++                self._sc_lookup_start_mono[lookup_id] = dispatch_mono
++                self._sc_lookup_poll_count[lookup_id] = 1
+ 
+-            if _kvio_trace_enabled():
++            if io_trace_enabled():
+                 logger.warning(
+-                    "[KVIO_LOOKUP_REQUEST_SEND] lookup_id=%s hashes=%d "
++                    "[SC_IO_LOOKUP_REQUEST_SEND] lookup_id=%s hashes=%d "
+                     "offset_tokens=%d workers=%d msg_bytes=%d mono=%.6f "
+                     "offer_wait=%.6f",
+                     lookup_id,
+@@ -483,7 +476,7 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
+                     len(msg_buf),
+                     dispatch_mono,
+                     dispatch_mono
+-                    - self._kvio_lookup_offer_mono.get(lookup_id, dispatch_mono),
++                    - self._sc_lookup_offer_mono.get(lookup_id, dispatch_mono),
+                 )
+ 
+             for i in range(self.world_size):
+@@ -492,10 +485,10 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
+             time.sleep(self.lookup_backoff_time)
+             return None
+         except Exception:
+-            # Gate C owns no worker-side cancellation policy. This release only
++            # Scheduler admission owns no worker-side cancellation policy. This release only
+             # prevents a client permit leak when lookup construction/dispatch
+             # itself fails before normal all-worker completion accounting.
+-            self._p0_release_client_lookup(lookup_id, reason="dispatch_error")
++            self._sc_release_scheduler_lookup(lookup_id, reason="dispatch_error")
+             with self.lock:
+                 self.reqs_status[lookup_id] = 0
+                 self.first_lookup_time.pop(lookup_id, None)
+@@ -517,15 +510,15 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
+                         self.res_for_each_worker[lookup_id].append(res)
+                     all_res = self.res_for_each_worker[lookup_id]
+ 
+-                    if _kvio_trace_enabled():
++                    if io_trace_enabled():
+                         logger.warning(
+-                            "[KVIO_LOOKUP_WORKER_RESPONSE] lookup_id=%s "
++                            "[SC_IO_LOOKUP_WORKER_RESPONSE] lookup_id=%s "
+                             "response_index=%d/%d tokens=%d age=%.6f aborted=%s",
+                             lookup_id,
+                             len(all_res),
+                             self.world_size,
+                             res,
+-                            time.monotonic() - self._kvio_lookup_start_mono.get(
++                            time.monotonic() - self._sc_lookup_start_mono.get(
+                                 lookup_id, time.monotonic()
+                             ),
+                             lookup_id in self.aborted_lookups,
+@@ -539,19 +532,19 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
+                         # can use the minimum value as the number of
+                         # hit tokens.
+                         self.reqs_status[lookup_id] = min(all_res)
+-                        self._p0_release_client_lookup(
++                        self._sc_release_scheduler_lookup(
+                             lookup_id, reason="all_worker_responses"
+                         )
+-                        if _kvio_trace_enabled():
++                        if io_trace_enabled():
+                             logger.warning(
+-                                "[KVIO_LOOKUP_ALL_RESPONSES] lookup_id=%s "
++                                "[SC_IO_LOOKUP_ALL_RESPONSES] lookup_id=%s "
+                                 "worker_tokens=%s min_tokens=%d age=%.6f "
+                                 "aborted=%s",
+                                 lookup_id,
+                                 all_res,
+                                 min(all_res),
+                                 time.monotonic()
+-                                - self._kvio_lookup_start_mono.get(
++                                - self._sc_lookup_start_mono.get(
+                                     lookup_id, time.monotonic()
+                                 ),
+                                 lookup_id in self.aborted_lookups,
+@@ -562,13 +555,13 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
+ 
+     def clear_lookup_status(self, lookup_id: str) -> None:
+         with self.lock:
+-            if _kvio_trace_enabled():
++            if io_trace_enabled():
+                 logger.warning(
+-                    "[KVIO_LOOKUP_STATUS_CLEAR] lookup_id=%s age=%.6f "
++                    "[SC_IO_LOOKUP_STATUS_CLEAR] lookup_id=%s age=%.6f "
+                     "status=%s aborted=%s",
+                     lookup_id,
+                     time.monotonic()
+-                    - self._kvio_lookup_start_mono.get(
++                    - self._sc_lookup_start_mono.get(
+                         lookup_id, time.monotonic()
+                     ),
+                     self.reqs_status.get(lookup_id),
+@@ -576,19 +569,19 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
+                 )
+             self.reqs_status.pop(lookup_id, None)
+             self.first_lookup_time.pop(lookup_id, None)
+-            self._kvio_lookup_start_mono.pop(lookup_id, None)
+-            self._kvio_lookup_offer_mono.pop(lookup_id, None)
+-            self._kvio_poll_count.pop(lookup_id, None)
++            self._sc_lookup_start_mono.pop(lookup_id, None)
++            self._sc_lookup_offer_mono.pop(lookup_id, None)
++            self._sc_lookup_poll_count.pop(lookup_id, None)
+ 
+     def cancel_lookup(self, lookup_id: str) -> None:
+         """Mark lookup as aborted. Cleanup will happen after task finishes."""
+-        if _kvio_trace_enabled():
++        if io_trace_enabled():
+             logger.warning(
+-                "[KVIO_LOOKUP_MARK_ABORTED] lookup_id=%s age=%.6f "
++                "[SC_IO_LOOKUP_MARK_ABORTED] lookup_id=%s age=%.6f "
+                 "aborted_before=%d",
+                 lookup_id,
+                 time.monotonic()
+-                - self._kvio_lookup_start_mono.get(
++                - self._sc_lookup_start_mono.get(
+                     lookup_id, time.monotonic()
+                 ),
+                 len(self.aborted_lookups),
+@@ -605,9 +598,9 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
+             if self.reqs_status.get(lookup_id) is not None
+         ]
+         if finished_lookups:
+-            if _kvio_trace_enabled():
++            if io_trace_enabled():
+                 logger.warning(
+-                    "[KVIO_LOOKUP_CLEANUP_READY] lookup_ids=%s "
++                    "[SC_IO_LOOKUP_CLEANUP_READY] lookup_ids=%s "
+                     "remaining_aborted_before=%d",
+                     finished_lookups,
+                     len(self.aborted_lookups),
+@@ -627,13 +620,13 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
+         for i in range(self.world_size):
+             self.push_sockets[i].send(msg_buf, copy=False)
+         logger.debug("Sent cleanup message for lookup_id=%s", lookup_id)
+-        if _kvio_trace_enabled():
++        if io_trace_enabled():
+             logger.warning(
+-                "[KVIO_LOOKUP_CLEANUP_SEND] lookup_id=%s workers=%d age=%.6f",
++                "[SC_IO_LOOKUP_CLEANUP_SEND] lookup_id=%s workers=%d age=%.6f",
+                 lookup_id,
+                 self.world_size,
+                 time.monotonic()
+-                - self._kvio_lookup_start_mono.get(
++                - self._sc_lookup_start_mono.get(
+                     lookup_id, time.monotonic()
+                 ),
+             )
+diff --git a/third_party/LMCache/lmcache/v1/memory_management.py b/third_party/LMCache/lmcache/v1/memory_management.py
+index 41f5bfe..bb9d7e3 100644
+--- a/third_party/LMCache/lmcache/v1/memory_management.py
++++ b/third_party/LMCache/lmcache/v1/memory_management.py
+@@ -22,21 +22,26 @@ from lmcache.logging import init_logger
+ from lmcache.observability import LMCStatsMonitor
+ from lmcache.utils import _lmcache_nvtx_annotate
+ from lmcache.v1.pin_monitor import PinMonitor
++from lmcache.v1.sc_config import (
++    env_float,
++    memory_snapshot_enabled,
++    memory_trace_enabled,
++)
+ from lmcache.v1.system_detection import NUMAMapping
+ import lmcache.c_ops as lmc_ops
+ 
+ logger = init_logger(__name__)
+ 
+-# ===== SRIRAM DEBUG START =====
+-import os as _sr_os
+-import time as _sr_time
+-import traceback as _sr_traceback
+-import subprocess as _sr_subprocess
+-import shutil as _sr_shutil
+-import resource as _sr_resource
++# ===== SC MEMORY SNAPSHOT START =====
++import os as _sc_os
++import time as _sc_time
++import traceback as _sc_traceback
++import subprocess as _sc_subprocess
++import shutil as _sc_shutil
++import resource as _sc_resource
+ 
+ 
+-def _sr_read_file(path):
++def _sc_read_file(path):
+     try:
+         with open(path, "r") as f:
+             return f.read().strip()
+@@ -44,7 +49,7 @@ def _sr_read_file(path):
+         return "NA"
+ 
+ 
+-def _sr_proc_mem():
++def _sc_proc_mem():
+     status = {}
+     try:
+         with open("/proc/self/status", "r") as f:
+@@ -57,25 +62,25 @@ def _sr_proc_mem():
+     return status
+ 
+ 
+-def _sr_cgroup_mem():
++def _sc_cgroup_mem():
+     candidates = [
+         "/sys/fs/cgroup/memory.current",
+         "/sys/fs/cgroup/memory.max",
+         "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+         "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+     ]
+-    return {p: _sr_read_file(p) for p in candidates if _sr_os.path.exists(p)}
++    return {p: _sc_read_file(p) for p in candidates if _sc_os.path.exists(p)}
+ 
+ 
+-def _sr_disk(path):
++def _sc_disk(path):
+     try:
+-        u = _sr_shutil.disk_usage(path)
++        u = _sc_shutil.disk_usage(path)
+         return f"{path}: used={u.used/1024**3:.1f}G free={u.free/1024**3:.1f}G total={u.total/1024**3:.1f}G"
+     except Exception as e:
+         return f"{path}: disk_error={e!r}"
+ 
+ 
+-def _sr_gpu_mem():
++def _sc_gpu_mem():
+     parts = []
+     try:
+         import torch
+@@ -93,13 +98,13 @@ def _sr_gpu_mem():
+         parts.append(f"torch_cuda_error={e!r}")
+ 
+     try:
+-        out = _sr_subprocess.check_output(
++        out = _sc_subprocess.check_output(
+             [
+                 "nvidia-smi",
+                 "--query-gpu=index,memory.used,memory.free,memory.total,utilization.gpu",
+                 "--format=csv,noheader,nounits",
+             ],
+-            stderr=_sr_subprocess.STDOUT,
++            stderr=_sc_subprocess.STDOUT,
+             timeout=3,
+             text=True,
+         )
+@@ -110,7 +115,7 @@ def _sr_gpu_mem():
+     return " ".join(parts)
+ 
+ 
+-def _sr_obj_summary(obj):
++def _sc_obj_summary(obj):
+     vals = []
+     for name in (
+         "ref_count",
+@@ -131,29 +136,31 @@ def _sr_obj_summary(obj):
+     return " ".join(vals)
+ 
+ 
+-def _sr_mem_snapshot(tag, obj=None, extra="", stack=False):
++def _sc_memory_snapshot(tag, obj=None, extra="", stack=False):
++    if not memory_snapshot_enabled():
++        return
+     try:
+-        pid = _sr_os.getpid()
+-        host = _sr_proc_mem()
+-        cg = _sr_cgroup_mem()
+-        ru = _sr_resource.getrusage(_sr_resource.RUSAGE_SELF).ru_maxrss
++        pid = _sc_os.getpid()
++        host = _sc_proc_mem()
++        cg = _sc_cgroup_mem()
++        ru = _sc_resource.getrusage(_sc_resource.RUSAGE_SELF).ru_maxrss
+         msg = (
+-            f"[SRIRAM_MEMDBG] {tag} "
+-            f"t={_sr_time.time():.3f} pid={pid} "
++            f"[SC_MEMORY_SNAPSHOT] {tag} "
++            f"t={_sc_time.time():.3f} pid={pid} "
+             f"host={host} ru_maxrss_kb={ru} cgroup={cg} "
+-            f"tmp={_sr_disk('/tmp')} shm={_sr_disk('/dev/shm')} "
+-            f"lmcache_disk={_sr_disk(_sr_os.environ.get('SRIRAM_LMCACHE_DIR', '/tmp'))} "
+-            f"gpu={_sr_gpu_mem()} "
++            f"tmp={_sc_disk('/tmp')} shm={_sc_disk('/dev/shm')} "
++            f"lmcache_disk={_sc_disk((_sc_os.environ.get('SC_LMCACHE_DATA_DIR') or '/tmp'))} "
++            f"gpu={_sc_gpu_mem()} "
+             f"obj_id={id(obj) if obj is not None else None} "
+-            f"obj={_sr_obj_summary(obj) if obj is not None else ''} "
++            f"obj={_sc_obj_summary(obj) if obj is not None else ''} "
+             # f"extra={extra}"
+         )
+         print(msg, flush=True)
+         if stack:
+-            print("[SRIRAM_MEMDBG_STACK]\n" + "".join(_sr_traceback.format_stack(limit=12)), flush=True)
++            print("[SC_MEMORY_SNAPSHOT_STACK]\n" + "".join(_sc_traceback.format_stack(limit=12)), flush=True)
+     except Exception as e:
+-        print(f"[SRIRAM_MEMDBG_ERROR] tag={tag} err={e!r}", flush=True)
+-# ===== SRIRAM DEBUG END =====
++        print(f"[SC_MEMORY_SNAPSHOT_ERROR] tag={tag} err={e!r}", flush=True)
++# ===== SC MEMORY SNAPSHOT END =====
+ 
+ 
+ # Helper functions for thread safety
+@@ -710,9 +717,9 @@ class TensorMemoryObj(MemoryObj):
+         self.lock = threading.Lock()
+         self.parent_allocator = parent_allocator
+ 
+-        # SRIRAM DEBUG: lifetime of the outermost pin and ref_count > 1 state.
+-        self._sr_pin_started: Optional[float] = None
+-        self._sr_ref_gt1_started: Optional[float] = None
++        # SC memory tracing: lifetime of the outermost pin and ref_count > 1 state.
++        self._sc_pin_started: Optional[float] = None
++        self._sc_ref_gt1_started: Optional[float] = None
+         # Calculate the prefix sum of the group sizes
+         # If there are two groups, the prefix sum will be
+         # [0, size_of_group_1, size_of_group_1 + size_of_group_2]
+@@ -780,9 +787,9 @@ class TensorMemoryObj(MemoryObj):
+         with self.lock:
+             if (
+                 self.meta.ref_count == 1
+-                and self._sr_ref_gt1_started is None
++                and self._sc_ref_gt1_started is None
+             ):
+-                self._sr_ref_gt1_started = _sr_time.monotonic()
++                self._sc_ref_gt1_started = _sc_time.monotonic()
+             self.meta.ref_count += 1
+ 
+     def ref_count_down(self):
+@@ -790,29 +797,26 @@ class TensorMemoryObj(MemoryObj):
+             self.meta.ref_count -= 1
+ 
+             if self.meta.ref_count == 1:
+-                started = self._sr_ref_gt1_started
+-                self._sr_ref_gt1_started = None
++                started = self._sc_ref_gt1_started
++                self._sc_ref_gt1_started = None
+                 if started is not None:
+-                    age = _sr_time.monotonic() - started
+-                    threshold = float(
+-                        _sr_os.environ.get("SRIRAM_LONG_REF_SECONDS", "10")
++                    age = _sc_time.monotonic() - started
++                    threshold = env_float(
++                        "SC_LMCACHE_LONG_REF_THRESHOLD_S", 10.0, minimum=0.0
+                     )
+-                    if (
+-                        _sr_os.environ.get("SRIRAM_KV_MEM_DEBUG", "0") == "1"
+-                        and age >= threshold
+-                    ):
++                    if memory_trace_enabled() and age >= threshold:
+                         logger.warning(
+-                            "[KVDBG_LONG_REF] "
++                            "[SC_MEMORY_LONG_REF] "
+                             "pid=%d address=%s size=%.3fMiB "
+                             "age=%.3fs pin_count=%d",
+-                            _sr_os.getpid(),
++                            _sc_os.getpid(),
+                             self.meta.address,
+                             self.meta.phy_size / 1024**2,
+                             age,
+                             self.meta.pin_count,
+                         )
+             elif self.meta.ref_count < 1:
+-                self._sr_ref_gt1_started = None
++                self._sc_ref_gt1_started = None
+ 
+             if self.meta.ref_count < 0:
+                 logger.warning(
+@@ -843,7 +847,7 @@ class TensorMemoryObj(MemoryObj):
+             # if pin_count is 0, indicates that the object is pinned for the first time
+             if self.meta.pin_count == 0:
+                 TensorMemoryObj.monitor.update_pinned_memory_objs_count(1)
+-                self._sr_pin_started = _sr_time.monotonic()
++                self._sc_pin_started = _sc_time.monotonic()
+ 
+             self.meta.pin_count += 1
+ 
+@@ -860,22 +864,19 @@ class TensorMemoryObj(MemoryObj):
+             if self.meta.pin_count == 0:
+                 TensorMemoryObj.monitor.update_pinned_memory_objs_count(-1)
+ 
+-                started = self._sr_pin_started
+-                self._sr_pin_started = None
++                started = self._sc_pin_started
++                self._sc_pin_started = None
+                 if started is not None:
+-                    age = _sr_time.monotonic() - started
+-                    threshold = float(
+-                        _sr_os.environ.get("SRIRAM_LONG_PIN_SECONDS", "10")
++                    age = _sc_time.monotonic() - started
++                    threshold = env_float(
++                        "SC_LMCACHE_LONG_PIN_THRESHOLD_S", 10.0, minimum=0.0
+                     )
+-                    if (
+-                        _sr_os.environ.get("SRIRAM_KV_MEM_DEBUG", "0") == "1"
+-                        and age >= threshold
+-                    ):
++                    if memory_trace_enabled() and age >= threshold:
+                         logger.warning(
+-                            "[KVDBG_LONG_PIN] "
++                            "[SC_MEMORY_LONG_PIN] "
+                             "pid=%d address=%s size=%.3fMiB "
+                             "age=%.3fs ref_count=%d",
+-                            _sr_os.getpid(),
++                            _sc_os.getpid(),
+                             self.meta.address,
+                             self.meta.phy_size / 1024**2,
+                             age,
+diff --git a/third_party/LMCache/lmcache/v1/sc_config.py b/third_party/LMCache/lmcache/v1/sc_config.py
+new file mode 100644
+index 0000000..11e5d8b
+--- /dev/null
++++ b/third_party/LMCache/lmcache/v1/sc_config.py
+@@ -0,0 +1,87 @@
++# SPDX-License-Identifier: Apache-2.0
++"""SC experiment controls for the vendored LMCache build.
++
++All controls are read from environment variables so Slurm jobs can compose
++independent gate and observability settings without editing Python source.
++Unset controls preserve vanilla LMCache behavior: custom gates and custom
++tracing are disabled.
++"""
++
++from __future__ import annotations
++
++import os
++from typing import Final
++
++
++TRUE_VALUES: Final = frozenset({"1", "true", "yes", "on"})
++FALSE_VALUES: Final = frozenset({"0", "false", "no", "off", ""})
++
++
++def env_flag(name: str, default: bool = False) -> bool:
++    raw = os.environ.get(name)
++    if raw is None:
++        return default
++    normalized = raw.strip().lower()
++    if normalized in TRUE_VALUES:
++        return True
++    if normalized in FALSE_VALUES:
++        return False
++    raise ValueError(
++        f"{name} must be one of 0/1, false/true, no/yes, off/on; got {raw!r}"
++    )
++
++
++def env_int(name: str, default: int, *, minimum: int | None = None) -> int:
++    raw = os.environ.get(name)
++    value = default if raw is None or raw.strip() == "" else int(raw)
++    if minimum is not None and value < minimum:
++        raise ValueError(f"{name} must be >= {minimum}, got {value}")
++    return value
++
++
++def env_float(name: str, default: float, *, minimum: float | None = None) -> float:
++    raw = os.environ.get(name)
++    value = default if raw is None or raw.strip() == "" else float(raw)
++    if minimum is not None and value < minimum:
++        raise ValueError(f"{name} must be >= {minimum}, got {value}")
++    return value
++
++
++def scheduler_lookup_admission_enabled() -> bool:
++    return env_flag("SC_LMCACHE_SCHEDULER_LOOKUP_ADMISSION_ENABLE")
++
++
++def worker_lookup_admission_enabled() -> bool:
++    return env_flag("SC_LMCACHE_WORKER_LOOKUP_ADMISSION_ENABLE")
++
++
++def disk_put_admission_enabled() -> bool:
++    return env_flag("SC_LMCACHE_DISK_PUT_ADMISSION_ENABLE")
++
++
++def io_trace_enabled() -> bool:
++    return env_flag("SC_LMCACHE_IO_TRACE_ENABLE")
++
++
++def load_trace_enabled() -> bool:
++    return env_flag("SC_LMCACHE_LOAD_TRACE_ENABLE")
++
++
++def memory_trace_enabled() -> bool:
++    return env_flag("SC_LMCACHE_MEMORY_TRACE_ENABLE")
++
++
++def memory_snapshot_enabled() -> bool:
++    return env_flag("SC_LMCACHE_MEMORY_SNAPSHOT_ENABLE")
++
++
++def lookup_trace_enabled() -> bool:
++    return env_flag("SC_LMCACHE_LOOKUP_TRACE_ENABLE")
++
++
++def request_trace_enabled() -> bool:
++    return env_flag("SC_LMCACHE_REQUEST_TRACE_ENABLE")
++
++
++def gpu_assert_snapshot_enabled() -> bool:
++    return env_flag("SC_LMCACHE_GPU_ASSERT_SNAPSHOT_ENABLE")
+diff --git a/third_party/LMCache/lmcache/v1/storage_backend/local_cpu_backend.py b/third_party/LMCache/lmcache/v1/storage_backend/local_cpu_backend.py
+index 1f8ee62..dc54230 100644
+--- a/third_party/LMCache/lmcache/v1/storage_backend/local_cpu_backend.py
++++ b/third_party/LMCache/lmcache/v1/storage_backend/local_cpu_backend.py
+@@ -27,6 +27,7 @@ from lmcache.v1.memory_management import (
+     PagedCpuGpuMemoryAllocator,
+ )
+ from lmcache.v1.metadata import LMCacheMetadata
++from lmcache.v1.sc_config import env_float, memory_trace_enabled
+ from lmcache.v1.storage_backend.abstract_backend import AllocatorBackendInterface
+ from lmcache.v1.storage_backend.batched_message_sender import BatchedMessageSender
+ from lmcache.v1.storage_backend.cache_policy import get_cache_policy
+@@ -59,10 +60,10 @@ class LocalCPUBackend(AllocatorBackendInterface):
+         else:
+             super().__init__("cpu")
+ 
+-        self._sr_last_pressure_log = 0.0
+-        self._sr_pressure_events = 0
+-        self._sr_evicted_keys_since_log = 0
+-        self._sr_evicted_bytes_since_log = 0
++        self._sc_last_pressure_log = 0.0
++        self._sc_pressure_events = 0
++        self._sc_evicted_keys_since_log = 0
++        self._sc_evicted_bytes_since_log = 0
+ 
+         self.cache_policy = get_cache_policy(config.cache_policy)
+         self.hot_cache = self.cache_policy.init_mutable_mapping()
+@@ -111,27 +112,27 @@ class LocalCPUBackend(AllocatorBackendInterface):
+ 
+         self._setup_metrics()
+ 
+-    def _sr_pressure_snapshot(
++    def _sc_pressure_snapshot(
+         self,
+         reason: str,
+         requested_bytes: int = 0,
+         force: bool = False,
+     ) -> None:
+         """Rate-limited LMCache pinned-pool diagnostic."""
+-        if os.environ.get("SRIRAM_KV_MEM_DEBUG", "0") != "1":
++        if not memory_trace_enabled():
+             return
+ 
+-        self._sr_pressure_events += 1
++        self._sc_pressure_events += 1
+ 
+         now = time.monotonic()
+-        interval = float(
+-            os.environ.get("SRIRAM_KV_MEM_DEBUG_INTERVAL_S", "5")
++        interval = env_float(
++            "SC_LMCACHE_MEMORY_TRACE_INTERVAL_S", 5.0, minimum=0.0
+         )
+ 
+-        if not force and now - self._sr_last_pressure_log < interval:
++        if not force and now - self._sc_last_pressure_log < interval:
+             return
+ 
+-        self._sr_last_pressure_log = now
++        self._sc_last_pressure_log = now
+ 
+         # Persistent objects currently admitted to the CPU hot cache.
+         with self.cpu_lock:
+@@ -178,7 +179,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
+                     evictable_bytes += size
+             except Exception:
+                 logger.exception(
+-                    "[KVDBG_CPU_POOL] Could not inspect MemoryObj"
++                    "[SC_MEMORY_CPU_POOL] Could not inspect MemoryObj"
+                 )
+ 
+         # The actual pinned-memory allocator is normally wrapped by
+@@ -216,7 +217,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
+                 )
+             except Exception:
+                 logger.exception(
+-                    "[KVDBG_CPU_POOL] Address-manager inspection failed"
++                    "[SC_MEMORY_CPU_POOL] Address-manager inspection failed"
+                 )
+         elif hasattr(allocator, "free_blocks"):
+             # Paged allocator.
+@@ -239,7 +240,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
+             return 100.0 * value / heap_bytes if heap_bytes else 0.0
+ 
+         logger.warning(
+-            "[KVDBG_CPU_POOL] "
++            "[SC_MEMORY_CPU_POOL] "
+             "pid=%d rank=%s reason=%s pressure_events=%d "
+             "requested=%.3fGiB "
+             "pool=%.3fGiB used=%.3fGiB free=%.3fGiB "
+@@ -254,7 +255,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
+             os.getpid(),
+             getattr(self.metadata, "worker_id", "NA"),
+             reason,
+-            self._sr_pressure_events,
++            self._sc_pressure_events,
+             gib(requested_bytes),
+             gib(heap_bytes),
+             gib(used_bytes),
+@@ -276,12 +277,12 @@ class LocalCPUBackend(AllocatorBackendInterface):
+             percentage(non_hot_bytes),
+             dict(pin_hist),
+             dict(ref_hist),
+-            self._sr_evicted_keys_since_log,
+-            gib(self._sr_evicted_bytes_since_log),
++            self._sc_evicted_keys_since_log,
++            gib(self._sc_evicted_bytes_since_log),
+         )
+ 
+-        self._sr_evicted_keys_since_log = 0
+-        self._sr_evicted_bytes_since_log = 0
++        self._sc_evicted_keys_since_log = 0
++        self._sc_evicted_bytes_since_log = 0
+     def _setup_metrics(self) -> None:
+         if self.metadata is None:
+             return
+@@ -797,7 +798,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
+             dtypes if isinstance(dtypes, list) else [dtypes],
+         )
+         if memory_obj is None:
+-            self._sr_pressure_snapshot(
++            self._sc_pressure_snapshot(
+                 reason="initial_allocate_failed",
+                 requested_bytes=requested_bytes,
+             )
+@@ -827,7 +828,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
+                             len(evict_keys),
+                         )
+ 
+-                        # SRIRAM DEBUG: cpu_lock is already held here.
++                        # SC DEBUG: cpu_lock is already held here.
+                         victim_objs = [
+                             self.hot_cache[key]
+                             for key in evict_keys
+@@ -840,21 +841,21 @@ class LocalCPUBackend(AllocatorBackendInterface):
+                             memory_obj.get_physical_size()
+                             for memory_obj in victim_objs
+                         )
+-                        self._sr_evicted_keys_since_log += len(victim_objs)
+-                        self._sr_evicted_bytes_since_log += victim_bytes
++                        self._sc_evicted_keys_since_log += len(victim_objs)
++                        self._sc_evicted_bytes_since_log += victim_bytes
+ 
+                         # Existing removal. force=False because cpu_lock is held.
+                         self.batched_remove(evict_keys, force=False)
+                         evict_keys_count += len(evict_keys)
+                     else:
+-                        # _sr_pressure_snapshot() takes cpu_lock itself, so defer it.
++                        # _sc_pressure_snapshot() takes cpu_lock itself, so defer it.
+                         no_evict_candidates = True
+                         self.stats_monitor.update_local_cpu_evict_failed_count(
+                             num_candidates
+                         )
+ 
+                 if no_evict_candidates:
+-                    self._sr_pressure_snapshot(
++                    self._sc_pressure_snapshot(
+                         reason="no_evict_candidates",
+                         requested_bytes=requested_bytes,
+                     )
+@@ -879,7 +880,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
+ 
+             memory_obj = self.memory_allocator.allocate(shapes, dtypes, fmt)
+             if memory_obj is None:
+-                self._sr_pressure_snapshot(
++                self._sc_pressure_snapshot(
+                     reason="allocate_retry_failed",
+                     requested_bytes=requested_bytes,
+                 )
+@@ -893,7 +894,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
+             )
+ 
+         if memory_obj is None:
+-            self._sr_pressure_snapshot(
++            self._sc_pressure_snapshot(
+                 reason="allocate_returning_none",
+                 requested_bytes=requested_bytes,
+                 force=True,
+@@ -953,7 +954,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
+             * batch_size
+         )
+         if memory_objs is None:
+-            self._sr_pressure_snapshot(
++            self._sc_pressure_snapshot(
+                 reason="initial_allocate_failed",
+                 requested_bytes=requested_bytes,
+             )
+@@ -993,14 +994,14 @@ class LocalCPUBackend(AllocatorBackendInterface):
+                                 self.hot_cache[key] for key in evict_key_all_layer
+                             ]
+ 
+-                            # SRIRAM DEBUG: count the actual per-layer objects and bytes
++                            # SC DEBUG: count the actual per-layer objects and bytes
+                             # about to be freed by the batched eviction path.
+                             victim_bytes = sum(
+                                 memory_obj.get_physical_size()
+                                 for memory_obj in old_mem_objs
+                             )
+-                            self._sr_evicted_keys_since_log += len(old_mem_objs)
+-                            self._sr_evicted_bytes_since_log += victim_bytes
++                            self._sc_evicted_keys_since_log += len(old_mem_objs)
++                            self._sc_evicted_bytes_since_log += victim_bytes
+ 
+                             # Existing eviction behavior.
+                             for key in evict_key_all_layer:
+@@ -1016,14 +1017,14 @@ class LocalCPUBackend(AllocatorBackendInterface):
+                                 victim_bytes / 1024**2,
+                             )
+                     else:
+-                        # _sr_pressure_snapshot() takes cpu_lock itself, so defer it.
++                        # _sc_pressure_snapshot() takes cpu_lock itself, so defer it.
+                         no_evict_candidates = True
+                         self.stats_monitor.update_local_cpu_evict_failed_count(
+                             num_candidates
+                         )
+ 
+                 if no_evict_candidates:
+-                    self._sr_pressure_snapshot(
++                    self._sc_pressure_snapshot(
+                         reason="no_evict_candidates_batched",
+                         requested_bytes=requested_bytes,
+                     )
+@@ -1050,7 +1051,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
+                 shapes, dtypes, batch_size, fmt
+             )
+             if memory_objs is None:
+-                self._sr_pressure_snapshot(
++                self._sc_pressure_snapshot(
+                     reason="batched_allocate_retry_failed",
+                     requested_bytes=requested_bytes,
+                 )
+@@ -1063,7 +1064,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
+                 " attempts of local cpu backend batched_allocate()"
+             )
+         if memory_objs is None:
+-            self._sr_pressure_snapshot(
++            self._sc_pressure_snapshot(
+                 reason="batched_allocate_returning_none",
+                 requested_bytes=requested_bytes,
+                 force=True,
+diff --git a/third_party/LMCache/lmcache/v1/storage_backend/local_disk_backend.py b/third_party/LMCache/lmcache/v1/storage_backend/local_disk_backend.py
+index e6bebdf..b176ade 100644
+--- a/third_party/LMCache/lmcache/v1/storage_backend/local_disk_backend.py
++++ b/third_party/LMCache/lmcache/v1/storage_backend/local_disk_backend.py
+@@ -19,6 +19,12 @@ from lmcache.v1.cache_controller.message import OpType
+ from lmcache.v1.config import LMCacheEngineConfig
+ from lmcache.v1.memory_management import MemoryFormat, MemoryObj
+ from lmcache.v1.metadata import LMCacheMetadata
++from lmcache.v1.sc_config import (
++    disk_put_admission_enabled,
++    env_int,
++    io_trace_enabled,
++    load_trace_enabled,
++)
+ from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
+ from lmcache.v1.storage_backend.batched_message_sender import BatchedMessageSender
+ from lmcache.v1.storage_backend.cache_policy import get_cache_policy
+@@ -35,13 +41,9 @@ if TYPE_CHECKING:
+ logger = init_logger(__name__)
+ 
+ 
+-def _kvio_trace_enabled() -> bool:
+-    return os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1"
+-
+-
+-def _kvio_proc_io_snapshot() -> dict[str, int]:
++def _sc_io_proc_snapshot() -> dict[str, int]:
+     values: dict[str, int] = {}
+-    if not _kvio_trace_enabled():
++    if not io_trace_enabled():
+         return values
+     try:
+         with open("/proc/self/io", "r", encoding="utf-8") as f:
+@@ -49,11 +51,11 @@ def _kvio_proc_io_snapshot() -> dict[str, int]:
+                 key, value = line.split(":", 1)
+                 values[key.strip()] = int(value.strip())
+     except Exception as exc:
+-        logger.warning("[KVIO_PROC_IO_ERROR] pid=%d error=%r", os.getpid(), exc)
++        logger.warning("[SC_IO_PROC_IO_ERROR] pid=%d error=%r", os.getpid(), exc)
+     return values
+ 
+ 
+-def _kvio_io_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, int]:
++def _sc_io_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, int]:
+     return {
+         key: after.get(key, 0) - before.get(key, 0)
+         for key in set(before) | set(after)
+@@ -74,63 +76,62 @@ class LocalDiskWorker:
+         self.loop = loop
+         self._closed = False
+         # Observability-only counters. They do not gate or reorder work.
+-        self._kvio_state_lock = threading.Lock()
+-        self._kvio_active = {"prefetch": 0, "put": 0, "delete": 0}
+-
+-        # P0-B: bound disk puts before LocalDiskBackend takes an extra
+-        # MemoryObj ref and before work enters the executor's unbounded queue.
+-        # A value of 0 disables P0-B.
+-        self._p0_put_limit = int(
+-            os.environ.get(
+-                "LMCACHE_P0_DISK_PUT_MAX_PENDING",
+-                "8",
+-            )
++        self._sc_io_state_lock = threading.Lock()
++        self._sc_io_active = {"prefetch": 0, "put": 0, "delete": 0}
++
++        # Optional disk-put admission before LocalDiskBackend takes an extra
++        # MemoryObj reference or submits work to the executor queue.
++        self._sc_disk_put_admission_enabled = disk_put_admission_enabled()
++        self._sc_disk_put_limit = env_int(
++            "SC_LMCACHE_DISK_PUT_MAX_PENDING", 8, minimum=0
+         )
+-        if self._p0_put_limit < 0:
++        if self._sc_disk_put_admission_enabled and self._sc_disk_put_limit < 1:
+             raise ValueError(
+-                "LMCACHE_P0_DISK_PUT_MAX_PENDING must be >= 0, "
+-                f"got {self._p0_put_limit}"
++                "SC_LMCACHE_DISK_PUT_MAX_PENDING must be >= 1 "
++                "when disk-put admission is enabled"
+             )
+-        self._p0_put_admission = (
+-            threading.BoundedSemaphore(self._p0_put_limit)
+-            if self._p0_put_limit > 0
++        self._sc_disk_put_admission = (
++            threading.BoundedSemaphore(self._sc_disk_put_limit)
++            if self._sc_disk_put_admission_enabled
+             else None
+         )
+-        self._p0_put_state_lock = threading.Lock()
+-        self._p0_put_inflight = 0
+-        self._p0_put_waiters = 0
+-        self._p0_put_peak = 0
+-
+-        logger.info(
+-            "P0 disk put admission: limit=%d (0 disables P0-B)",
+-            self._p0_put_limit,
+-        )
++        self._sc_disk_put_state_lock = threading.Lock()
++        self._sc_disk_put_inflight = 0
++        self._sc_disk_put_waiters = 0
++        self._sc_disk_put_peak = 0
++
++        if self._sc_disk_put_admission_enabled or io_trace_enabled():
++            logger.info(
++                "SC disk-put admission: enabled=%s limit=%d",
++                self._sc_disk_put_admission_enabled,
++                self._sc_disk_put_limit,
++            )
+ 
+-    def acquire_put_admission(self, key: CacheEngineKey) -> bool:
++    def acquire_disk_put_admission(self, key: CacheEngineKey) -> bool:
+         """Block before ref_count_up until one bounded put slot is free.
+ 
+         A disabled gate returns True immediately so callers continue through
+         the original LMCache write path without admission throttling.
+         """
+-        semaphore = self._p0_put_admission
++        semaphore = self._sc_disk_put_admission
+         if semaphore is None:
+             return True
+ 
+         queued_at = time.monotonic()
+-        trace_enabled = _kvio_trace_enabled()
+-        with self._p0_put_state_lock:
+-            self._p0_put_waiters += 1
+-            waiters = self._p0_put_waiters
+-            inflight = self._p0_put_inflight
++        trace_enabled = io_trace_enabled()
++        with self._sc_disk_put_state_lock:
++            self._sc_disk_put_waiters += 1
++            waiters = self._sc_disk_put_waiters
++            inflight = self._sc_disk_put_inflight
+ 
+         if trace_enabled:
+             logger.warning(
+-                "[P0_PUT_ADMISSION_WAIT] pid=%d key_hash=%s "
++                "[SC_DISK_PUT_ADMISSION_WAIT] pid=%d key_hash=%s "
+                 "limit=%d inflight=%d waiters=%d queue_depth=%d "
+                 "thread=%s",
+                 os.getpid(),
+                 key.chunk_hash,
+-                self._p0_put_limit,
++                self._sc_disk_put_limit,
+                 inflight,
+                 waiters,
+                 self.executor._queue.qsize(),
+@@ -148,58 +149,60 @@ class LocalDiskWorker:
+         if on_event_loop:
+             acquired = semaphore.acquire(blocking=False)
+             if not acquired:
+-                with self._p0_put_state_lock:
+-                    self._p0_put_waiters -= 1
+-                    waiters = self._p0_put_waiters
+-                    inflight = self._p0_put_inflight
+-                logger.error(
+-                    "[P0_PUT_ADMISSION_REJECT_LOOP_THREAD] "
+-                    "pid=%d key_hash=%s waited=%.6f limit=%d "
+-                    "inflight=%d waiters=%d queue_depth=%d",
+-                    os.getpid(),
+-                    key.chunk_hash,
+-                    time.monotonic() - queued_at,
+-                    self._p0_put_limit,
+-                    inflight,
+-                    waiters,
+-                    self.executor._queue.qsize(),
+-                )
++                with self._sc_disk_put_state_lock:
++                    self._sc_disk_put_waiters -= 1
++                    waiters = self._sc_disk_put_waiters
++                    inflight = self._sc_disk_put_inflight
++                if trace_enabled:
++                    logger.error(
++                        "[SC_DISK_PUT_ADMISSION_REJECT_LOOP_THREAD] "
++                        "pid=%d key_hash=%s waited=%.6f limit=%d "
++                        "inflight=%d waiters=%d queue_depth=%d",
++                        os.getpid(),
++                        key.chunk_hash,
++                        time.monotonic() - queued_at,
++                        self._sc_disk_put_limit,
++                        inflight,
++                        waiters,
++                        self.executor._queue.qsize(),
++                    )
+                 return False
+         else:
+             while not semaphore.acquire(timeout=5.0):
+-                logger.warning(
+-                    "[P0_PUT_ADMISSION_STALLED] pid=%d key_hash=%s "
+-                    "waited=%.6f limit=%d queue_depth=%d "
+-                    "put_tasks=%d thread=%s",
+-                    os.getpid(),
+-                    key.chunk_hash,
+-                    time.monotonic() - queued_at,
+-                    self._p0_put_limit,
+-                    self.executor._queue.qsize(),
+-                    len(self.put_tasks),
+-                    threading.current_thread().name,
+-                )
++                if trace_enabled:
++                    logger.warning(
++                        "[SC_DISK_PUT_ADMISSION_STALLED] pid=%d key_hash=%s "
++                        "waited=%.6f limit=%d queue_depth=%d "
++                        "put_tasks=%d thread=%s",
++                        os.getpid(),
++                        key.chunk_hash,
++                        time.monotonic() - queued_at,
++                        self._sc_disk_put_limit,
++                        self.executor._queue.qsize(),
++                        len(self.put_tasks),
++                        threading.current_thread().name,
++                    )
+ 
+-        with self._p0_put_state_lock:
+-            self._p0_put_waiters -= 1
+-            self._p0_put_inflight += 1
+-            self._p0_put_peak = max(
+-                self._p0_put_peak,
+-                self._p0_put_inflight,
++        with self._sc_disk_put_state_lock:
++            self._sc_disk_put_waiters -= 1
++            self._sc_disk_put_inflight += 1
++            self._sc_disk_put_peak = max(
++                self._sc_disk_put_peak,
++                self._sc_disk_put_inflight,
+             )
+-            waiters = self._p0_put_waiters
+-            inflight = self._p0_put_inflight
+-            peak = self._p0_put_peak
++            waiters = self._sc_disk_put_waiters
++            inflight = self._sc_disk_put_inflight
++            peak = self._sc_disk_put_peak
+ 
+         if trace_enabled:
+             logger.warning(
+-                "[P0_PUT_ADMISSION_ACQUIRE] pid=%d key_hash=%s "
++                "[SC_DISK_PUT_ADMISSION_ACQUIRE] pid=%d key_hash=%s "
+                 "waited=%.6f limit=%d inflight=%d waiters=%d "
+                 "peak=%d queue_depth=%d put_tasks=%d thread=%s",
+                 os.getpid(),
+                 key.chunk_hash,
+                 time.monotonic() - queued_at,
+-                self._p0_put_limit,
++                self._sc_disk_put_limit,
+                 inflight,
+                 waiters,
+                 peak,
+@@ -209,32 +212,32 @@ class LocalDiskWorker:
+             )
+         return True
+ 
+-    def release_put_admission(
++    def release_disk_put_admission(
+         self,
+         key: CacheEngineKey,
+         reason: str,
+         error: Optional[BaseException] = None,
+     ) -> None:
+         """Release a put slot after completion or failed submission."""
+-        semaphore = self._p0_put_admission
++        semaphore = self._sc_disk_put_admission
+         if semaphore is None:
+             return
+ 
+-        with self._p0_put_state_lock:
+-            self._p0_put_inflight -= 1
+-            if self._p0_put_inflight < 0:
+-                self._p0_put_inflight = 0
++        with self._sc_disk_put_state_lock:
++            self._sc_disk_put_inflight -= 1
++            if self._sc_disk_put_inflight < 0:
++                self._sc_disk_put_inflight = 0
+                 raise RuntimeError(
+-                    f"P0 put admission underflow for key={key}"
++                    f"SC disk-put admission underflow for key={key}"
+                 )
+-            inflight = self._p0_put_inflight
+-            waiters = self._p0_put_waiters
+-            peak = self._p0_put_peak
++            inflight = self._sc_disk_put_inflight
++            waiters = self._sc_disk_put_waiters
++            peak = self._sc_disk_put_peak
+ 
+         semaphore.release()
+-        if _kvio_trace_enabled() or error is not None:
++        if io_trace_enabled():
+             logger.warning(
+-                "[P0_PUT_ADMISSION_RELEASE] pid=%d key_hash=%s "
++                "[SC_DISK_PUT_ADMISSION_RELEASE] pid=%d key_hash=%s "
+                 "reason=%s error=%r limit=%d inflight=%d "
+                 "waiters=%d peak=%d queue_depth=%d put_tasks=%d "
+                 "thread=%s",
+@@ -242,7 +245,7 @@ class LocalDiskWorker:
+                 key.chunk_hash,
+                 reason,
+                 error,
+-                self._p0_put_limit,
++                self._sc_disk_put_limit,
+                 inflight,
+                 waiters,
+                 peak,
+@@ -268,18 +271,18 @@ class LocalDiskWorker:
+         else:
+             raise ValueError(f"Unknown task type: {task_type}")
+ 
+-        kvio_id = str(kwargs.pop("_kvio_id", "unknown"))
++        sc_io_id = str(kwargs.pop("_sc_io_id", "unknown"))
+         enqueued_at = time.monotonic()
+         queue_depth_before = self.executor._queue.qsize()
+-        if _kvio_trace_enabled():
+-            with self._kvio_state_lock:
+-                active_snapshot = dict(self._kvio_active)
++        if io_trace_enabled():
++            with self._sc_io_state_lock:
++                active_snapshot = dict(self._sc_io_active)
+             logger.warning(
+-                "[KVIO_DISKQ_ENQUEUE] pid=%d id=%s task_type=%s "
++                "[SC_IO_DISKQ_ENQUEUE] pid=%d id=%s task_type=%s "
+                 "task=%s priority=%d queue_depth_before=%d active=%s "
+                 "put_tasks=%d mono=%.6f",
+                 os.getpid(),
+-                kvio_id,
++                sc_io_id,
+                 task_type,
+                 getattr(task, "__name__", repr(task)),
+                 priority,
+@@ -291,16 +294,16 @@ class LocalDiskWorker:
+ 
+         def traced_task(*task_args, **task_kwargs):
+             started_at = time.monotonic()
+-            with self._kvio_state_lock:
+-                self._kvio_active[task_type] += 1
+-                active_snapshot = dict(self._kvio_active)
+-            if _kvio_trace_enabled():
++            with self._sc_io_state_lock:
++                self._sc_io_active[task_type] += 1
++                active_snapshot = dict(self._sc_io_active)
++            if io_trace_enabled():
+                 logger.warning(
+-                    "[KVIO_DISKQ_START] pid=%d id=%s task_type=%s "
++                    "[SC_IO_DISKQ_START] pid=%d id=%s task_type=%s "
+                     "task=%s queue_wait=%.6f queue_depth_now=%d "
+                     "active=%s put_tasks=%d thread=%s",
+                     os.getpid(),
+-                    kvio_id,
++                    sc_io_id,
+                     task_type,
+                     getattr(task, "__name__", repr(task)),
+                     started_at - enqueued_at,
+@@ -313,16 +316,16 @@ class LocalDiskWorker:
+                 return task(*task_args, **task_kwargs)
+             finally:
+                 finished_at = time.monotonic()
+-                with self._kvio_state_lock:
+-                    self._kvio_active[task_type] -= 1
+-                    active_after = dict(self._kvio_active)
+-                if _kvio_trace_enabled():
++                with self._sc_io_state_lock:
++                    self._sc_io_active[task_type] -= 1
++                    active_after = dict(self._sc_io_active)
++                if io_trace_enabled():
+                     logger.warning(
+-                        "[KVIO_DISKQ_DONE] pid=%d id=%s task_type=%s "
++                        "[SC_IO_DISKQ_DONE] pid=%d id=%s task_type=%s "
+                         "task=%s service=%.6f total=%.6f "
+                         "queue_depth_now=%d active=%s put_tasks=%d thread=%s",
+                         os.getpid(),
+-                        kvio_id,
++                        sc_io_id,
+                         task_type,
+                         getattr(task, "__name__", repr(task)),
+                         finished_at - started_at,
+@@ -344,9 +347,9 @@ class LocalDiskWorker:
+         with self.put_lock:
+             if key in self.put_tasks:
+                 self.put_tasks.remove(key)
+-                if _kvio_trace_enabled():
++                if io_trace_enabled():
+                     logger.warning(
+-                        "[KVIO_PUT_TASK_REMOVE] pid=%d key_hash=%s "
++                        "[SC_IO_PUT_TASK_REMOVE] pid=%d key_hash=%s "
+                         "remaining_put_tasks=%d",
+                         os.getpid(),
+                         key.chunk_hash,
+@@ -360,9 +363,9 @@ class LocalDiskWorker:
+             if key in self.put_tasks:
+                 return False
+             self.put_tasks.append(key)
+-            if _kvio_trace_enabled():
++            if io_trace_enabled():
+                 logger.warning(
+-                    "[KVIO_PUT_TASK_INSERT] pid=%d key_hash=%s put_tasks=%d",
++                    "[SC_IO_PUT_TASK_INSERT] pid=%d key_hash=%s put_tasks=%d",
+                     os.getpid(),
+                     key.chunk_hash,
+                     len(self.put_tasks),
+@@ -377,11 +380,11 @@ class LocalDiskWorker:
+         # Gracefully shut down the executor
+         if self._closed:
+             return
+-        if _kvio_trace_enabled():
+-            with self._kvio_state_lock:
+-                active_snapshot = dict(self._kvio_active)
++        if io_trace_enabled():
++            with self._sc_io_state_lock:
++                active_snapshot = dict(self._sc_io_active)
+             logger.warning(
+-                "[KVIO_DISKQ_CLOSE_ENTER] pid=%d queue_depth=%d "
++                "[SC_IO_DISKQ_CLOSE_ENTER] pid=%d queue_depth=%d "
+                 "active=%s put_tasks=%d",
+                 os.getpid(),
+                 self.executor._queue.qsize(),
+@@ -390,9 +393,9 @@ class LocalDiskWorker:
+             )
+         self._closed = True
+         self.executor.shutdown(wait=True)
+-        if _kvio_trace_enabled():
++        if io_trace_enabled():
+             logger.warning(
+-                "[KVIO_DISKQ_CLOSE_DONE] pid=%d queue_depth=%d put_tasks=%d",
++                "[SC_IO_DISKQ_CLOSE_DONE] pid=%d queue_depth=%d put_tasks=%d",
+                 os.getpid(),
+                 self.executor._queue.qsize(),
+                 len(self.put_tasks),
+@@ -613,7 +616,7 @@ class LocalDiskBackend(StorageBackendInterface):
+         """
+         Submit a single put task to store KV cache to disk asynchronously.
+ 
+-        P0-B acquires a bounded admission slot before incrementing the
++        Optional SC disk-put admission acquires a bounded slot before incrementing the
+         MemoryObj refcount or placing the write in the executor queue.
+ 
+         :param key: The cache key for this KV chunk.
+@@ -631,15 +634,15 @@ class LocalDiskBackend(StorageBackendInterface):
+             logger.debug(f"Put task for {key} is already in progress.")
+             return None
+ 
+-        if not self.disk_worker.acquire_put_admission(key):
+-            logger.warning(
+-                "Skipping disk put for %s because bounded admission rejected it.",
+-                key,
+-            )
++        if not self.disk_worker.acquire_disk_put_admission(key):
++            if io_trace_enabled():
++                logger.warning(
++                    "[SC_DISK_PUT_ADMISSION_REJECT] key=%s", key
++                )
+             return None
+ 
+         if not self.disk_worker.insert_put_task(key):
+-            self.disk_worker.release_put_admission(
++            self.disk_worker.release_disk_put_admission(
+                 key,
+                 reason="duplicate_after_wait",
+             )
+@@ -673,7 +676,7 @@ class LocalDiskBackend(StorageBackendInterface):
+ 
+         if not evict_success:
+             self.disk_worker.remove_put_task(key)
+-            self.disk_worker.release_put_admission(
++            self.disk_worker.release_disk_put_admission(
+                 key,
+                 reason="disk_capacity_rejected",
+             )
+@@ -690,14 +693,14 @@ class LocalDiskBackend(StorageBackendInterface):
+                     key=key,
+                     memory_obj=memory_obj,
+                     on_complete_callback=on_complete_callback,
+-                    _kvio_id=f"put:{key.chunk_hash}",
++                    _sc_io_id=f"put:{key.chunk_hash}",
+                 ),
+                 self.loop,
+             )
+         except BaseException as exc:
+             memory_obj.ref_count_down()
+             self.disk_worker.remove_put_task(key)
+-            self.disk_worker.release_put_admission(
++            self.disk_worker.release_disk_put_admission(
+                 key,
+                 reason="submit_failed",
+                 error=exc,
+@@ -716,7 +719,7 @@ class LocalDiskBackend(StorageBackendInterface):
+                     error = exc
+                 if error is not None:
+                     reason = "failed"
+-            self.disk_worker.release_put_admission(
++            self.disk_worker.release_disk_put_admission(
+                 key,
+                 reason=reason,
+                 error=error,
+@@ -803,11 +806,11 @@ class LocalDiskBackend(StorageBackendInterface):
+         mem_objs: list[MemoryObj] = []
+         paths: list[str] = []
+         started = time.monotonic()
+-        debug_enabled = os.environ.get("SRIRAM_KV_MEM_DEBUG", "0") == "1"
++        trace_enabled = load_trace_enabled()
+ 
+-        if debug_enabled:
++        if trace_enabled:
+             logger.warning(
+-                "[KVDBG_DISK_LOAD_START] "
++                "[SC_LOAD_DISK_LOAD_START] "
+                 "pid=%d lookup_id=%s requested_keys=%d thread=%s",
+                 os.getpid(),
+                 lookup_id,
+@@ -847,9 +850,9 @@ class LocalDiskBackend(StorageBackendInterface):
+                     busy_loop=False,
+                 )
+                 allocation_elapsed = time.monotonic() - allocation_started
+-                if _kvio_trace_enabled():
++                if io_trace_enabled():
+                     logger.warning(
+-                        "[KVIO_STAGE_ALLOC] pid=%d lookup_id=%s "
++                        "[SC_IO_STAGE_ALLOC] pid=%d lookup_id=%s "
+                         "key_index=%d/%d key_hash=%s shape=%s dtype=%s fmt=%s "
+                         "success=%s elapsed=%.6f",
+                         os.getpid(),
+@@ -865,22 +868,23 @@ class LocalDiskBackend(StorageBackendInterface):
+                     )
+ 
+                 if memory_obj is None:
+-                    logger.error(
+-                        "[KVDBG_DISK_STAGE_FAIL] "
+-                        "pid=%d lookup_id=%s key_index=%d/%d "
+-                        "allocated_so_far=%d elapsed=%.3fs thread=%s. "
+-                        "Memory allocation failed during async disk load "
+-                        "for key %s. CPU staging pool may be exhausted. "
+-                        "Returning partial results.",
+-                        os.getpid(),
+-                        lookup_id,
+-                        key_index,
+-                        len(keys),
+-                        len(mem_objs),
+-                        time.monotonic() - started,
+-                        threading.current_thread().name,
+-                        key,
+-                    )
++                    if trace_enabled:
++                        logger.error(
++                            "[SC_LOAD_DISK_STAGE_FAIL] "
++                            "pid=%d lookup_id=%s key_index=%d/%d "
++                            "allocated_so_far=%d elapsed=%.3fs thread=%s. "
++                            "Memory allocation failed during async disk load "
++                            "for key %s. CPU staging pool may be exhausted. "
++                            "Returning partial results.",
++                            os.getpid(),
++                            lookup_id,
++                            key_index,
++                            len(keys),
++                            len(mem_objs),
++                            time.monotonic() - started,
++                            threading.current_thread().name,
++                            key,
++                        )
+                     return mem_objs
+ 
+                 # Extra disk pin for the physical read. The lookup pin is
+@@ -895,9 +899,9 @@ class LocalDiskBackend(StorageBackendInterface):
+             mem_objs.append(memory_obj)
+             paths.append(path)
+ 
+-        if _kvio_trace_enabled():
++        if io_trace_enabled():
+             logger.warning(
+-                "[KVIO_STAGE_BATCH_DONE] pid=%d lookup_id=%s "
++                "[SC_IO_STAGE_BATCH_DONE] pid=%d lookup_id=%s "
+                 "requested_keys=%d staged=%d elapsed=%.6f",
+                 os.getpid(),
+                 lookup_id,
+@@ -914,25 +918,26 @@ class LocalDiskBackend(StorageBackendInterface):
+                 keys=keys,
+                 memory_objs=mem_objs,
+                 lookup_id=lookup_id,
+-                _kvio_id=lookup_id,
++                _sc_io_id=lookup_id,
+             )
+         except Exception:
+-            logger.exception(
+-                "[KVDBG_DISK_LOAD_FAILED] "
+-                "pid=%d lookup_id=%s requested_keys=%d "
+-                "allocated=%d elapsed=%.3fs thread=%s",
+-                os.getpid(),
+-                lookup_id,
+-                len(keys),
+-                len(mem_objs),
+-                time.monotonic() - started,
+-                threading.current_thread().name,
+-            )
++            if trace_enabled:
++                logger.exception(
++                    "[SC_LOAD_DISK_LOAD_FAILED] "
++                    "pid=%d lookup_id=%s requested_keys=%d "
++                    "allocated=%d elapsed=%.3fs thread=%s",
++                    os.getpid(),
++                    lookup_id,
++                    len(keys),
++                    len(mem_objs),
++                    time.monotonic() - started,
++                    threading.current_thread().name,
++                )
+             raise
+ 
+-        if debug_enabled or time.monotonic() - started >= 1.0:
++        if trace_enabled:
+             logger.warning(
+-                "[KVDBG_DISK_LOAD_DONE] "
++                "[SC_LOAD_DISK_LOAD_DONE] "
+                 "pid=%d lookup_id=%s requested_keys=%d returned=%d "
+                 "elapsed=%.3fs thread=%s",
+                 os.getpid(),
+@@ -1027,9 +1032,9 @@ class LocalDiskBackend(StorageBackendInterface):
+ 
+         logger.debug("Executing `async_load_bytes` from disk.")
+         batch_started = time.monotonic()
+-        if _kvio_trace_enabled():
++        if io_trace_enabled():
+             logger.warning(
+-                "[KVIO_READ_BATCH_START] pid=%d lookup_id=%s files=%d "
++                "[SC_IO_READ_BATCH_START] pid=%d lookup_id=%s files=%d "
+                 "bytes=%d thread=%s mono=%.6f",
+                 os.getpid(),
+                 lookup_id,
+@@ -1061,9 +1066,9 @@ class LocalDiskBackend(StorageBackendInterface):
+             self.dict[key].unpin()
+             self.disk_lock.release()
+ 
+-        if _kvio_trace_enabled():
++        if io_trace_enabled():
+             logger.warning(
+-                "[KVIO_READ_BATCH_DONE] pid=%d lookup_id=%s files=%d "
++                "[SC_IO_READ_BATCH_DONE] pid=%d lookup_id=%s files=%d "
+                 "elapsed=%.6f thread=%s",
+                 os.getpid(),
+                 lookup_id,
+@@ -1101,7 +1106,7 @@ class LocalDiskBackend(StorageBackendInterface):
+     def write_file(self, buffer, path, key: Optional[CacheEngineKey] = None):
+         total_started = time.monotonic()
+         size = len(buffer)
+-        io_before = _kvio_proc_io_snapshot()
++        io_before = _sc_io_proc_snapshot()
+         open_elapsed = 0.0
+         write_elapsed = 0.0
+         bytes_written = 0
+@@ -1125,14 +1130,14 @@ class LocalDiskBackend(StorageBackendInterface):
+                 os.close(fd)
+ 
+         total_elapsed = time.monotonic() - total_started
+-        io_after = _kvio_proc_io_snapshot()
++        io_after = _sc_io_proc_snapshot()
+         logger.debug(
+             f"Disk write size: {size} bytes, "
+             f"Bandwidth: {size / max(total_elapsed, 1e-9) / 1e6:.2f} MB/s"
+         )
+-        if _kvio_trace_enabled():
++        if io_trace_enabled():
+             logger.warning(
+-                "[KVIO_FILE_WRITE] pid=%d key_hash=%s bytes_expected=%d "
++                "[SC_IO_FILE_WRITE] pid=%d key_hash=%s bytes_expected=%d "
+                 "bytes_written=%d open=%.6f write=%.6f total=%.6f "
+                 "odirect=%s proc_io_delta=%s thread=%s path=%s",
+                 os.getpid(),
+@@ -1143,7 +1148,7 @@ class LocalDiskBackend(StorageBackendInterface):
+                 write_elapsed,
+                 total_elapsed,
+                 self.use_odirect,
+-                _kvio_io_delta(io_before, io_after),
++                _sc_io_delta(io_before, io_after),
+                 threading.current_thread().name,
+                 path,
+             )
+@@ -1166,7 +1171,7 @@ class LocalDiskBackend(StorageBackendInterface):
+                 "size is not aligned to disk block size."
+             )
+ 
+-        io_before = _kvio_proc_io_snapshot()
++        io_before = _sc_io_proc_snapshot()
+         open_elapsed = 0.0
+         read_elapsed = 0.0
+         bytes_read = 0
+@@ -1192,9 +1197,9 @@ class LocalDiskBackend(StorageBackendInterface):
+             logger.warning(f"File not found on disk: {path}")
+             if self.dict.get(key, None):
+                 self.dict.pop(key)
+-            if _kvio_trace_enabled():
++            if io_trace_enabled():
+                 logger.warning(
+-                    "[KVIO_FILE_READ_MISSING] pid=%d lookup_id=%s "
++                    "[SC_IO_FILE_READ_MISSING] pid=%d lookup_id=%s "
+                     "file_index=%d/%d key_hash=%s elapsed=%.6f path=%s",
+                     os.getpid(),
+                     lookup_id,
+@@ -1207,14 +1212,14 @@ class LocalDiskBackend(StorageBackendInterface):
+             return
+ 
+         total_elapsed = time.monotonic() - total_started
+-        io_after = _kvio_proc_io_snapshot()
++        io_after = _sc_io_proc_snapshot()
+         logger.debug(
+             f"Disk read size: {size} bytes, "
+             f"Bandwidth: {size / max(total_elapsed, 1e-9) / 1e6:.2f} MB/s"
+         )
+-        if _kvio_trace_enabled():
++        if io_trace_enabled():
+             logger.warning(
+-                "[KVIO_FILE_READ] pid=%d lookup_id=%s file_index=%d/%d "
++                "[SC_IO_FILE_READ] pid=%d lookup_id=%s file_index=%d/%d "
+                 "key_hash=%s bytes_expected=%d bytes_read=%d "
+                 "open=%.6f read=%.6f total=%.6f bandwidth_MBps=%.3f "
+                 "odirect=%s proc_io_delta=%s thread=%s path=%s",
+@@ -1230,7 +1235,7 @@ class LocalDiskBackend(StorageBackendInterface):
+                 total_elapsed,
+                 bytes_read / max(read_elapsed, 1e-9) / 1e6,
+                 effective_odirect,
+-                _kvio_io_delta(io_before, io_after),
++                _sc_io_delta(io_before, io_after),
+                 threading.current_thread().name,
+                 path,
+             )
+diff --git a/third_party/LMCache/lmcache/v1/storage_backend/storage_manager.py b/third_party/LMCache/lmcache/v1/storage_backend/storage_manager.py
+index 7e47ab8..a9e962a 100644
+--- a/third_party/LMCache/lmcache/v1/storage_backend/storage_manager.py
++++ b/third_party/LMCache/lmcache/v1/storage_backend/storage_manager.py
+@@ -38,6 +38,13 @@ from lmcache.v1.memory_management import (
+     MemoryObj,
+ )
+ from lmcache.v1.metadata import LMCacheMetadata
++from lmcache.v1.sc_config import (
++    env_int,
++    io_trace_enabled,
++    load_trace_enabled,
++    lookup_trace_enabled,
++    worker_lookup_admission_enabled,
++)
+ from lmcache.v1.storage_backend import CreateStorageBackends, is_cuda_worker
+ from lmcache.v1.storage_backend.abstract_backend import (
+     AllocatorBackendInterface,
+@@ -54,25 +61,27 @@ if TYPE_CHECKING:
+ 
+ logger = init_logger(__name__)
+ 
+-# ===== SRIRAM LOOKUP DEBUG START =====
+-import os as _sr_os
+-import time as _sr_time
+-import traceback as _sr_traceback
+-from collections import defaultdict as _sr_defaultdict
++# ===== SC LOOKUP TRACE START =====
++import os as _sc_os
++import time as _sc_time
++import traceback as _sc_traceback
++from collections import defaultdict as _sc_defaultdict
+ 
+-_SR_LOOKUP_SEEN = _sr_defaultdict(lambda: {"count": 0, "last": 0.0})
++_SC_LOOKUP_SEEN = _sc_defaultdict(lambda: {"count": 0, "last": 0.0})
+ 
+ 
+-def _sr_lookup_debug(lookup_id, retrieved_length=None, extra=""):
++def _sc_lookup_trace(lookup_id, retrieved_length=None, extra=""):
++    if not lookup_trace_enabled():
++        return
+     try:
+-        now = _sr_time.time()
+-        s = _SR_LOOKUP_SEEN[str(lookup_id)]
++        now = _sc_time.time()
++        s = _SC_LOOKUP_SEEN[str(lookup_id)]
+         s["count"] += 1
+         dt = now - s["last"] if s["last"] else 0.0
+         s["last"] = now
+ 
+         print(
+-            f"[SRIRAM_LOOKUPDBG] pid={_sr_os.getpid()} lookup_id={lookup_id} "
++            f"[SC_LOOKUP_TRACE] pid={_sc_os.getpid()} lookup_id={lookup_id} "
+             f"count={s['count']} dt={dt:.3f} retrieved_length={retrieved_length} "
+             f"extra={extra}",
+             flush=True,
+@@ -80,13 +89,13 @@ def _sr_lookup_debug(lookup_id, retrieved_length=None, extra=""):
+ 
+         if s["count"] in (2, 5, 10):
+             print(
+-                "[SRIRAM_LOOKUPDBG_STACK]\n"
+-                + "".join(_sr_traceback.format_stack(limit=12)),
++                "[SC_LOOKUP_TRACE_STACK]\n"
++                + "".join(_sc_traceback.format_stack(limit=12)),
+                 flush=True,
+             )
+     except Exception as e:
+-        print(f"[SRIRAM_LOOKUPDBG_ERROR] {e!r}", flush=True)
+-# ===== SRIRAM LOOKUP DEBUG END =====
++        print(f"[SC_LOOKUP_TRACE_ERROR] {e!r}", flush=True)
++# ===== SC LOOKUP TRACE END =====
+ 
+ # Helper function to get the class name of the backend
+ def get_backend_cname(backend: StorageBackendInterface) -> str:
+@@ -218,13 +227,13 @@ class AsyncMultiSerializer:
+         num_chunks: int,
+         **kwargs: Any,
+     ) -> Any:
+-        trace_enabled = _sr_os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1"
+-        lookup_id = kwargs.get("_kvio_lookup_id", "unknown")
+-        backend_name = kwargs.get("_kvio_backend_name", "unknown")
+-        queued_at = _sr_time.monotonic()
++        trace_enabled = io_trace_enabled()
++        lookup_id = kwargs.get("_sc_io_lookup_id", "unknown")
++        backend_name = kwargs.get("_sc_io_backend_name", "unknown")
++        queued_at = _sc_time.monotonic()
+         if trace_enabled:
+             logger.warning(
+-                "[KVIO_MULTI_SERIALIZER_ENQUEUE] lookup_id=%s backend=%s "
++                "[SC_IO_MULTI_SERIALIZER_ENQUEUE] lookup_id=%s backend=%s "
+                 "chunks=%d mono=%.6f",
+                 lookup_id,
+                 backend_name,
+@@ -232,10 +241,10 @@ class AsyncMultiSerializer:
+                 queued_at,
+             )
+         await self._sem.acquire(num_chunks)
+-        acquired_at = _sr_time.monotonic()
++        acquired_at = _sc_time.monotonic()
+         if trace_enabled:
+             logger.warning(
+-                "[KVIO_MULTI_SERIALIZER_ACQUIRE] lookup_id=%s backend=%s "
++                "[SC_IO_MULTI_SERIALIZER_ACQUIRE] lookup_id=%s backend=%s "
+                 "chunks=%d queue_wait=%.6f",
+                 lookup_id,
+                 backend_name,
+@@ -247,13 +256,13 @@ class AsyncMultiSerializer:
+         finally:
+             if trace_enabled:
+                 logger.warning(
+-                    "[KVIO_MULTI_SERIALIZER_RELEASE] lookup_id=%s backend=%s "
++                    "[SC_IO_MULTI_SERIALIZER_RELEASE] lookup_id=%s backend=%s "
+                     "chunks=%d held=%.6f total=%.6f",
+                     lookup_id,
+                     backend_name,
+                     num_chunks,
+-                    _sr_time.monotonic() - acquired_at,
+-                    _sr_time.monotonic() - queued_at,
++                    _sc_time.monotonic() - acquired_at,
++                    _sc_time.monotonic() - queued_at,
+                 )
+             await self._sem.release(num_chunks)
+ 
+@@ -269,9 +278,9 @@ class AsyncSingleSerializer:
+         # lazy init in run
+         self.lock: Optional[asyncio.Lock] = None
+         # Observability-only counters; they do not gate admission.
+-        self._kvio_waiters = 0
+-        self._kvio_active_lookup_id: Optional[str] = None
+-        self._kvio_active_backend: Optional[str] = None
++        self._sc_io_waiters = 0
++        self._sc_io_active_lookup_id: Optional[str] = None
++        self._sc_io_active_backend: Optional[str] = None
+ 
+     async def run(self, coro_fn: Coroutine[Any, Any, Any], *args, **kwargs) -> Any:
+         # we need to lazily initialize the lock to
+@@ -279,46 +288,46 @@ class AsyncSingleSerializer:
+         if self.lock is None:
+             self.lock = asyncio.Lock()
+ 
+-        trace_enabled = _sr_os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1"
+-        lookup_id = str(kwargs.get("_kvio_lookup_id", "unknown"))
+-        backend_name = str(kwargs.get("_kvio_backend_name", "unknown"))
+-        num_chunks = int(kwargs.get("_kvio_num_chunks", args[0] if args else -1))
+-        queued_at = _sr_time.monotonic()
++        trace_enabled = io_trace_enabled()
++        lookup_id = str(kwargs.get("_sc_io_lookup_id", "unknown"))
++        backend_name = str(kwargs.get("_sc_io_backend_name", "unknown"))
++        num_chunks = int(kwargs.get("_sc_io_num_chunks", args[0] if args else -1))
++        queued_at = _sc_time.monotonic()
+         acquired = False
+ 
+         if trace_enabled:
+-            self._kvio_waiters += 1
++            self._sc_io_waiters += 1
+             logger.warning(
+-                "[KVIO_SERIALIZER_ENQUEUE] lookup_id=%s backend=%s chunks=%d "
++                "[SC_IO_SERIALIZER_ENQUEUE] lookup_id=%s backend=%s chunks=%d "
+                 "waiters=%d active_lookup_id=%s active_backend=%s mono=%.6f",
+                 lookup_id,
+                 backend_name,
+                 num_chunks,
+-                self._kvio_waiters,
+-                self._kvio_active_lookup_id,
+-                self._kvio_active_backend,
++                self._sc_io_waiters,
++                self._sc_io_active_lookup_id,
++                self._sc_io_active_backend,
+                 queued_at,
+             )
+ 
+         try:
+             async with self.lock:  # type: ignore
+                 acquired = True
+-                acquired_at = _sr_time.monotonic()
++                acquired_at = _sc_time.monotonic()
+                 if trace_enabled:
+-                    self._kvio_waiters -= 1
+-                    previous_lookup_id = self._kvio_active_lookup_id
+-                    previous_backend = self._kvio_active_backend
+-                    self._kvio_active_lookup_id = lookup_id
+-                    self._kvio_active_backend = backend_name
++                    self._sc_io_waiters -= 1
++                    previous_lookup_id = self._sc_io_active_lookup_id
++                    previous_backend = self._sc_io_active_backend
++                    self._sc_io_active_lookup_id = lookup_id
++                    self._sc_io_active_backend = backend_name
+                     logger.warning(
+-                        "[KVIO_SERIALIZER_ACQUIRE] lookup_id=%s backend=%s "
++                        "[SC_IO_SERIALIZER_ACQUIRE] lookup_id=%s backend=%s "
+                         "chunks=%d queue_wait=%.6f waiters=%d "
+                         "previous_lookup_id=%s previous_backend=%s",
+                         lookup_id,
+                         backend_name,
+                         num_chunks,
+                         acquired_at - queued_at,
+-                        self._kvio_waiters,
++                        self._sc_io_waiters,
+                         previous_lookup_id,
+                         previous_backend,
+                     )
+@@ -326,31 +335,31 @@ class AsyncSingleSerializer:
+                     return await coro_fn
+                 finally:
+                     if trace_enabled:
+-                        now = _sr_time.monotonic()
++                        now = _sc_time.monotonic()
+                         logger.warning(
+-                            "[KVIO_SERIALIZER_RELEASE] lookup_id=%s backend=%s "
++                            "[SC_IO_SERIALIZER_RELEASE] lookup_id=%s backend=%s "
+                             "chunks=%d held=%.6f total=%.6f waiters=%d",
+                             lookup_id,
+                             backend_name,
+                             num_chunks,
+                             now - acquired_at,
+                             now - queued_at,
+-                            self._kvio_waiters,
++                            self._sc_io_waiters,
+                         )
+-                        self._kvio_active_lookup_id = None
+-                        self._kvio_active_backend = None
++                        self._sc_io_active_lookup_id = None
++                        self._sc_io_active_backend = None
+         finally:
+             if trace_enabled and not acquired:
+-                self._kvio_waiters -= 1
++                self._sc_io_waiters -= 1
+                 logger.warning(
+-                    "[KVIO_SERIALIZER_WAIT_ENDED_WITHOUT_ACQUIRE] "
++                    "[SC_IO_SERIALIZER_WAIT_ENDED_WITHOUT_ACQUIRE] "
+                     "lookup_id=%s backend=%s chunks=%d waited=%.6f "
+                     "waiters=%d",
+                     lookup_id,
+                     backend_name,
+                     num_chunks,
+-                    _sr_time.monotonic() - queued_at,
+-                    self._kvio_waiters,
++                    _sc_time.monotonic() - queued_at,
++                    self._sc_io_waiters,
+                 )
+ 
+ 
+@@ -411,33 +420,38 @@ class StorageManager:
+         )
+         self.async_serializer: Optional[AsyncSerializer] = None
+ 
+-        # P0-A: admit async lookups before any backend pins keys or allocates
+-        # staging buffers. A value of 0 disables P0-A and restores the
+-        # original fire-and-forget async lookup/prefetch behavior.
+-        self._p0_lookup_limit = int(
+-            _sr_os.environ.get(
+-                "LMCACHE_P0_LOOKUP_MAX_INFLIGHT",
+-                "1",
+-            )
++        # Optional worker-side admission before any backend pins keys or
++        # allocates staging buffers. This gate is independent from scheduler
++        # admission and disk-put admission.
++        self._sc_worker_lookup_admission_enabled = (
++            worker_lookup_admission_enabled()
++        )
++        self._sc_worker_lookup_limit = env_int(
++            "SC_LMCACHE_WORKER_LOOKUP_MAX_INFLIGHT", 1, minimum=0
+         )
+-        if self._p0_lookup_limit < 0:
++        if (
++            self._sc_worker_lookup_admission_enabled
++            and self._sc_worker_lookup_limit < 1
++        ):
+             raise ValueError(
+-                "LMCACHE_P0_LOOKUP_MAX_INFLIGHT must be >= 0, "
+-                f"got {self._p0_lookup_limit}"
++                "SC_LMCACHE_WORKER_LOOKUP_MAX_INFLIGHT must be >= 1 "
++                "when worker lookup admission is enabled"
+             )
+-        self._p0_lookup_admission = (
+-            asyncio.Semaphore(self._p0_lookup_limit)
+-            if self._p0_lookup_limit > 0
++        self._sc_worker_lookup_admission = (
++            asyncio.Semaphore(self._sc_worker_lookup_limit)
++            if self._sc_worker_lookup_admission_enabled
+             else None
+         )
+-        self._p0_lookup_inflight = 0
+-        self._p0_lookup_waiters = 0
+-        self._p0_lookup_peak = 0
+-
+-        logger.info(
+-            "P0 worker lookup admission: limit=%d (0 disables P0-A)",
+-            self._p0_lookup_limit,
+-        )
++        self._sc_worker_lookup_inflight = 0
++        self._sc_worker_lookup_waiters = 0
++        self._sc_worker_lookup_peak = 0
++
++        if self._sc_worker_lookup_admission_enabled or io_trace_enabled():
++            logger.info(
++                "SC worker lookup admission: enabled=%s limit=%d",
++                self._sc_worker_lookup_admission_enabled,
++                self._sc_worker_lookup_limit,
++            )
+ 
+         # The GPU stream for internal copies during put
+         if is_cuda_worker(metadata):
+@@ -709,99 +723,99 @@ class StorageManager:
+             task = asyncio.run_coroutine_threadsafe(coro, self.loop)
+             yield task
+ 
+-    async def _p0_acquire_lookup_admission(self, lookup_id: str) -> bool:
+-        """Acquire a lookup slot before contains(pin=True) can retain keys.
++    async def _sc_acquire_worker_lookup_admission(self, lookup_id: str) -> bool:
++        """Acquire a worker lookup slot before contains(pin=True).
+ 
+-        Returns True only when a real P0-A permit was acquired. A configured
+-        limit of 0 bypasses the gate and returns False.
++        Returns True only when the optional worker gate is enabled and a real
++        permit was acquired. A disabled gate returns False immediately.
+         """
+-        semaphore = self._p0_lookup_admission
++        semaphore = self._sc_worker_lookup_admission
+         if semaphore is None:
+             return False
+ 
+-        queued_at = _sr_time.monotonic()
+-        self._p0_lookup_waiters += 1
+-        trace_enabled = _sr_os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1"
++        queued_at = _sc_time.monotonic()
++        self._sc_worker_lookup_waiters += 1
++        trace_enabled = io_trace_enabled()
+ 
+         if trace_enabled:
+             logger.warning(
+-                "[P0_LOOKUP_ADMISSION_WAIT] pid=%d lookup_id=%s "
++                "[SC_WORKER_LOOKUP_ADMISSION_WAIT] pid=%d lookup_id=%s "
+                 "limit=%d inflight=%d waiters=%d",
+-                _sr_os.getpid(),
++                _sc_os.getpid(),
+                 lookup_id,
+-                self._p0_lookup_limit,
+-                self._p0_lookup_inflight,
+-                self._p0_lookup_waiters,
++                self._sc_worker_lookup_limit,
++                self._sc_worker_lookup_inflight,
++                self._sc_worker_lookup_waiters,
+             )
+ 
+         try:
+             await semaphore.acquire()
+         except BaseException:
+-            self._p0_lookup_waiters -= 1
++            self._sc_worker_lookup_waiters -= 1
+             if trace_enabled:
+                 logger.warning(
+-                    "[P0_LOOKUP_ADMISSION_ABORT] pid=%d lookup_id=%s "
++                    "[SC_WORKER_LOOKUP_ADMISSION_ABORT] pid=%d lookup_id=%s "
+                     "waited=%.6f inflight=%d waiters=%d",
+-                    _sr_os.getpid(),
++                    _sc_os.getpid(),
+                     lookup_id,
+-                    _sr_time.monotonic() - queued_at,
+-                    self._p0_lookup_inflight,
+-                    self._p0_lookup_waiters,
++                    _sc_time.monotonic() - queued_at,
++                    self._sc_worker_lookup_inflight,
++                    self._sc_worker_lookup_waiters,
+                 )
+             raise
+ 
+-        self._p0_lookup_waiters -= 1
+-        self._p0_lookup_inflight += 1
+-        self._p0_lookup_peak = max(
+-            self._p0_lookup_peak,
+-            self._p0_lookup_inflight,
++        self._sc_worker_lookup_waiters -= 1
++        self._sc_worker_lookup_inflight += 1
++        self._sc_worker_lookup_peak = max(
++            self._sc_worker_lookup_peak,
++            self._sc_worker_lookup_inflight,
+         )
+         if trace_enabled:
+             logger.warning(
+-                "[P0_LOOKUP_ADMISSION_ACQUIRE] pid=%d lookup_id=%s "
++                "[SC_WORKER_LOOKUP_ADMISSION_ACQUIRE] pid=%d lookup_id=%s "
+                 "waited=%.6f limit=%d inflight=%d waiters=%d peak=%d",
+-                _sr_os.getpid(),
++                _sc_os.getpid(),
+                 lookup_id,
+-                _sr_time.monotonic() - queued_at,
+-                self._p0_lookup_limit,
+-                self._p0_lookup_inflight,
+-                self._p0_lookup_waiters,
+-                self._p0_lookup_peak,
++                _sc_time.monotonic() - queued_at,
++                self._sc_worker_lookup_limit,
++                self._sc_worker_lookup_inflight,
++                self._sc_worker_lookup_waiters,
++                self._sc_worker_lookup_peak,
+             )
+         return True
+ 
+-    def _p0_release_lookup_admission(
++    def _sc_release_worker_lookup_admission(
+         self,
+         lookup_id: str,
+         reason: str,
+         admitted_at: float,
+     ) -> None:
+         """Release one lookup slot on the storage-manager event loop."""
+-        semaphore = self._p0_lookup_admission
++        semaphore = self._sc_worker_lookup_admission
+         if semaphore is None:
+             return
+ 
+-        self._p0_lookup_inflight -= 1
+-        if self._p0_lookup_inflight < 0:
+-            self._p0_lookup_inflight = 0
++        self._sc_worker_lookup_inflight -= 1
++        if self._sc_worker_lookup_inflight < 0:
++            self._sc_worker_lookup_inflight = 0
+             raise RuntimeError(
+-                f"P0 lookup admission underflow for lookup_id={lookup_id}"
++                f"SC worker lookup admission underflow for lookup_id={lookup_id}"
+             )
+         semaphore.release()
+ 
+-        if _sr_os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
++        if io_trace_enabled():
+             logger.warning(
+-                "[P0_LOOKUP_ADMISSION_RELEASE] pid=%d lookup_id=%s "
++                "[SC_WORKER_LOOKUP_ADMISSION_RELEASE] pid=%d lookup_id=%s "
+                 "reason=%s held=%.6f limit=%d inflight=%d "
+                 "waiters=%d peak=%d",
+-                _sr_os.getpid(),
++                _sc_os.getpid(),
+                 lookup_id,
+                 reason,
+-                _sr_time.monotonic() - admitted_at,
+-                self._p0_lookup_limit,
+-                self._p0_lookup_inflight,
+-                self._p0_lookup_waiters,
+-                self._p0_lookup_peak,
++                _sc_time.monotonic() - admitted_at,
++                self._sc_worker_lookup_limit,
++                self._sc_worker_lookup_inflight,
++                self._sc_worker_lookup_waiters,
++                self._sc_worker_lookup_peak,
+             )
+ 
+     def prefetch_single_done_callback(
+@@ -813,15 +827,17 @@ class StorageManager:
+         started: float,
+     ) -> None:
+         """Log completion, partial completion, or failure of one tier load."""
+-        elapsed = _sr_time.monotonic() - started
+-        debug_enabled = _sr_os.environ.get("SRIRAM_KV_MEM_DEBUG", "0") == "1"
++        elapsed = _sc_time.monotonic() - started
++        trace_enabled = load_trace_enabled()
++        if not trace_enabled:
++            return
+ 
+         if future.cancelled():
+             logger.error(
+-                "[KVDBG_LOAD_CANCELLED] "
++                "[SC_LOAD_CANCELLED] "
+                 "pid=%d lookup_id=%s backend=%s "
+                 "requested_keys=%d elapsed=%.3fs",
+-                _sr_os.getpid(),
++                _sc_os.getpid(),
+                 lookup_id,
+                 backend_name,
+                 len(keys),
+@@ -834,19 +850,13 @@ class StorageManager:
+             returned = len(results)
+             none_count = sum(memory_obj is None for memory_obj in results)
+ 
+-            if (
+-                debug_enabled
+-                or backend_name == "LocalDiskBackend"
+-                or elapsed >= 1.0
+-                or none_count > 0
+-                or returned != len(keys)
+-            ):
++            if trace_enabled:
+                 logger.warning(
+-                    "[KVDBG_LOAD_DONE] "
++                    "[SC_LOAD_DONE] "
+                     "pid=%d lookup_id=%s backend=%s "
+                     "requested_keys=%d returned=%d none=%d "
+                     "partial=%s elapsed=%.3fs",
+-                    _sr_os.getpid(),
++                    _sc_os.getpid(),
+                     lookup_id,
+                     backend_name,
+                     len(keys),
+@@ -857,10 +867,10 @@ class StorageManager:
+                 )
+         except Exception:
+             logger.exception(
+-                "[KVDBG_LOAD_FAILED] "
++                "[SC_LOAD_FAILED] "
+                 "pid=%d lookup_id=%s backend=%s "
+                 "requested_keys=%d elapsed=%.3fs",
+-                _sr_os.getpid(),
++                _sc_os.getpid(),
+                 lookup_id,
+                 backend_name,
+                 len(keys),
+@@ -962,7 +972,7 @@ class StorageManager:
+             f"Responding to scheduler for lookup id {lookup_id}"
+             f" with retrieved length {retrieved_length}"
+         )
+-        _sr_lookup_debug(lookup_id, retrieved_length=retrieved_length, extra="responding_to_scheduler")
++        _sc_lookup_trace(lookup_id, retrieved_length=retrieved_length, extra="responding_to_scheduler")
+         self.async_lookup_server.send_response_to_scheduler(lookup_id, retrieved_length)
+ 
+     async def _async_lookup_and_prefetch_impl(
+@@ -1026,19 +1036,19 @@ class StorageManager:
+                 f"len(keys)={len(keys)} is not a multiple of "
+                 f"keys_per_chunk={keys_per_chunk}"
+             )
+-        kvio_lookup_started = _sr_time.monotonic()
+-        if _sr_os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
++        sc_io_lookup_started = _sc_time.monotonic()
++        if io_trace_enabled():
+             logger.warning(
+-                "[KVIO_STORAGE_LOOKUP_ENTER] pid=%d lookup_id=%s keys=%d "
++                "[SC_IO_STORAGE_LOOKUP_ENTER] pid=%d lookup_id=%s keys=%d "
+                 "chunks=%d keys_per_chunk=%d pin=%s search_range=%s mono=%.6f",
+-                _sr_os.getpid(),
++                _sc_os.getpid(),
+                 lookup_id,
+                 len(keys),
+                 len(keys) // keys_per_chunk,
+                 keys_per_chunk,
+                 pin,
+                 search_range,
+-                kvio_lookup_started,
++                sc_io_lookup_started,
+             )
+ 
+         num_total_chunks = len(keys) // keys_per_chunk
+@@ -1058,21 +1068,21 @@ class StorageManager:
+         for backend_name, backend in self.get_active_storage_backends(
+             search_range=search_range
+         ):
+-            contains_started = _sr_time.monotonic()
++            contains_started = _sc_time.monotonic()
+             num_hit_keys_raw = await backend.batched_async_contains(
+                 lookup_id, keys, pin
+             )
+-            if _sr_os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
++            if io_trace_enabled():
+                 logger.warning(
+-                    "[KVIO_CONTAINS_DONE] pid=%d lookup_id=%s backend=%s "
++                    "[SC_IO_CONTAINS_DONE] pid=%d lookup_id=%s backend=%s "
+                     "input_keys=%d hit_keys_raw=%d pin=%s elapsed=%.6f",
+-                    _sr_os.getpid(),
++                    _sc_os.getpid(),
+                     lookup_id,
+                     backend_name,
+                     len(keys),
+                     num_hit_keys_raw,
+                     pin,
+-                    _sr_time.monotonic() - contains_started,
++                    _sc_time.monotonic() - contains_started,
+                 )
+             # Round down to a whole-chunk boundary. If a backend has only
+             # some of a chunk's per-layer keys (e.g., partial eviction),
+@@ -1103,13 +1113,13 @@ class StorageManager:
+                 "async_lookup_and_prefetch."
+             )
+             # num_hit_chunks is only used for the multi serializer
+-            load_started = _sr_time.monotonic()
+-            if _sr_os.environ.get("SRIRAM_KV_MEM_DEBUG", "0") == "1":
++            load_started = _sc_time.monotonic()
++            if load_trace_enabled():
+                 logger.warning(
+-                    "[KVDBG_LOAD_START] "
++                    "[SC_LOAD_START] "
+                     "pid=%d lookup_id=%s backend=%s "
+                     "hit_chunks=%d requested_keys=%d pin=%s",
+-                    _sr_os.getpid(),
++                    _sc_os.getpid(),
+                     lookup_id,
+                     backend_name,
+                     num_hit_chunks,
+@@ -1124,9 +1134,9 @@ class StorageManager:
+                     {"cum_chunk_lengths": cum_chunk_lengths[: num_hit_chunks + 1]},
+                 ),
+                 num_hit_chunks,
+-                _kvio_lookup_id=lookup_id,
+-                _kvio_backend_name=backend_name,
+-                _kvio_num_chunks=num_hit_chunks,
++                _sc_io_lookup_id=lookup_id,
++                _sc_io_backend_name=backend_name,
++                _sc_io_num_chunks=num_hit_chunks,
+             )
+             loading_task = asyncio.create_task(get_coro)
+             loading_task.add_done_callback(
+@@ -1149,13 +1159,13 @@ class StorageManager:
+ 
+         # If no chunks were hit across all backends, respond immediately and return.
+         if num_total_hit_chunks == 0:
+-            if _sr_os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
++            if io_trace_enabled():
+                 logger.warning(
+-                    "[KVIO_STORAGE_LOOKUP_NO_HIT] pid=%d lookup_id=%s "
++                    "[SC_IO_STORAGE_LOOKUP_NO_HIT] pid=%d lookup_id=%s "
+                     "elapsed=%.6f",
+-                    _sr_os.getpid(),
++                    _sc_os.getpid(),
+                     lookup_id,
+-                    _sr_time.monotonic() - kvio_lookup_started,
++                    _sc_time.monotonic() - sc_io_lookup_started,
+                 )
+             if self.async_lookup_server is not None:
+                 self.async_lookup_server.send_response_to_scheduler(lookup_id, 0)
+@@ -1186,15 +1196,15 @@ class StorageManager:
+             lookup_id,
+             all_done,
+         )
+-        if _sr_os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
++        if io_trace_enabled():
+             logger.warning(
+-                "[KVIO_STORAGE_EVENT_REGISTER] pid=%d lookup_id=%s "
++                "[SC_IO_STORAGE_EVENT_REGISTER] pid=%d lookup_id=%s "
+                 "loading_tasks=%d expected_chunks=%s elapsed=%.6f",
+-                _sr_os.getpid(),
++                _sc_os.getpid(),
+                 lookup_id,
+                 len(loading_tasks),
+                 tier_expected_chunks,
+-                _sr_time.monotonic() - kvio_lookup_started,
++                _sc_time.monotonic() - sc_io_lookup_started,
+             )
+ 
+         all_done.add_done_callback(
+@@ -1207,10 +1217,10 @@ class StorageManager:
+             )
+         )
+ 
+-        # When P0-A is enabled, keep its permit until physical prefetch work
+-        # completes. When disabled, preserve vanilla LMCache's fire-and-forget
++        # When worker admission is enabled, keep its permit until physical
++        # prefetch work completes. When disabled, preserve vanilla LMCache's fire-and-forget
+         # behavior and return immediately after registering callbacks.
+-        if self._p0_lookup_admission is not None:
++        if self._sc_worker_lookup_admission is not None:
+             await all_done
+ 
+     async def async_lookup_and_prefetch(
+@@ -1222,9 +1232,9 @@ class StorageManager:
+         pin: bool = False,
+         keys_per_chunk: int = 1,
+     ) -> None:
+-        """P0-A wrapper that bounds lookups before any pinning occurs."""
+-        admitted = await self._p0_acquire_lookup_admission(lookup_id)
+-        admitted_at = _sr_time.monotonic() if admitted else 0.0
++        """Optionally bound worker lookups before any pinning occurs."""
++        admitted = await self._sc_acquire_worker_lookup_admission(lookup_id)
++        admitted_at = _sc_time.monotonic() if admitted else 0.0
+         try:
+             await self._async_lookup_and_prefetch_impl(
+                 lookup_id,
+@@ -1236,7 +1246,7 @@ class StorageManager:
+             )
+         finally:
+             if admitted:
+-                self._p0_release_lookup_admission(
++                self._sc_release_worker_lookup_admission(
+                     lookup_id,
+                     reason="prefetch_complete_or_exit",
+                     admitted_at=admitted_at,
+-- 
+2.47.3
+

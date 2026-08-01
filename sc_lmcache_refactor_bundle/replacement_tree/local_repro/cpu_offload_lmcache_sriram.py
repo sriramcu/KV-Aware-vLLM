@@ -8,7 +8,6 @@ import os
 import re
 import sys
 import time
-import random
 from dataclasses import asdict
 from pathlib import Path
 
@@ -25,38 +24,38 @@ from vllm.engine.arg_utils import EngineArgs
 
 import hashlib
 
-# ===== SRIRAM PROCESS MONITOR START =====
-import os as _sr_os
-import time as _sr_time
-import threading as _sr_threading
-import shutil as _sr_shutil
-import subprocess as _sr_subprocess
+# ===== SC DRIVER RESOURCE MONITOR START =====
+import os as _sc_os
+import time as _sc_time
+import threading as _sc_threading
+import shutil as _sc_shutil
+import subprocess as _sc_subprocess
 
 
-def _sr_top_processes():
+def _sc_top_processes():
     try:
-        return _sr_subprocess.check_output(
+        return _sc_subprocess.check_output(
             [
                 "bash",
                 "-lc",
                 "ps -u $USER -o pid,ppid,rss,vsz,stat,etime,cmd --sort=-rss | head -20",
             ],
-            stderr=_sr_subprocess.STDOUT,
+            stderr=_sc_subprocess.STDOUT,
             timeout=3,
             text=True,
         ).replace("\n", " || ")
     except Exception as e:
         return repr(e)
 
-def _sr_disk_usage(path):
+def _sc_disk_usage(path):
     try:
-        u = _sr_shutil.disk_usage(path)
+        u = _sc_shutil.disk_usage(path)
         return f"{path}: used={u.used/1024**3:.1f}G free={u.free/1024**3:.1f}G total={u.total/1024**3:.1f}G"
     except Exception as e:
         return f"{path}: {e!r}"
 
 
-def _sr_status():
+def _sc_status():
     vals = {}
     try:
         with open("/proc/self/status") as f:
@@ -69,22 +68,22 @@ def _sr_status():
     return vals
 
 
-def _sr_gpu():
+def _sc_gpu():
     try:
-        return _sr_subprocess.check_output(
+        return _sc_subprocess.check_output(
             [
                 "nvidia-smi",
                 "--query-gpu=index,memory.used,memory.free,memory.total,utilization.gpu",
                 "--format=csv,noheader,nounits",
             ],
-            stderr=_sr_subprocess.STDOUT,
+            stderr=_sc_subprocess.STDOUT,
             timeout=3,
             text=True,
         ).replace("\n", " | ")
     except Exception as e:
         return repr(e)
 
-def _sr_meminfo():
+def _sc_meminfo():
     try:
         keys = ("MemTotal:", "MemFree:", "MemAvailable:", "Buffers:", "Cached:", "SwapTotal:", "SwapFree:")
         out = []
@@ -96,114 +95,66 @@ def _sr_meminfo():
     except Exception as e:
         return repr(e)
 
-def _sr_monitor_loop():
+def _sc_env_flag(name: str, default: bool = False) -> bool:
+    raw = _sc_os.environ.get(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off", ""}:
+        return False
+    raise ValueError(f"{name} has invalid boolean value {raw!r}")
+
+
+def _sc_monitor_loop():
+    interval_s = float(
+        _sc_os.environ.get("SC_DRIVER_RESOURCE_MONITOR_INTERVAL_S", "30")
+    )
     while True:
         print(
-            "[SRIRAM_MONITOR] "
-            f"pid={_sr_os.getpid()} "
-            f"status={_sr_status()} "
-            f"tmp={_sr_disk_usage('/tmp')} "
-            f"shm={_sr_disk_usage('/dev/shm')} "
-            f"lmcache={_sr_disk_usage(_sr_os.environ.get('SRIRAM_LMCACHE_DIR', '/tmp'))} "
-            f"gpu={_sr_gpu()}",
-            f"top_procs={_sr_top_processes()} ",
-            f"meminfo={_sr_meminfo()} ",
+            "[SC_DRIVER_MONITOR] "
+            f"pid={_sc_os.getpid()} "
+            f"status={_sc_status()} "
+            f"tmp={_sc_disk_usage('/tmp')} "
+            f"shm={_sc_disk_usage('/dev/shm')} "
+            f"lmcache={_sc_disk_usage((_sc_os.environ.get('SC_LMCACHE_DATA_DIR') or '/tmp'))} "
+            f"gpu={_sc_gpu()}",
+            f"top_procs={_sc_top_processes()} ",
+            f"meminfo={_sc_meminfo()} ",
             flush=True,
         )
-        _sr_time.sleep(30)
+        _sc_time.sleep(interval_s)
 
 
-def _sr_start_monitor():
-    t = _sr_threading.Thread(target=_sr_monitor_loop, daemon=True)
+def _sc_start_monitor():
+    if not _sc_env_flag("SC_DRIVER_RESOURCE_MONITOR_ENABLE", False):
+        return
+    t = _sc_threading.Thread(
+        target=_sc_monitor_loop,
+        daemon=True,
+        name="sc-driver-resource-monitor",
+    )
     t.start()
-# ===== SRIRAM PROCESS MONITOR END =====
+# ===== SC DRIVER RESOURCE MONITOR END =====
 
 def passage_prefix_signature(sorted_passage, n=2):
-    """Legacy signature: hash the first n passages as one opaque prefix."""
     prefix = "\n".join(sorted_passage[:n])
     return hashlib.sha1(prefix.encode("utf-8")).hexdigest()
 
 
-def passage_signature(passage):
-    """Stable signature for one exact retrieved passage."""
-    return hashlib.sha1(passage.encode("utf-8")).hexdigest()
-
-
-def hierarchical_passage_prefix_key(prompt_record, depth=2):
-    """
-    Sort by P1, then P2, then P3, and so on.
-
-    Unlike the legacy combined-prefix hash, this keeps requests sharing P1
-    adjacent even when their P2 passages differ.
-    """
-    sorted_passage = prompt_record.get("sorted_passage") or []
-    passage_signatures = tuple(
-        passage_signature(sorted_passage[index])
-        if index < len(sorted_passage)
-        else ""
-        for index in range(depth)
-    )
-    return (*passage_signatures, prompt_record.get("question", ""))
-
-
-def reorder_requests(
-    llm_inputs,
-    prompt_records,
-    order_mode="legacy_prefix_hash",
-    prefix_sort_depth=2,
-    seed=0,
-):
-    """
-    Return llm_inputs and prompt_records in one of three reproducible orders.
-
-    legacy_prefix_hash:
-        Preserve the original program behavior. Hash the first
-        prefix_sort_depth passages together, then sort by question.
-
-    hierarchical_prefix:
-        Sort by P1, then P2, and so on through prefix_sort_depth.
-
-    seeded_shuffle:
-        Deterministically shuffle with a fixed seed. Given identical inputs
-        and the same seed, different program runs receive the same order.
-    """
-    if len(llm_inputs) != len(prompt_records):
-        raise ValueError(
-            "llm_inputs and prompt_records must have identical lengths: "
-            f"{len(llm_inputs)} != {len(prompt_records)}"
-        )
-    if prefix_sort_depth <= 0:
-        raise ValueError(
-            "prefix_sort_depth must be greater than zero, "
-            f"got {prefix_sort_depth}"
-        )
-
+def reorder_by_shared_passage_prefix(llm_inputs, prompt_records, n=2):
     pairs = list(zip(llm_inputs, prompt_records))
 
-    if order_mode == "legacy_prefix_hash":
-        pairs.sort(
-            key=lambda pair: (
-                passage_prefix_signature(
-                    pair[1]["sorted_passage"],
-                    n=prefix_sort_depth,
-                ),
-                pair[1]["question"],
-            )
+    pairs.sort(
+        key=lambda x: (
+            passage_prefix_signature(x[1]["sorted_passage"], n=n),
+            x[1]["question"],
         )
-    elif order_mode == "hierarchical_prefix":
-        pairs.sort(
-            key=lambda pair: hierarchical_passage_prefix_key(
-                pair[1],
-                depth=prefix_sort_depth,
-            )
-        )
-    elif order_mode == "seeded_shuffle":
-        random.Random(seed).shuffle(pairs)
-    else:
-        raise ValueError(f"Unknown request order mode: {order_mode}")
+    )
 
-    new_llm_inputs = [pair[0] for pair in pairs]
-    new_prompt_records = [pair[1] for pair in pairs]
+    new_llm_inputs = [p[0] for p in pairs]
+    new_prompt_records = [p[1] for p in pairs]
 
     return new_llm_inputs, new_prompt_records
 
@@ -234,64 +185,35 @@ sys.path.insert(0, vllm_root)
 #     to_dataframe as kv_to_dataframe,
 # )
 # from kvcache_visualize import visualize as kv_visualize
+# LM_CACHE_DISK_PATH = os.environ.get(
+#     "SC_LMCACHE_DATA_DIR",
+#     "/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/lmcache_vllm/manual",
+# )
 LM_CACHE_DISK_PATH = os.environ.get(
-    "SRIRAM_LMCACHE_DIR",
-    "/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/lmcache_vllm/manual",
-)
-# LM_CACHE_DISK_PATH = "/scratch/sriramc2/vllm/"
-
-# Define duplicated LMCache settings once so the generated YAML and the
-# environment-variable overrides cannot accidentally diverge.
-LM_CACHE_CHUNK_SIZE = 512
-LM_CACHE_LOCAL_CPU = True
-LM_CACHE_MAX_LOCAL_CPU_SIZE = 100.0
-LM_CACHE_LOCAL_DISK = True
-LM_CACHE_MAX_LOCAL_DISK_SIZE = 450.0
-LM_CACHE_ENABLE_KV_EVENTS = True
-LM_CACHE_PRE_CACHING_HASH_ALGORITHM = "builtin"
-LM_CACHE_ENABLE_ASYNC_LOADING = True
-LM_CACHE_CPU_READER_THREADS = 4
-LM_CACHE_USE_EXPERIMENTAL = True
-LM_CACHE_INTERNAL_API_SERVER_ENABLED = True
-DYN_KVBM_DISABLE_DISK_OFFLOAD_FILTER = False
-GNN_KV_BLOCK_SIZE = 16
-
-
-def _bool_text(value):
-    return "true" if value else "false"
-
-
+    "SC_LMCACHE_DATA_DIR", "/scratch/sriramc2/vllm/"
+) or "/scratch/sriramc2/vllm/"
 def setup_environment_variables():
     def write_lmcache_config(path: str):
-        config_lines = [
-            f"chunk_size: {LM_CACHE_CHUNK_SIZE}",
-            f"local_cpu: {_bool_text(LM_CACHE_LOCAL_CPU)}",
-            f"max_local_cpu_size: {LM_CACHE_MAX_LOCAL_CPU_SIZE}",
-        ]
+        import textwrap
 
-        if LM_CACHE_LOCAL_DISK:
-            config_lines.extend(
-                [
-                    f'local_disk: "file://{LM_CACHE_DISK_PATH}"',
-                    f"max_local_disk_size: {LM_CACHE_MAX_LOCAL_DISK_SIZE}",
-                ]
-            )
-
-        config_lines.extend(
-            [
-                f"enable_kv_events: {_bool_text(LM_CACHE_ENABLE_KV_EVENTS)}",
-                (
-                    "pre_caching_hash_algorithm: "
-                    f"{LM_CACHE_PRE_CACHING_HASH_ALGORITHM}"
-                ),
-                (
-                    "enable_async_loading: "
-                    f"{_bool_text(LM_CACHE_ENABLE_ASYNC_LOADING)}"
-                ),
-            ]
-        )
-
-        config = "\n".join(config_lines)
+        config = textwrap.dedent(f"""
+        chunk_size: 512
+        local_cpu: true
+        max_local_cpu_size: 100.0
+        local_disk: "file://{LM_CACHE_DISK_PATH}"
+        max_local_disk_size: 450.0
+        enable_kv_events: true
+        pre_caching_hash_algorithm: builtin
+        enable_async_loading: true
+        """).strip()
+        # config = textwrap.dedent(f"""
+        # chunk_size: 512
+        # local_cpu: true
+        # max_local_cpu_size: 100.0
+        # enable_kv_events: true
+        # pre_caching_hash_algorithm: builtin
+        # enable_async_loading: false
+        # """).strip()
         Path(path).write_text(config + "\n", encoding="utf-8")
 
     cfg_path = "./lmcache_config.yaml"
@@ -309,38 +231,22 @@ def setup_environment_variables():
     os.environ["VLLM_DISTRIBUTED_BACKEND"] = "nccl"
     os.environ["VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM"] = "1"
     os.environ["VLLM_RPC_TIMEOUT"] = "1200000"
-    os.environ["LMCACHE_CPU_READER_THREADS"] = str(LM_CACHE_CPU_READER_THREADS)
+    os.environ["LMCACHE_CPU_READER_THREADS"] = "4"
     os.environ["VLLM_ENGINE_ITERATION_TIMEOUT_S"] = "1200"
     os.environ["VLLM_SAMPLED_TOKEN_ID_BUFFER_SIZE"] = "10"
     os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-    os.environ["LMCACHE_ENABLE_ASYNC_LOADING"] = str(
-        LM_CACHE_ENABLE_ASYNC_LOADING
-    )
-    os.environ["LMCACHE_USE_EXPERIMENTAL"] = str(LM_CACHE_USE_EXPERIMENTAL)
-    os.environ["LMCACHE_CHUNK_SIZE"] = str(LM_CACHE_CHUNK_SIZE)
-    os.environ["LMCACHE_LOCAL_CPU"] = str(LM_CACHE_LOCAL_CPU)
-    os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = str(
-        LM_CACHE_MAX_LOCAL_CPU_SIZE
-    )
+    os.environ["LMCACHE_ENABLE_ASYNC_LOADING"] = "True"
+    os.environ["LMCACHE_USE_EXPERIMENTAL"] = "True"
+    os.environ["LMCACHE_CHUNK_SIZE"] = "512"
+    os.environ["LMCACHE_LOCAL_CPU"] = "True"
+    os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "100"
 
-    if LM_CACHE_LOCAL_DISK:
-        os.makedirs(f"{LM_CACHE_DISK_PATH}", exist_ok=True)
-        print("XYZ created lmcache disk path")
-        os.environ["LMCACHE_LOCAL_DISK"] = f"file://{LM_CACHE_DISK_PATH}"
-        os.environ["LMCACHE_MAX_LOCAL_DISK_SIZE"] = str(
-            LM_CACHE_MAX_LOCAL_DISK_SIZE
-        )
-        os.environ["DYN_KVBM_DISABLE_DISK_OFFLOAD_FILTER"] = str(
-            DYN_KVBM_DISABLE_DISK_OFFLOAD_FILTER
-        )
-    else:
-        os.environ.pop("LMCACHE_LOCAL_DISK", None)
-        os.environ.pop("LMCACHE_MAX_LOCAL_DISK_SIZE", None)
-        os.environ.pop("DYN_KVBM_DISABLE_DISK_OFFLOAD_FILTER", None)
-
-    os.environ["LMCACHE_INTERNAL_API_SERVER_ENABLED"] = str(
-        LM_CACHE_INTERNAL_API_SERVER_ENABLED
-    )
+    os.makedirs(f"{LM_CACHE_DISK_PATH}", exist_ok=True)
+    print("XYZ created lmcache disk path")
+    os.environ["LMCACHE_LOCAL_DISK"] = f"file://{LM_CACHE_DISK_PATH}"
+    os.environ["LMCACHE_INTERNAL_API_SERVER_ENABLED"] = "True"
+    os.environ["LMCACHE_MAX_LOCAL_DISK_SIZE"] = "450"
+    os.environ["DYN_KVBM_DISABLE_DISK_OFFLOAD_FILTER"] = "False"
     os.environ["PROMETHEUS_MULTIPROC_DIR"] = os.environ.get(
         "PROMETHEUS_MULTIPROC_DIR",
         "/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/prometheus_vllm",
@@ -388,49 +294,6 @@ def parse_arguments():
     )
     parser.add_argument("--dataset_name", default="hotpotqa")
     parser.add_argument("--llm_model", default="meta-llama/Llama-3.3-70B-Instruct")
-    parser.add_argument(
-        "--request_order",
-        choices=(
-            "legacy_prefix_hash",
-            "hierarchical_prefix",
-            "seeded_shuffle",
-        ),
-        default="legacy_prefix_hash",
-        help=(
-            "Cold request ordering. 'legacy_prefix_hash' preserves the "
-            "existing combined-prefix hash behavior; 'hierarchical_prefix' "
-            "sorts by P1, then P2, and so on; 'seeded_shuffle' creates a "
-            "repeatable shuffled order."
-        ),
-    )
-    parser.add_argument(
-        "--prefix_sort_depth",
-        type=int,
-        default=2,
-        help=(
-            "Number of leading retrieved passages used by the legacy and "
-            "hierarchical prefix-ordering modes."
-        ),
-    )
-    parser.add_argument(
-        "--request_order_seed",
-        type=int,
-        default=0,
-        help=(
-            "Fixed seed used by --request_order seeded_shuffle. Identical "
-            "inputs and the same seed produce the same order across runs."
-        ),
-    )
-    parser.add_argument(
-        "--warm_order",
-        choices=("same", "reverse"),
-        default="reverse",
-        help=(
-            "Warm replay order. 'reverse' starts with the requests most "
-            "recently executed in the cold pass; 'same' exactly replays the "
-            "cold order."
-        ),
-    )
 
     return parser.parse_args()
 
@@ -470,7 +333,7 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
         max_model_len=8000,
         gpu_memory_utilization=float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.65")),
         dtype="bfloat16",
-        max_num_seqs=int(os.environ.get("VLLM_MAX_NUM_SEQS", "4")),
+        max_num_seqs=4,
         tensor_parallel_size=int(os.environ.get("VLLM_TENSOR_PARALLEL_SIZE", "2")),
         enforce_eager=False,
         enable_chunked_prefill=True,
@@ -480,8 +343,17 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
         enable_prefix_caching=True,
     )
 
-    print("[SRIRAM BEFORE LLM] CUDA_VISIBLE_DEVICES=", os.environ.get("CUDA_VISIBLE_DEVICES"), flush=True)
-    print("[SRIRAM BEFORE LLM] CUDA_DEVICE_ORDER=", os.environ.get("CUDA_DEVICE_ORDER"), flush=True)
+    if _sc_io_trace_enabled():
+        print(
+            "[SC_BEFORE_LLM] CUDA_VISIBLE_DEVICES=",
+            os.environ.get("CUDA_VISIBLE_DEVICES"),
+            flush=True,
+        )
+        print(
+            "[SC_BEFORE_LLM] CUDA_DEVICE_ORDER=",
+            os.environ.get("CUDA_DEVICE_ORDER"),
+            flush=True,
+        )
 
     print(
         "[LMCache configuration] disk path:",
@@ -495,13 +367,13 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
     finally:
         LMCacheEngineBuilder.destroy(ENGINE_NAME)
 
-def _kvio_trace_enabled() -> bool:
-    return os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1"
+def _sc_io_trace_enabled() -> bool:
+    return _sc_env_flag("SC_LMCACHE_IO_TRACE_ENABLE", False)
 
 
-def _kvio_proc_io_snapshot() -> dict[str, int]:
+def _sc_io_proc_snapshot() -> dict[str, int]:
     values: dict[str, int] = {}
-    if not _kvio_trace_enabled():
+    if not _sc_io_trace_enabled():
         return values
     try:
         with open("/proc/self/io", "r", encoding="utf-8") as f:
@@ -509,7 +381,7 @@ def _kvio_proc_io_snapshot() -> dict[str, int]:
                 key, value = line.split(":", 1)
                 values[key.strip()] = int(value.strip())
     except Exception as exc:
-        print(f"[KVIO_DRIVER_PROC_IO_ERROR] error={exc!r}", flush=True)
+        print(f"[SC_IO_DRIVER_PROC_IO_ERROR] error={exc!r}", flush=True)
     return values
 
 
@@ -554,10 +426,10 @@ def generate_in_submission_batches(
 
         batch_start = time.time()
         batch_start_mono = time.monotonic()
-        batch_io_before = _kvio_proc_io_snapshot()
-        if _kvio_trace_enabled():
+        batch_io_before = _sc_io_proc_snapshot()
+        if _sc_io_trace_enabled():
             print(
-                "[KVIO_DRIVER_BATCH_START] "
+                "[SC_IO_DRIVER_BATCH_START] "
                 f"phase={phase_name} batch={batch_number}/{total_batches} "
                 f"requests={start_idx}:{end_idx} wall={batch_start:.6f} "
                 f"mono={batch_start_mono:.6f} proc_io={batch_io_before}",
@@ -572,14 +444,14 @@ def generate_in_submission_batches(
         batch_end = time.time()
         batch_end_mono = time.monotonic()
         batch_elapsed = batch_end - batch_start
-        batch_io_after = _kvio_proc_io_snapshot()
-        if _kvio_trace_enabled():
+        batch_io_after = _sc_io_proc_snapshot()
+        if _sc_io_trace_enabled():
             io_delta = {
                 key: batch_io_after.get(key, 0) - batch_io_before.get(key, 0)
                 for key in set(batch_io_before) | set(batch_io_after)
             }
             print(
-                "[KVIO_DRIVER_BATCH_DONE] "
+                "[SC_IO_DRIVER_BATCH_DONE] "
                 f"phase={phase_name} batch={batch_number}/{total_batches} "
                 f"requests={start_idx}:{end_idx} wall={batch_end:.6f} "
                 f"mono={batch_end_mono:.6f} elapsed={batch_end_mono - batch_start_mono:.6f} "
@@ -835,7 +707,7 @@ def main():
     if not args.question and not args.questions_json:
         raise ValueError("provide either --question or --questions_json")
     
-    _sr_start_monitor()
+    _sc_start_monitor()
     setup_environment_variables()
 
     questions = load_questions(args)
@@ -861,38 +733,12 @@ def main():
         retrieval_results,
         vllm_tokenizer,
     )
-    llm_inputs, prompt_records = reorder_requests(
+    llm_inputs, prompt_records = reorder_by_shared_passage_prefix(
         llm_inputs,
         prompt_records,
-        order_mode=args.request_order,
-        prefix_sort_depth=args.prefix_sort_depth,
-        seed=args.request_order_seed,
+        n=2,
     )
 
-    num_requests = len(llm_inputs)
-    if args.warm_order == "reverse":
-        warm_source_indices = list(range(num_requests - 1, -1, -1))
-    else:
-        warm_source_indices = list(range(num_requests))
-
-    warm_llm_inputs = [
-        llm_inputs[source_index]
-        for source_index in warm_source_indices
-    ]
-    warm_prompt_records = [
-        prompt_records[source_index]
-        for source_index in warm_source_indices
-    ]
-
-    print(
-        "Request ordering configuration: "
-        f"request_order={args.request_order}, "
-        f"prefix_sort_depth={args.prefix_sort_depth}, "
-        f"request_order_seed={args.request_order_seed}, "
-        f"warm_order={args.warm_order}, "
-        f"requests={num_requests}",
-        flush=True,
-    )
     print("retrieval and vLLM prompt construction finished", flush=True)
 
     node_features, edge_index, edge_weight, node_name_to_idx, passage_text_to_hash = (
@@ -931,24 +777,10 @@ def main():
         print("gnn_prediction has finished", flush=True)
         gnn_predictions.append(pred)
 
-    tiers_by_source_index = [
-        gnn_pred_to_block_tiers(pred)
-        for pred in gnn_predictions
-    ]
-
-    importance_sidecar = {}
-
-    # Cold runtime request IDs are 0 through N-1.
-    for source_index, tiers in enumerate(tiers_by_source_index):
-        importance_sidecar[str(source_index)] = tiers
-
-    # Warm runtime request IDs are N through 2N-1. Map each runtime position
-    # back to the source prompt whose GNN prediction belongs at that position.
-    for warm_position, source_index in enumerate(warm_source_indices):
-        runtime_request_id = num_requests + warm_position
-        importance_sidecar[str(runtime_request_id)] = (
-            tiers_by_source_index[source_index]
-        )
+    importance_sidecar = {
+        str(i): gnn_pred_to_block_tiers(pred)
+        for i, pred in enumerate(gnn_predictions)
+    } 
     importance_path = os.environ.get(
         "VLLM_KV_IMPORTANCE_TIERS",
         f"/tmp/kv_importance_tiers_{os.environ.get('USER', 'user')}_{os.environ.get('SLURM_JOB_ID', 'local')}.json",
@@ -975,7 +807,7 @@ def main():
 
     lmcache_connector = "LMCacheConnectorV1"
     os.environ["VLLM_KV_IMPORTANCE_TIERS"] = importance_path
-    os.environ["GNN_KV_BLOCK_SIZE"] = str(GNN_KV_BLOCK_SIZE)
+    os.environ["GNN_KV_BLOCK_SIZE"] = str(16)
     
     os.environ["VLLM_KV_IMPORTANCE_ENABLE"] = os.environ.get(
         "VLLM_KV_IMPORTANCE_ENABLE", "0"
@@ -989,10 +821,7 @@ def main():
         print(
             "Bounded submission configuration: "
             f"total_requests={len(llm_inputs)}, "
-            f"submission_batch_size={args.submission_batch_size}, "
-            f"max_num_seqs={os.environ.get('VLLM_MAX_NUM_SEQS', '4')}, "
-            f"request_order={args.request_order}, "
-            f"warm_order={args.warm_order}",
+            f"submission_batch_size={args.submission_batch_size}",
             flush=True,
         )
 
@@ -1012,27 +841,27 @@ def main():
             f"first generation took {cold_time_taken:.2f} seconds.",
             flush=True,
         )
-        if _kvio_trace_enabled():
+        if _sc_io_trace_enabled():
             print(
-                "[KVIO_PHASE_BOUNDARY] "
+                "[SC_IO_PHASE_BOUNDARY] "
                 f"phase=cold_done wall={time.time():.6f} "
-                f"mono={time.monotonic():.6f} proc_io={_kvio_proc_io_snapshot()}",
+                f"mono={time.monotonic():.6f} proc_io={_sc_io_proc_snapshot()}",
                 flush=True,
             )
 
         print("Warm run starting...", flush=True)
-        if _kvio_trace_enabled():
+        if _sc_io_trace_enabled():
             print(
-                "[KVIO_PHASE_BOUNDARY] "
+                "[SC_IO_PHASE_BOUNDARY] "
                 f"phase=warm_start wall={time.time():.6f} "
-                f"mono={time.monotonic():.6f} proc_io={_kvio_proc_io_snapshot()}",
+                f"mono={time.monotonic():.6f} proc_io={_sc_io_proc_snapshot()}",
                 flush=True,
             )
         warm_start = time.time()
 
-        warm_outputs_in_execution_order = generate_in_submission_batches(
+        warm_outputs = generate_in_submission_batches(
             llm=llm,
-            llm_inputs=warm_llm_inputs,
+            llm_inputs=llm_inputs,
             sampling_params=sampling_params,
             submission_batch_size=args.submission_batch_size,
             phase_name="warm",
@@ -1043,17 +872,6 @@ def main():
             f"Second generation took {warm_time_taken:.2f} seconds.",
             flush=True,
         )
-
-        warm_outputs = [None] * num_requests
-        for warm_position, source_index in enumerate(warm_source_indices):
-            warm_outputs[source_index] = (
-                warm_outputs_in_execution_order[warm_position]
-            )
-
-        if any(output is None for output in warm_outputs):
-            raise RuntimeError(
-                "Failed to restore warm outputs to cold/source request order"
-            )
 
         outputs = warm_outputs
         # start = warm_start
@@ -1074,3 +892,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
