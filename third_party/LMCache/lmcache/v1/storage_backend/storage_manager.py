@@ -38,6 +38,13 @@ from lmcache.v1.memory_management import (
     MemoryObj,
 )
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.sc_config import (
+    env_int,
+    io_trace_enabled,
+    load_trace_enabled,
+    lookup_trace_enabled,
+    worker_lookup_admission_enabled,
+)
 from lmcache.v1.storage_backend import CreateStorageBackends, is_cuda_worker
 from lmcache.v1.storage_backend.abstract_backend import (
     AllocatorBackendInterface,
@@ -54,25 +61,27 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# ===== SRIRAM LOOKUP DEBUG START =====
-import os as _sr_os
-import time as _sr_time
-import traceback as _sr_traceback
-from collections import defaultdict as _sr_defaultdict
+# ===== SC LOOKUP TRACE START =====
+import os as _sc_os
+import time as _sc_time
+import traceback as _sc_traceback
+from collections import defaultdict as _sc_defaultdict
 
-_SR_LOOKUP_SEEN = _sr_defaultdict(lambda: {"count": 0, "last": 0.0})
+_SC_LOOKUP_SEEN = _sc_defaultdict(lambda: {"count": 0, "last": 0.0})
 
 
-def _sr_lookup_debug(lookup_id, retrieved_length=None, extra=""):
+def _sc_lookup_trace(lookup_id, retrieved_length=None, extra=""):
+    if not lookup_trace_enabled():
+        return
     try:
-        now = _sr_time.time()
-        s = _SR_LOOKUP_SEEN[str(lookup_id)]
+        now = _sc_time.time()
+        s = _SC_LOOKUP_SEEN[str(lookup_id)]
         s["count"] += 1
         dt = now - s["last"] if s["last"] else 0.0
         s["last"] = now
 
         print(
-            f"[SRIRAM_LOOKUPDBG] pid={_sr_os.getpid()} lookup_id={lookup_id} "
+            f"[SC_LOOKUP_TRACE] pid={_sc_os.getpid()} lookup_id={lookup_id} "
             f"count={s['count']} dt={dt:.3f} retrieved_length={retrieved_length} "
             f"extra={extra}",
             flush=True,
@@ -80,13 +89,13 @@ def _sr_lookup_debug(lookup_id, retrieved_length=None, extra=""):
 
         if s["count"] in (2, 5, 10):
             print(
-                "[SRIRAM_LOOKUPDBG_STACK]\n"
-                + "".join(_sr_traceback.format_stack(limit=12)),
+                "[SC_LOOKUP_TRACE_STACK]\n"
+                + "".join(_sc_traceback.format_stack(limit=12)),
                 flush=True,
             )
     except Exception as e:
-        print(f"[SRIRAM_LOOKUPDBG_ERROR] {e!r}", flush=True)
-# ===== SRIRAM LOOKUP DEBUG END =====
+        print(f"[SC_LOOKUP_TRACE_ERROR] {e!r}", flush=True)
+# ===== SC LOOKUP TRACE END =====
 
 # Helper function to get the class name of the backend
 def get_backend_cname(backend: StorageBackendInterface) -> str:
@@ -218,13 +227,13 @@ class AsyncMultiSerializer:
         num_chunks: int,
         **kwargs: Any,
     ) -> Any:
-        trace_enabled = _sr_os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1"
-        lookup_id = kwargs.get("_kvio_lookup_id", "unknown")
-        backend_name = kwargs.get("_kvio_backend_name", "unknown")
-        queued_at = _sr_time.monotonic()
+        trace_enabled = io_trace_enabled()
+        lookup_id = kwargs.get("_sc_io_lookup_id", "unknown")
+        backend_name = kwargs.get("_sc_io_backend_name", "unknown")
+        queued_at = _sc_time.monotonic()
         if trace_enabled:
             logger.warning(
-                "[KVIO_MULTI_SERIALIZER_ENQUEUE] lookup_id=%s backend=%s "
+                "[SC_IO_MULTI_SERIALIZER_ENQUEUE] lookup_id=%s backend=%s "
                 "chunks=%d mono=%.6f",
                 lookup_id,
                 backend_name,
@@ -232,10 +241,10 @@ class AsyncMultiSerializer:
                 queued_at,
             )
         await self._sem.acquire(num_chunks)
-        acquired_at = _sr_time.monotonic()
+        acquired_at = _sc_time.monotonic()
         if trace_enabled:
             logger.warning(
-                "[KVIO_MULTI_SERIALIZER_ACQUIRE] lookup_id=%s backend=%s "
+                "[SC_IO_MULTI_SERIALIZER_ACQUIRE] lookup_id=%s backend=%s "
                 "chunks=%d queue_wait=%.6f",
                 lookup_id,
                 backend_name,
@@ -247,13 +256,13 @@ class AsyncMultiSerializer:
         finally:
             if trace_enabled:
                 logger.warning(
-                    "[KVIO_MULTI_SERIALIZER_RELEASE] lookup_id=%s backend=%s "
+                    "[SC_IO_MULTI_SERIALIZER_RELEASE] lookup_id=%s backend=%s "
                     "chunks=%d held=%.6f total=%.6f",
                     lookup_id,
                     backend_name,
                     num_chunks,
-                    _sr_time.monotonic() - acquired_at,
-                    _sr_time.monotonic() - queued_at,
+                    _sc_time.monotonic() - acquired_at,
+                    _sc_time.monotonic() - queued_at,
                 )
             await self._sem.release(num_chunks)
 
@@ -269,9 +278,9 @@ class AsyncSingleSerializer:
         # lazy init in run
         self.lock: Optional[asyncio.Lock] = None
         # Observability-only counters; they do not gate admission.
-        self._kvio_waiters = 0
-        self._kvio_active_lookup_id: Optional[str] = None
-        self._kvio_active_backend: Optional[str] = None
+        self._sc_io_waiters = 0
+        self._sc_io_active_lookup_id: Optional[str] = None
+        self._sc_io_active_backend: Optional[str] = None
 
     async def run(self, coro_fn: Coroutine[Any, Any, Any], *args, **kwargs) -> Any:
         # we need to lazily initialize the lock to
@@ -279,46 +288,46 @@ class AsyncSingleSerializer:
         if self.lock is None:
             self.lock = asyncio.Lock()
 
-        trace_enabled = _sr_os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1"
-        lookup_id = str(kwargs.get("_kvio_lookup_id", "unknown"))
-        backend_name = str(kwargs.get("_kvio_backend_name", "unknown"))
-        num_chunks = int(kwargs.get("_kvio_num_chunks", args[0] if args else -1))
-        queued_at = _sr_time.monotonic()
+        trace_enabled = io_trace_enabled()
+        lookup_id = str(kwargs.get("_sc_io_lookup_id", "unknown"))
+        backend_name = str(kwargs.get("_sc_io_backend_name", "unknown"))
+        num_chunks = int(kwargs.get("_sc_io_num_chunks", args[0] if args else -1))
+        queued_at = _sc_time.monotonic()
         acquired = False
 
         if trace_enabled:
-            self._kvio_waiters += 1
+            self._sc_io_waiters += 1
             logger.warning(
-                "[KVIO_SERIALIZER_ENQUEUE] lookup_id=%s backend=%s chunks=%d "
+                "[SC_IO_SERIALIZER_ENQUEUE] lookup_id=%s backend=%s chunks=%d "
                 "waiters=%d active_lookup_id=%s active_backend=%s mono=%.6f",
                 lookup_id,
                 backend_name,
                 num_chunks,
-                self._kvio_waiters,
-                self._kvio_active_lookup_id,
-                self._kvio_active_backend,
+                self._sc_io_waiters,
+                self._sc_io_active_lookup_id,
+                self._sc_io_active_backend,
                 queued_at,
             )
 
         try:
             async with self.lock:  # type: ignore
                 acquired = True
-                acquired_at = _sr_time.monotonic()
+                acquired_at = _sc_time.monotonic()
                 if trace_enabled:
-                    self._kvio_waiters -= 1
-                    previous_lookup_id = self._kvio_active_lookup_id
-                    previous_backend = self._kvio_active_backend
-                    self._kvio_active_lookup_id = lookup_id
-                    self._kvio_active_backend = backend_name
+                    self._sc_io_waiters -= 1
+                    previous_lookup_id = self._sc_io_active_lookup_id
+                    previous_backend = self._sc_io_active_backend
+                    self._sc_io_active_lookup_id = lookup_id
+                    self._sc_io_active_backend = backend_name
                     logger.warning(
-                        "[KVIO_SERIALIZER_ACQUIRE] lookup_id=%s backend=%s "
+                        "[SC_IO_SERIALIZER_ACQUIRE] lookup_id=%s backend=%s "
                         "chunks=%d queue_wait=%.6f waiters=%d "
                         "previous_lookup_id=%s previous_backend=%s",
                         lookup_id,
                         backend_name,
                         num_chunks,
                         acquired_at - queued_at,
-                        self._kvio_waiters,
+                        self._sc_io_waiters,
                         previous_lookup_id,
                         previous_backend,
                     )
@@ -326,31 +335,31 @@ class AsyncSingleSerializer:
                     return await coro_fn
                 finally:
                     if trace_enabled:
-                        now = _sr_time.monotonic()
+                        now = _sc_time.monotonic()
                         logger.warning(
-                            "[KVIO_SERIALIZER_RELEASE] lookup_id=%s backend=%s "
+                            "[SC_IO_SERIALIZER_RELEASE] lookup_id=%s backend=%s "
                             "chunks=%d held=%.6f total=%.6f waiters=%d",
                             lookup_id,
                             backend_name,
                             num_chunks,
                             now - acquired_at,
                             now - queued_at,
-                            self._kvio_waiters,
+                            self._sc_io_waiters,
                         )
-                        self._kvio_active_lookup_id = None
-                        self._kvio_active_backend = None
+                        self._sc_io_active_lookup_id = None
+                        self._sc_io_active_backend = None
         finally:
             if trace_enabled and not acquired:
-                self._kvio_waiters -= 1
+                self._sc_io_waiters -= 1
                 logger.warning(
-                    "[KVIO_SERIALIZER_WAIT_ENDED_WITHOUT_ACQUIRE] "
+                    "[SC_IO_SERIALIZER_WAIT_ENDED_WITHOUT_ACQUIRE] "
                     "lookup_id=%s backend=%s chunks=%d waited=%.6f "
                     "waiters=%d",
                     lookup_id,
                     backend_name,
                     num_chunks,
-                    _sr_time.monotonic() - queued_at,
-                    self._kvio_waiters,
+                    _sc_time.monotonic() - queued_at,
+                    self._sc_io_waiters,
                 )
 
 
@@ -411,33 +420,38 @@ class StorageManager:
         )
         self.async_serializer: Optional[AsyncSerializer] = None
 
-        # P0-A: admit async lookups before any backend pins keys or allocates
-        # staging buffers. A value of 0 disables P0-A and restores the
-        # original fire-and-forget async lookup/prefetch behavior.
-        self._p0_lookup_limit = int(
-            _sr_os.environ.get(
-                "LMCACHE_P0_LOOKUP_MAX_INFLIGHT",
-                "1",
-            )
+        # Optional worker-side admission before any backend pins keys or
+        # allocates staging buffers. This gate is independent from scheduler
+        # admission and disk-put admission.
+        self._sc_worker_lookup_admission_enabled = (
+            worker_lookup_admission_enabled()
         )
-        if self._p0_lookup_limit < 0:
+        self._sc_worker_lookup_limit = env_int(
+            "SC_LMCACHE_WORKER_LOOKUP_MAX_INFLIGHT", 1, minimum=0
+        )
+        if (
+            self._sc_worker_lookup_admission_enabled
+            and self._sc_worker_lookup_limit < 1
+        ):
             raise ValueError(
-                "LMCACHE_P0_LOOKUP_MAX_INFLIGHT must be >= 0, "
-                f"got {self._p0_lookup_limit}"
+                "SC_LMCACHE_WORKER_LOOKUP_MAX_INFLIGHT must be >= 1 "
+                "when worker lookup admission is enabled"
             )
-        self._p0_lookup_admission = (
-            asyncio.Semaphore(self._p0_lookup_limit)
-            if self._p0_lookup_limit > 0
+        self._sc_worker_lookup_admission = (
+            asyncio.Semaphore(self._sc_worker_lookup_limit)
+            if self._sc_worker_lookup_admission_enabled
             else None
         )
-        self._p0_lookup_inflight = 0
-        self._p0_lookup_waiters = 0
-        self._p0_lookup_peak = 0
+        self._sc_worker_lookup_inflight = 0
+        self._sc_worker_lookup_waiters = 0
+        self._sc_worker_lookup_peak = 0
 
-        logger.info(
-            "P0 worker lookup admission: limit=%d (0 disables P0-A)",
-            self._p0_lookup_limit,
-        )
+        if self._sc_worker_lookup_admission_enabled or io_trace_enabled():
+            logger.info(
+                "SC worker lookup admission: enabled=%s limit=%d",
+                self._sc_worker_lookup_admission_enabled,
+                self._sc_worker_lookup_limit,
+            )
 
         # The GPU stream for internal copies during put
         if is_cuda_worker(metadata):
@@ -709,99 +723,99 @@ class StorageManager:
             task = asyncio.run_coroutine_threadsafe(coro, self.loop)
             yield task
 
-    async def _p0_acquire_lookup_admission(self, lookup_id: str) -> bool:
-        """Acquire a lookup slot before contains(pin=True) can retain keys.
+    async def _sc_acquire_worker_lookup_admission(self, lookup_id: str) -> bool:
+        """Acquire a worker lookup slot before contains(pin=True).
 
-        Returns True only when a real P0-A permit was acquired. A configured
-        limit of 0 bypasses the gate and returns False.
+        Returns True only when the optional worker gate is enabled and a real
+        permit was acquired. A disabled gate returns False immediately.
         """
-        semaphore = self._p0_lookup_admission
+        semaphore = self._sc_worker_lookup_admission
         if semaphore is None:
             return False
 
-        queued_at = _sr_time.monotonic()
-        self._p0_lookup_waiters += 1
-        trace_enabled = _sr_os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1"
+        queued_at = _sc_time.monotonic()
+        self._sc_worker_lookup_waiters += 1
+        trace_enabled = io_trace_enabled()
 
         if trace_enabled:
             logger.warning(
-                "[P0_LOOKUP_ADMISSION_WAIT] pid=%d lookup_id=%s "
+                "[SC_WORKER_LOOKUP_ADMISSION_WAIT] pid=%d lookup_id=%s "
                 "limit=%d inflight=%d waiters=%d",
-                _sr_os.getpid(),
+                _sc_os.getpid(),
                 lookup_id,
-                self._p0_lookup_limit,
-                self._p0_lookup_inflight,
-                self._p0_lookup_waiters,
+                self._sc_worker_lookup_limit,
+                self._sc_worker_lookup_inflight,
+                self._sc_worker_lookup_waiters,
             )
 
         try:
             await semaphore.acquire()
         except BaseException:
-            self._p0_lookup_waiters -= 1
+            self._sc_worker_lookup_waiters -= 1
             if trace_enabled:
                 logger.warning(
-                    "[P0_LOOKUP_ADMISSION_ABORT] pid=%d lookup_id=%s "
+                    "[SC_WORKER_LOOKUP_ADMISSION_ABORT] pid=%d lookup_id=%s "
                     "waited=%.6f inflight=%d waiters=%d",
-                    _sr_os.getpid(),
+                    _sc_os.getpid(),
                     lookup_id,
-                    _sr_time.monotonic() - queued_at,
-                    self._p0_lookup_inflight,
-                    self._p0_lookup_waiters,
+                    _sc_time.monotonic() - queued_at,
+                    self._sc_worker_lookup_inflight,
+                    self._sc_worker_lookup_waiters,
                 )
             raise
 
-        self._p0_lookup_waiters -= 1
-        self._p0_lookup_inflight += 1
-        self._p0_lookup_peak = max(
-            self._p0_lookup_peak,
-            self._p0_lookup_inflight,
+        self._sc_worker_lookup_waiters -= 1
+        self._sc_worker_lookup_inflight += 1
+        self._sc_worker_lookup_peak = max(
+            self._sc_worker_lookup_peak,
+            self._sc_worker_lookup_inflight,
         )
         if trace_enabled:
             logger.warning(
-                "[P0_LOOKUP_ADMISSION_ACQUIRE] pid=%d lookup_id=%s "
+                "[SC_WORKER_LOOKUP_ADMISSION_ACQUIRE] pid=%d lookup_id=%s "
                 "waited=%.6f limit=%d inflight=%d waiters=%d peak=%d",
-                _sr_os.getpid(),
+                _sc_os.getpid(),
                 lookup_id,
-                _sr_time.monotonic() - queued_at,
-                self._p0_lookup_limit,
-                self._p0_lookup_inflight,
-                self._p0_lookup_waiters,
-                self._p0_lookup_peak,
+                _sc_time.monotonic() - queued_at,
+                self._sc_worker_lookup_limit,
+                self._sc_worker_lookup_inflight,
+                self._sc_worker_lookup_waiters,
+                self._sc_worker_lookup_peak,
             )
         return True
 
-    def _p0_release_lookup_admission(
+    def _sc_release_worker_lookup_admission(
         self,
         lookup_id: str,
         reason: str,
         admitted_at: float,
     ) -> None:
         """Release one lookup slot on the storage-manager event loop."""
-        semaphore = self._p0_lookup_admission
+        semaphore = self._sc_worker_lookup_admission
         if semaphore is None:
             return
 
-        self._p0_lookup_inflight -= 1
-        if self._p0_lookup_inflight < 0:
-            self._p0_lookup_inflight = 0
+        self._sc_worker_lookup_inflight -= 1
+        if self._sc_worker_lookup_inflight < 0:
+            self._sc_worker_lookup_inflight = 0
             raise RuntimeError(
-                f"P0 lookup admission underflow for lookup_id={lookup_id}"
+                f"SC worker lookup admission underflow for lookup_id={lookup_id}"
             )
         semaphore.release()
 
-        if _sr_os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
+        if io_trace_enabled():
             logger.warning(
-                "[P0_LOOKUP_ADMISSION_RELEASE] pid=%d lookup_id=%s "
+                "[SC_WORKER_LOOKUP_ADMISSION_RELEASE] pid=%d lookup_id=%s "
                 "reason=%s held=%.6f limit=%d inflight=%d "
                 "waiters=%d peak=%d",
-                _sr_os.getpid(),
+                _sc_os.getpid(),
                 lookup_id,
                 reason,
-                _sr_time.monotonic() - admitted_at,
-                self._p0_lookup_limit,
-                self._p0_lookup_inflight,
-                self._p0_lookup_waiters,
-                self._p0_lookup_peak,
+                _sc_time.monotonic() - admitted_at,
+                self._sc_worker_lookup_limit,
+                self._sc_worker_lookup_inflight,
+                self._sc_worker_lookup_waiters,
+                self._sc_worker_lookup_peak,
             )
 
     def prefetch_single_done_callback(
@@ -813,15 +827,17 @@ class StorageManager:
         started: float,
     ) -> None:
         """Log completion, partial completion, or failure of one tier load."""
-        elapsed = _sr_time.monotonic() - started
-        debug_enabled = _sr_os.environ.get("SRIRAM_KV_MEM_DEBUG", "0") == "1"
+        elapsed = _sc_time.monotonic() - started
+        trace_enabled = load_trace_enabled()
+        if not trace_enabled:
+            return
 
         if future.cancelled():
             logger.error(
-                "[KVDBG_LOAD_CANCELLED] "
+                "[SC_LOAD_CANCELLED] "
                 "pid=%d lookup_id=%s backend=%s "
                 "requested_keys=%d elapsed=%.3fs",
-                _sr_os.getpid(),
+                _sc_os.getpid(),
                 lookup_id,
                 backend_name,
                 len(keys),
@@ -834,18 +850,13 @@ class StorageManager:
             returned = len(results)
             none_count = sum(memory_obj is None for memory_obj in results)
 
-            if debug_enabled and (                
-                backend_name == "LocalDiskBackend"
-                or elapsed >= 1.0
-                or none_count > 0
-                or returned != len(keys)
-            ):
+            if trace_enabled:
                 logger.warning(
-                    "[KVDBG_LOAD_DONE] "
+                    "[SC_LOAD_DONE] "
                     "pid=%d lookup_id=%s backend=%s "
                     "requested_keys=%d returned=%d none=%d "
                     "partial=%s elapsed=%.3fs",
-                    _sr_os.getpid(),
+                    _sc_os.getpid(),
                     lookup_id,
                     backend_name,
                     len(keys),
@@ -856,10 +867,10 @@ class StorageManager:
                 )
         except Exception:
             logger.exception(
-                "[KVDBG_LOAD_FAILED] "
+                "[SC_LOAD_FAILED] "
                 "pid=%d lookup_id=%s backend=%s "
                 "requested_keys=%d elapsed=%.3fs",
-                _sr_os.getpid(),
+                _sc_os.getpid(),
                 lookup_id,
                 backend_name,
                 len(keys),
@@ -961,8 +972,7 @@ class StorageManager:
             f"Responding to scheduler for lookup id {lookup_id}"
             f" with retrieved length {retrieved_length}"
         )
-        if _sr_os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
-            _sr_lookup_debug(lookup_id, retrieved_length=retrieved_length, extra="responding_to_scheduler")
+        _sc_lookup_trace(lookup_id, retrieved_length=retrieved_length, extra="responding_to_scheduler")
         self.async_lookup_server.send_response_to_scheduler(lookup_id, retrieved_length)
 
     async def _async_lookup_and_prefetch_impl(
@@ -1026,19 +1036,19 @@ class StorageManager:
                 f"len(keys)={len(keys)} is not a multiple of "
                 f"keys_per_chunk={keys_per_chunk}"
             )
-        kvio_lookup_started = _sr_time.monotonic()
-        if _sr_os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
+        sc_io_lookup_started = _sc_time.monotonic()
+        if io_trace_enabled():
             logger.warning(
-                "[KVIO_STORAGE_LOOKUP_ENTER] pid=%d lookup_id=%s keys=%d "
+                "[SC_IO_STORAGE_LOOKUP_ENTER] pid=%d lookup_id=%s keys=%d "
                 "chunks=%d keys_per_chunk=%d pin=%s search_range=%s mono=%.6f",
-                _sr_os.getpid(),
+                _sc_os.getpid(),
                 lookup_id,
                 len(keys),
                 len(keys) // keys_per_chunk,
                 keys_per_chunk,
                 pin,
                 search_range,
-                kvio_lookup_started,
+                sc_io_lookup_started,
             )
 
         num_total_chunks = len(keys) // keys_per_chunk
@@ -1058,21 +1068,21 @@ class StorageManager:
         for backend_name, backend in self.get_active_storage_backends(
             search_range=search_range
         ):
-            contains_started = _sr_time.monotonic()
+            contains_started = _sc_time.monotonic()
             num_hit_keys_raw = await backend.batched_async_contains(
                 lookup_id, keys, pin
             )
-            if _sr_os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
+            if io_trace_enabled():
                 logger.warning(
-                    "[KVIO_CONTAINS_DONE] pid=%d lookup_id=%s backend=%s "
+                    "[SC_IO_CONTAINS_DONE] pid=%d lookup_id=%s backend=%s "
                     "input_keys=%d hit_keys_raw=%d pin=%s elapsed=%.6f",
-                    _sr_os.getpid(),
+                    _sc_os.getpid(),
                     lookup_id,
                     backend_name,
                     len(keys),
                     num_hit_keys_raw,
                     pin,
-                    _sr_time.monotonic() - contains_started,
+                    _sc_time.monotonic() - contains_started,
                 )
             # Round down to a whole-chunk boundary. If a backend has only
             # some of a chunk's per-layer keys (e.g., partial eviction),
@@ -1103,13 +1113,13 @@ class StorageManager:
                 "async_lookup_and_prefetch."
             )
             # num_hit_chunks is only used for the multi serializer
-            load_started = _sr_time.monotonic()
-            if _sr_os.environ.get("SRIRAM_KV_MEM_DEBUG", "0") == "1":
+            load_started = _sc_time.monotonic()
+            if load_trace_enabled():
                 logger.warning(
-                    "[KVDBG_LOAD_START] "
+                    "[SC_LOAD_START] "
                     "pid=%d lookup_id=%s backend=%s "
                     "hit_chunks=%d requested_keys=%d pin=%s",
-                    _sr_os.getpid(),
+                    _sc_os.getpid(),
                     lookup_id,
                     backend_name,
                     num_hit_chunks,
@@ -1124,9 +1134,9 @@ class StorageManager:
                     {"cum_chunk_lengths": cum_chunk_lengths[: num_hit_chunks + 1]},
                 ),
                 num_hit_chunks,
-                _kvio_lookup_id=lookup_id,
-                _kvio_backend_name=backend_name,
-                _kvio_num_chunks=num_hit_chunks,
+                _sc_io_lookup_id=lookup_id,
+                _sc_io_backend_name=backend_name,
+                _sc_io_num_chunks=num_hit_chunks,
             )
             loading_task = asyncio.create_task(get_coro)
             loading_task.add_done_callback(
@@ -1149,13 +1159,13 @@ class StorageManager:
 
         # If no chunks were hit across all backends, respond immediately and return.
         if num_total_hit_chunks == 0:
-            if _sr_os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
+            if io_trace_enabled():
                 logger.warning(
-                    "[KVIO_STORAGE_LOOKUP_NO_HIT] pid=%d lookup_id=%s "
+                    "[SC_IO_STORAGE_LOOKUP_NO_HIT] pid=%d lookup_id=%s "
                     "elapsed=%.6f",
-                    _sr_os.getpid(),
+                    _sc_os.getpid(),
                     lookup_id,
-                    _sr_time.monotonic() - kvio_lookup_started,
+                    _sc_time.monotonic() - sc_io_lookup_started,
                 )
             if self.async_lookup_server is not None:
                 self.async_lookup_server.send_response_to_scheduler(lookup_id, 0)
@@ -1186,15 +1196,15 @@ class StorageManager:
             lookup_id,
             all_done,
         )
-        if _sr_os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
+        if io_trace_enabled():
             logger.warning(
-                "[KVIO_STORAGE_EVENT_REGISTER] pid=%d lookup_id=%s "
+                "[SC_IO_STORAGE_EVENT_REGISTER] pid=%d lookup_id=%s "
                 "loading_tasks=%d expected_chunks=%s elapsed=%.6f",
-                _sr_os.getpid(),
+                _sc_os.getpid(),
                 lookup_id,
                 len(loading_tasks),
                 tier_expected_chunks,
-                _sr_time.monotonic() - kvio_lookup_started,
+                _sc_time.monotonic() - sc_io_lookup_started,
             )
 
         all_done.add_done_callback(
@@ -1207,10 +1217,10 @@ class StorageManager:
             )
         )
 
-        # When P0-A is enabled, keep its permit until physical prefetch work
-        # completes. When disabled, preserve vanilla LMCache's fire-and-forget
+        # When worker admission is enabled, keep its permit until physical
+        # prefetch work completes. When disabled, preserve vanilla LMCache's fire-and-forget
         # behavior and return immediately after registering callbacks.
-        if self._p0_lookup_admission is not None:
+        if self._sc_worker_lookup_admission is not None:
             await all_done
 
     async def async_lookup_and_prefetch(
@@ -1222,9 +1232,9 @@ class StorageManager:
         pin: bool = False,
         keys_per_chunk: int = 1,
     ) -> None:
-        """P0-A wrapper that bounds lookups before any pinning occurs."""
-        admitted = await self._p0_acquire_lookup_admission(lookup_id)
-        admitted_at = _sr_time.monotonic() if admitted else 0.0
+        """Optionally bound worker lookups before any pinning occurs."""
+        admitted = await self._sc_acquire_worker_lookup_admission(lookup_id)
+        admitted_at = _sc_time.monotonic() if admitted else 0.0
         try:
             await self._async_lookup_and_prefetch_impl(
                 lookup_id,
@@ -1236,7 +1246,7 @@ class StorageManager:
             )
         finally:
             if admitted:
-                self._p0_release_lookup_admission(
+                self._sc_release_worker_lookup_admission(
                     lookup_id,
                     reason="prefetch_complete_or_exit",
                     admitted_at=admitted_at,

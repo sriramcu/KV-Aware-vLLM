@@ -22,21 +22,26 @@ from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor
 from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.pin_monitor import PinMonitor
+from lmcache.v1.sc_config import (
+    env_float,
+    memory_snapshot_enabled,
+    memory_trace_enabled,
+)
 from lmcache.v1.system_detection import NUMAMapping
 import lmcache.c_ops as lmc_ops
 
 logger = init_logger(__name__)
 
-# ===== SRIRAM DEBUG START =====
-import os as _sr_os
-import time as _sr_time
-import traceback as _sr_traceback
-import subprocess as _sr_subprocess
-import shutil as _sr_shutil
-import resource as _sr_resource
+# ===== SC MEMORY SNAPSHOT START =====
+import os as _sc_os
+import time as _sc_time
+import traceback as _sc_traceback
+import subprocess as _sc_subprocess
+import shutil as _sc_shutil
+import resource as _sc_resource
 
 
-def _sr_read_file(path):
+def _sc_read_file(path):
     try:
         with open(path, "r") as f:
             return f.read().strip()
@@ -44,7 +49,7 @@ def _sr_read_file(path):
         return "NA"
 
 
-def _sr_proc_mem():
+def _sc_proc_mem():
     status = {}
     try:
         with open("/proc/self/status", "r") as f:
@@ -57,25 +62,25 @@ def _sr_proc_mem():
     return status
 
 
-def _sr_cgroup_mem():
+def _sc_cgroup_mem():
     candidates = [
         "/sys/fs/cgroup/memory.current",
         "/sys/fs/cgroup/memory.max",
         "/sys/fs/cgroup/memory/memory.usage_in_bytes",
         "/sys/fs/cgroup/memory/memory.limit_in_bytes",
     ]
-    return {p: _sr_read_file(p) for p in candidates if _sr_os.path.exists(p)}
+    return {p: _sc_read_file(p) for p in candidates if _sc_os.path.exists(p)}
 
 
-def _sr_disk(path):
+def _sc_disk(path):
     try:
-        u = _sr_shutil.disk_usage(path)
+        u = _sc_shutil.disk_usage(path)
         return f"{path}: used={u.used/1024**3:.1f}G free={u.free/1024**3:.1f}G total={u.total/1024**3:.1f}G"
     except Exception as e:
         return f"{path}: disk_error={e!r}"
 
 
-def _sr_gpu_mem():
+def _sc_gpu_mem():
     parts = []
     try:
         import torch
@@ -93,13 +98,13 @@ def _sr_gpu_mem():
         parts.append(f"torch_cuda_error={e!r}")
 
     try:
-        out = _sr_subprocess.check_output(
+        out = _sc_subprocess.check_output(
             [
                 "nvidia-smi",
                 "--query-gpu=index,memory.used,memory.free,memory.total,utilization.gpu",
                 "--format=csv,noheader,nounits",
             ],
-            stderr=_sr_subprocess.STDOUT,
+            stderr=_sc_subprocess.STDOUT,
             timeout=3,
             text=True,
         )
@@ -110,7 +115,7 @@ def _sr_gpu_mem():
     return " ".join(parts)
 
 
-def _sr_obj_summary(obj):
+def _sc_obj_summary(obj):
     vals = []
     for name in (
         "ref_count",
@@ -131,29 +136,31 @@ def _sr_obj_summary(obj):
     return " ".join(vals)
 
 
-def _sr_mem_snapshot(tag, obj=None, extra="", stack=False):
+def _sc_memory_snapshot(tag, obj=None, extra="", stack=False, force=False):
+    if not force and not memory_snapshot_enabled():
+        return
     try:
-        pid = _sr_os.getpid()
-        host = _sr_proc_mem()
-        cg = _sr_cgroup_mem()
-        ru = _sr_resource.getrusage(_sr_resource.RUSAGE_SELF).ru_maxrss
+        pid = _sc_os.getpid()
+        host = _sc_proc_mem()
+        cg = _sc_cgroup_mem()
+        ru = _sc_resource.getrusage(_sc_resource.RUSAGE_SELF).ru_maxrss
         msg = (
-            f"[SRIRAM_MEMDBG] {tag} "
-            f"t={_sr_time.time():.3f} pid={pid} "
+            f"[SC_MEMORY_SNAPSHOT] {tag} "
+            f"t={_sc_time.time():.3f} pid={pid} "
             f"host={host} ru_maxrss_kb={ru} cgroup={cg} "
-            f"tmp={_sr_disk('/tmp')} shm={_sr_disk('/dev/shm')} "
-            f"lmcache_disk={_sr_disk(_sr_os.environ.get('SRIRAM_LMCACHE_DIR', '/tmp'))} "
-            f"gpu={_sr_gpu_mem()} "
+            f"tmp={_sc_disk('/tmp')} shm={_sc_disk('/dev/shm')} "
+            f"lmcache_disk={_sc_disk((_sc_os.environ.get('SC_LMCACHE_DATA_DIR') or '/tmp'))} "
+            f"gpu={_sc_gpu_mem()} "
             f"obj_id={id(obj) if obj is not None else None} "
-            f"obj={_sr_obj_summary(obj) if obj is not None else ''} "
+            f"obj={_sc_obj_summary(obj) if obj is not None else ''} "
             # f"extra={extra}"
         )
         print(msg, flush=True)
         if stack:
-            print("[SRIRAM_MEMDBG_STACK]\n" + "".join(_sr_traceback.format_stack(limit=12)), flush=True)
+            print("[SC_MEMORY_SNAPSHOT_STACK]\n" + "".join(_sc_traceback.format_stack(limit=12)), flush=True)
     except Exception as e:
-        print(f"[SRIRAM_MEMDBG_ERROR] tag={tag} err={e!r}", flush=True)
-# ===== SRIRAM DEBUG END =====
+        print(f"[SC_MEMORY_SNAPSHOT_ERROR] tag={tag} err={e!r}", flush=True)
+# ===== SC MEMORY SNAPSHOT END =====
 
 
 # Helper functions for thread safety
@@ -710,9 +717,9 @@ class TensorMemoryObj(MemoryObj):
         self.lock = threading.Lock()
         self.parent_allocator = parent_allocator
 
-        # SRIRAM DEBUG: lifetime of the outermost pin and ref_count > 1 state.
-        self._sr_pin_started: Optional[float] = None
-        self._sr_ref_gt1_started: Optional[float] = None
+        # SC memory tracing: lifetime of the outermost pin and ref_count > 1 state.
+        self._sc_pin_started: Optional[float] = None
+        self._sc_ref_gt1_started: Optional[float] = None
         # Calculate the prefix sum of the group sizes
         # If there are two groups, the prefix sum will be
         # [0, size_of_group_1, size_of_group_1 + size_of_group_2]
@@ -780,9 +787,9 @@ class TensorMemoryObj(MemoryObj):
         with self.lock:
             if (
                 self.meta.ref_count == 1
-                and self._sr_ref_gt1_started is None
+                and self._sc_ref_gt1_started is None
             ):
-                self._sr_ref_gt1_started = _sr_time.monotonic()
+                self._sc_ref_gt1_started = _sc_time.monotonic()
             self.meta.ref_count += 1
 
     def ref_count_down(self):
@@ -790,29 +797,26 @@ class TensorMemoryObj(MemoryObj):
             self.meta.ref_count -= 1
 
             if self.meta.ref_count == 1:
-                started = self._sr_ref_gt1_started
-                self._sr_ref_gt1_started = None
+                started = self._sc_ref_gt1_started
+                self._sc_ref_gt1_started = None
                 if started is not None:
-                    age = _sr_time.monotonic() - started
-                    threshold = float(
-                        _sr_os.environ.get("SRIRAM_LONG_REF_SECONDS", "10")
+                    age = _sc_time.monotonic() - started
+                    threshold = env_float(
+                        "SC_LMCACHE_LONG_REF_THRESHOLD_S", 10.0, minimum=0.0
                     )
-                    if (
-                        _sr_os.environ.get("SRIRAM_KV_MEM_DEBUG", "0") == "1"
-                        and age >= threshold
-                    ):
+                    if memory_trace_enabled() and age >= threshold:
                         logger.warning(
-                            "[KVDBG_LONG_REF] "
+                            "[SC_MEMORY_LONG_REF] "
                             "pid=%d address=%s size=%.3fMiB "
                             "age=%.3fs pin_count=%d",
-                            _sr_os.getpid(),
+                            _sc_os.getpid(),
                             self.meta.address,
                             self.meta.phy_size / 1024**2,
                             age,
                             self.meta.pin_count,
                         )
             elif self.meta.ref_count < 1:
-                self._sr_ref_gt1_started = None
+                self._sc_ref_gt1_started = None
 
             if self.meta.ref_count < 0:
                 logger.warning(
@@ -843,7 +847,7 @@ class TensorMemoryObj(MemoryObj):
             # if pin_count is 0, indicates that the object is pinned for the first time
             if self.meta.pin_count == 0:
                 TensorMemoryObj.monitor.update_pinned_memory_objs_count(1)
-                self._sr_pin_started = _sr_time.monotonic()
+                self._sc_pin_started = _sc_time.monotonic()
 
             self.meta.pin_count += 1
 
@@ -860,22 +864,19 @@ class TensorMemoryObj(MemoryObj):
             if self.meta.pin_count == 0:
                 TensorMemoryObj.monitor.update_pinned_memory_objs_count(-1)
 
-                started = self._sr_pin_started
-                self._sr_pin_started = None
+                started = self._sc_pin_started
+                self._sc_pin_started = None
                 if started is not None:
-                    age = _sr_time.monotonic() - started
-                    threshold = float(
-                        _sr_os.environ.get("SRIRAM_LONG_PIN_SECONDS", "10")
+                    age = _sc_time.monotonic() - started
+                    threshold = env_float(
+                        "SC_LMCACHE_LONG_PIN_THRESHOLD_S", 10.0, minimum=0.0
                     )
-                    if (
-                        _sr_os.environ.get("SRIRAM_KV_MEM_DEBUG", "0") == "1"
-                        and age >= threshold
-                    ):
+                    if memory_trace_enabled() and age >= threshold:
                         logger.warning(
-                            "[KVDBG_LONG_PIN] "
+                            "[SC_MEMORY_LONG_PIN] "
                             "pid=%d address=%s size=%.3fMiB "
                             "age=%.3fs ref_count=%d",
-                            _sr_os.getpid(),
+                            _sc_os.getpid(),
                             self.meta.address,
                             self.meta.phy_size / 1024**2,
                             age,

@@ -10,25 +10,18 @@
 #SBATCH --cpus-per-task=16
 
 set -euxo pipefail
-export PYTHONPATH=/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM:${PYTHONPATH:-}
+REPO=/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
+export PYTHONPATH="$REPO:${PYTHONPATH:-}"
+if [[ "${SC_LMCACHE_SOURCE_DEFAULT_KNOBS:-1}" == "1" ]]; then
+  # Existing environment values win over defaults in this file.
+  source "$REPO/local_repro/sc_lmcache_knobs.sh"
+fi
 export PYTHONFAULTHANDLER=1
-export SRIRAM_STACK_DUMP_INTERVAL=120
-export SRIRAM_KV_IO_TRACE=0
-export SRIRAM_KV_MEM_DEBUG=0
-
-export LMCACHE_P0_CLIENT_LOOKUP_ADMISSION_TIMEOUT_MS=0 # default
-export LMCACHE_P0_CLIENT_LOOKUP_MAX_INFLIGHT=0 
-export LMCACHE_P0_LOOKUP_MAX_INFLIGHT=0  # default 4
-export LMCACHE_P0_DISK_PUT_MAX_PENDING=0 # default 8
 export MAX_QUESTIONS=250
-# export SUBMISSION_BATCH_SIZE="$MAX_QUESTIONS"
 export SUBMISSION_BATCH_SIZE=50
 # export CUDA_DEVICE_ORDER=PCI_BUS_ID
 # export CUDA_VISIBLE_DEVICES=0
-
-
-
 export DATASET_NAME="medical"
 
 mkdir -p /mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/logs
-/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM/local_repro/run_driver.sh with_gnn 2>&1
+"$REPO/local_repro/run_driver.sh" with_gnn 2>&1

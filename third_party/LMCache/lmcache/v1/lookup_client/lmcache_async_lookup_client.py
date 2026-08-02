@@ -21,6 +21,11 @@ from lmcache.v1.lookup_client.async_lookup_message import (
     LookupResponseMsg,
 )
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.sc_config import (
+    env_int,
+    io_trace_enabled,
+    scheduler_lookup_admission_enabled,
+)
 from lmcache.v1.rpc_utils import (
     get_zmq_context,
     get_zmq_rpc_path_lmcache,
@@ -28,10 +33,6 @@ from lmcache.v1.rpc_utils import (
 )
 
 logger = init_logger(__name__)
-
-
-def _kvio_trace_enabled() -> bool:
-    return os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1"
 
 
 # NOTE(Jiayi): Prefetch could load extra redundant cache if multiple
@@ -61,8 +62,8 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
         self.first_lookup_time: dict[str, float] = {}
         # Observability-only timestamps/counters. They do not participate in
         # timeout, cleanup, or scheduling decisions.
-        self._kvio_lookup_start_mono: dict[str, float] = {}
-        self._kvio_poll_count: dict[str, int] = {}
+        self._sc_lookup_start_mono: dict[str, float] = {}
+        self._sc_lookup_poll_count: dict[str, int] = {}
         self.config = config
 
         self.ctx = get_zmq_context(use_asyncio=False)
@@ -135,54 +136,46 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
         # (e.g., worker process).
         self.lock = threading.Lock()
 
-        # P0 Gate C: scheduler-side admission before a logical lookup is
-        # registered as pending and before messages are sent to workers.
-        #
-        # By default, reuse the worker-side P0-A limit so one knob can bound
-        # both logical lookups and per-rank pre-pin work. Set the client-specific
-        # value to 0 to disable only Gate C while leaving worker P0-A enabled.
-        client_limit_raw = os.environ.get(
-            "LMCACHE_P0_CLIENT_LOOKUP_MAX_INFLIGHT",
-            os.environ.get("LMCACHE_P0_LOOKUP_MAX_INFLIGHT", "0"),
+        # Optional scheduler-side admission before a logical lookup is
+        # registered as pending or dispatched to workers. This gate is fully
+        # independent from worker-side lookup admission.
+        self._sc_scheduler_lookup_admission_enabled = (
+            scheduler_lookup_admission_enabled()
         )
-        self._p0_client_lookup_limit = int(client_limit_raw)
-        if self._p0_client_lookup_limit < 0:
-            raise ValueError(
-                "LMCACHE_P0_CLIENT_LOOKUP_MAX_INFLIGHT must be >= 0, "
-                f"got {self._p0_client_lookup_limit}"
-            )
-
-        self._p0_client_lookup_wait_ms = int(
-            os.environ.get(
-                "LMCACHE_P0_CLIENT_LOOKUP_ADMISSION_TIMEOUT_MS",
-                "0",
-            )
+        self._sc_scheduler_lookup_limit = env_int(
+            "SC_LMCACHE_SCHEDULER_LOOKUP_MAX_INFLIGHT", 4, minimum=0
         )
-        if self._p0_client_lookup_wait_ms < 0:
+        if (
+            self._sc_scheduler_lookup_admission_enabled
+            and self._sc_scheduler_lookup_limit < 1
+        ):
             raise ValueError(
-                "LMCACHE_P0_CLIENT_LOOKUP_ADMISSION_TIMEOUT_MS must be >= 0, "
-                f"got {self._p0_client_lookup_wait_ms}"
+                "SC_LMCACHE_SCHEDULER_LOOKUP_MAX_INFLIGHT must be >= 1 "
+                "when scheduler lookup admission is enabled"
             )
-
-        self._p0_client_lookup_admission = (
-            threading.BoundedSemaphore(self._p0_client_lookup_limit)
-            if self._p0_client_lookup_limit > 0
+        self._sc_scheduler_lookup_wait_ms = env_int(
+            "SC_LMCACHE_SCHEDULER_LOOKUP_ADMISSION_WAIT_MS", 0, minimum=0
+        )
+        self._sc_scheduler_lookup_admission = (
+            threading.BoundedSemaphore(self._sc_scheduler_lookup_limit)
+            if self._sc_scheduler_lookup_admission_enabled
             else None
         )
-        self._p0_client_lookup_state_lock = threading.Lock()
-        self._p0_client_lookup_admitted: set[str] = set()
-        self._p0_client_lookup_admitted_at: dict[str, float] = {}
-        self._p0_client_lookup_inflight = 0
-        self._p0_client_lookup_waiters = 0
-        self._p0_client_lookup_peak = 0
-        self._kvio_lookup_offer_mono: dict[str, float] = {}
+        self._sc_scheduler_lookup_state_lock = threading.Lock()
+        self._sc_scheduler_lookup_admitted: set[str] = set()
+        self._sc_scheduler_lookup_admitted_at: dict[str, float] = {}
+        self._sc_scheduler_lookup_inflight = 0
+        self._sc_scheduler_lookup_waiters = 0
+        self._sc_scheduler_lookup_peak = 0
+        self._sc_lookup_offer_mono: dict[str, float] = {}
 
-        logger.info(
-            "P0 client lookup admission: limit=%d wait_ms=%d "
-            "(0 limit disables Gate C)",
-            self._p0_client_lookup_limit,
-            self._p0_client_lookup_wait_ms,
-        )
+        if self._sc_scheduler_lookup_admission_enabled or io_trace_enabled():
+            logger.info(
+                "SC scheduler lookup admission: enabled=%s limit=%d wait_ms=%d",
+                self._sc_scheduler_lookup_admission_enabled,
+                self._sc_scheduler_lookup_limit,
+                self._sc_scheduler_lookup_wait_ms,
+            )
 
         # map from lookup_id (i.e., req_id) to req's status.
         # None indicates ongoing.
@@ -214,65 +207,65 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
                 config.extra_config.get("lookup_backoff_time", self.lookup_backoff_time)
             )
 
-    def _p0_try_admit_client_lookup(self, lookup_id: str) -> bool:
-        """Acquire Gate C before creating/sending worker lookup work.
+    def _sc_try_admit_scheduler_lookup(self, lookup_id: str) -> bool:
+        """Acquire optional scheduler admission before dispatching lookup work.
 
         The permit remains held until every configured lookup worker responds.
-        In particular, a scheduler-side lookup timeout does not release it,
-        because the underlying worker read is still unfinished without P0-D.
+        A scheduler-side lookup timeout does not release it because the worker
+        read remains unfinished without worker-side cancellation support.
         """
-        semaphore = self._p0_client_lookup_admission
+        semaphore = self._sc_scheduler_lookup_admission
         if semaphore is None:
             return True
 
         started = time.monotonic()
-        with self._p0_client_lookup_state_lock:
-            self._p0_client_lookup_waiters += 1
-            inflight = self._p0_client_lookup_inflight
-            waiters = self._p0_client_lookup_waiters
+        with self._sc_scheduler_lookup_state_lock:
+            self._sc_scheduler_lookup_waiters += 1
+            inflight = self._sc_scheduler_lookup_inflight
+            waiters = self._sc_scheduler_lookup_waiters
 
-        if _kvio_trace_enabled():
+        if io_trace_enabled():
             logger.warning(
-                "[P0_CLIENT_LOOKUP_ADMISSION_WAIT] pid=%d lookup_id=%s "
+                "[SC_SCHEDULER_LOOKUP_ADMISSION_WAIT] pid=%d lookup_id=%s "
                 "limit=%d inflight=%d waiters=%d timeout_ms=%d",
                 os.getpid(),
                 lookup_id,
-                self._p0_client_lookup_limit,
+                self._sc_scheduler_lookup_limit,
                 inflight,
                 waiters,
-                self._p0_client_lookup_wait_ms,
+                self._sc_scheduler_lookup_wait_ms,
             )
 
         acquired = semaphore.acquire(
-            timeout=self._p0_client_lookup_wait_ms / 1000.0
+            timeout=self._sc_scheduler_lookup_wait_ms / 1000.0
         )
         waited = time.monotonic() - started
 
-        with self._p0_client_lookup_state_lock:
-            self._p0_client_lookup_waiters -= 1
+        with self._sc_scheduler_lookup_state_lock:
+            self._sc_scheduler_lookup_waiters -= 1
             if acquired:
-                if lookup_id in self._p0_client_lookup_admitted:
+                if lookup_id in self._sc_scheduler_lookup_admitted:
                     # Defensive: a logical lookup must own at most one permit.
                     semaphore.release()
                     raise RuntimeError(
-                        f"Gate C duplicate admission for lookup_id={lookup_id}"
+                        f"scheduler lookup admission duplicate admission for lookup_id={lookup_id}"
                     )
-                self._p0_client_lookup_admitted.add(lookup_id)
-                self._p0_client_lookup_admitted_at[lookup_id] = time.monotonic()
-                self._p0_client_lookup_inflight += 1
-                self._p0_client_lookup_peak = max(
-                    self._p0_client_lookup_peak,
-                    self._p0_client_lookup_inflight,
+                self._sc_scheduler_lookup_admitted.add(lookup_id)
+                self._sc_scheduler_lookup_admitted_at[lookup_id] = time.monotonic()
+                self._sc_scheduler_lookup_inflight += 1
+                self._sc_scheduler_lookup_peak = max(
+                    self._sc_scheduler_lookup_peak,
+                    self._sc_scheduler_lookup_inflight,
                 )
-            inflight = self._p0_client_lookup_inflight
-            waiters = self._p0_client_lookup_waiters
-            peak = self._p0_client_lookup_peak
+            inflight = self._sc_scheduler_lookup_inflight
+            waiters = self._sc_scheduler_lookup_waiters
+            peak = self._sc_scheduler_lookup_peak
 
-        if _kvio_trace_enabled():
+        if io_trace_enabled():
             marker = (
-                "P0_CLIENT_LOOKUP_ADMISSION_ACQUIRE"
+                "SC_SCHEDULER_LOOKUP_ADMISSION_ACQUIRE"
                 if acquired
-                else "P0_CLIENT_LOOKUP_ADMISSION_REJECT"
+                else "SC_SCHEDULER_LOOKUP_ADMISSION_REJECT"
             )
             logger.warning(
                 "[%s] pid=%d lookup_id=%s waited=%.6f limit=%d "
@@ -281,47 +274,47 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
                 os.getpid(),
                 lookup_id,
                 waited,
-                self._p0_client_lookup_limit,
+                self._sc_scheduler_lookup_limit,
                 inflight,
                 waiters,
                 peak,
-                self._p0_client_lookup_wait_ms,
+                self._sc_scheduler_lookup_wait_ms,
             )
 
         return acquired
 
-    def _p0_release_client_lookup(self, lookup_id: str, reason: str) -> bool:
-        """Release one Gate C permit after logical worker completion."""
-        semaphore = self._p0_client_lookup_admission
+    def _sc_release_scheduler_lookup(self, lookup_id: str, reason: str) -> bool:
+        """Release one scheduler-admission permit after worker completion."""
+        semaphore = self._sc_scheduler_lookup_admission
         if semaphore is None:
             return False
 
-        with self._p0_client_lookup_state_lock:
-            if lookup_id not in self._p0_client_lookup_admitted:
+        with self._sc_scheduler_lookup_state_lock:
+            if lookup_id not in self._sc_scheduler_lookup_admitted:
                 return False
-            self._p0_client_lookup_admitted.remove(lookup_id)
-            admitted_at = self._p0_client_lookup_admitted_at.pop(lookup_id, None)
-            self._p0_client_lookup_inflight -= 1
-            inflight = self._p0_client_lookup_inflight
-            waiters = self._p0_client_lookup_waiters
-            peak = self._p0_client_lookup_peak
+            self._sc_scheduler_lookup_admitted.remove(lookup_id)
+            admitted_at = self._sc_scheduler_lookup_admitted_at.pop(lookup_id, None)
+            self._sc_scheduler_lookup_inflight -= 1
+            inflight = self._sc_scheduler_lookup_inflight
+            waiters = self._sc_scheduler_lookup_waiters
+            peak = self._sc_scheduler_lookup_peak
 
         semaphore.release()
 
-        if _kvio_trace_enabled():
+        if io_trace_enabled():
             held = (
                 time.monotonic() - admitted_at
                 if admitted_at is not None
                 else -1.0
             )
             logger.warning(
-                "[P0_CLIENT_LOOKUP_ADMISSION_RELEASE] pid=%d lookup_id=%s "
+                "[SC_SCHEDULER_LOOKUP_ADMISSION_RELEASE] pid=%d lookup_id=%s "
                 "reason=%s held=%.6f limit=%d inflight=%d waiters=%d peak=%d",
                 os.getpid(),
                 lookup_id,
                 reason,
                 held,
-                self._p0_client_lookup_limit,
+                self._sc_scheduler_lookup_limit,
                 inflight,
                 waiters,
                 peak,
@@ -342,19 +335,19 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
 
         if req_status == -1:
             offer_mono = time.monotonic()
-            self._kvio_lookup_offer_mono.setdefault(lookup_id, offer_mono)
+            self._sc_lookup_offer_mono.setdefault(lookup_id, offer_mono)
 
-            # Gate C is intentionally before pending-state creation, the
-            # retrieval timeout, and worker message dispatch. A rejected
+            # Scheduler admission is intentionally before pending-state creation,
+            # the retrieval timeout, and worker dispatch. A rejected
             # lookup is cached as a zero-token result so repeated scheduler
             # probes remain idempotent until update_state_after_alloc clears it.
-            if not self._p0_try_admit_client_lookup(lookup_id):
+            if not self._sc_try_admit_scheduler_lookup(lookup_id):
                 with self.lock:
                     self.reqs_status[lookup_id] = 0
                     pending = sum(v is None for v in self.reqs_status.values())
-                if _kvio_trace_enabled():
+                if io_trace_enabled():
                     logger.warning(
-                        "[KVIO_LOOKUP_ADMISSION_BYPASS] lookup_id=%s "
+                        "[SC_IO_LOOKUP_ADMISSION_BYPASS] lookup_id=%s "
                         "offer_age=%.6f status=0 pending=%d",
                         lookup_id,
                         time.monotonic() - offer_mono,
@@ -364,12 +357,12 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
 
             with self.lock:
                 self.reqs_status[lookup_id] = None
-                self._kvio_poll_count[lookup_id] = 0
+                self._sc_lookup_poll_count[lookup_id] = 0
                 pending = sum(v is None for v in self.reqs_status.values())
                 aborted = len(self.aborted_lookups)
-            if _kvio_trace_enabled():
+            if io_trace_enabled():
                 logger.warning(
-                    "[KVIO_LOOKUP_STATUS_CREATE] lookup_id=%s "
+                    "[SC_IO_LOOKUP_STATUS_CREATE] lookup_id=%s "
                     "mono=%.6f pending=%d aborted=%d timer_started=0",
                     lookup_id,
                     offer_mono,
@@ -380,26 +373,26 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
 
         if req_status is None:
             with self.lock:
-                # Preserve the existing polling behavior. Gate C only changes
+                # Preserve the existing polling behavior. scheduler lookup admission only changes
                 # when the retrieval clock begins, not the polling cadence.
                 req_status = self.reqs_status.get(lookup_id, -1)
                 if req_status is not None:
                     return req_status
-                self._kvio_poll_count[lookup_id] = (
-                    self._kvio_poll_count.get(lookup_id, 0) + 1
+                self._sc_lookup_poll_count[lookup_id] = (
+                    self._sc_lookup_poll_count.get(lookup_id, 0) + 1
                 )
                 time.sleep(self.lookup_backoff_time)
 
                 lookup_started = self.first_lookup_time.get(lookup_id)
                 if lookup_started is None:
-                    # Gate C admitted the logical lookup, but lookup() has not
+                    # Scheduler admission accepted the logical lookup, but lookup() has not
                     # started dispatch yet. The retrieval timer is not running.
                     return None
 
                 if (
                     time.monotonic() - lookup_started
                 ) * 1000 > self.config.lookup_timeout_ms:
-                    age = time.monotonic() - self._kvio_lookup_start_mono.get(
+                    age = time.monotonic() - self._sc_lookup_start_mono.get(
                         lookup_id, time.monotonic()
                     )
                     logger.warning(
@@ -411,14 +404,14 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
                         lookup_id,
                         self.config.lookup_timeout_ms // 1000,
                     )
-                    if _kvio_trace_enabled():
+                    if io_trace_enabled():
                         logger.warning(
-                            "[KVIO_LOOKUP_TIMEOUT] lookup_id=%s age=%.6f "
+                            "[SC_IO_LOOKUP_TIMEOUT] lookup_id=%s age=%.6f "
                             "polls=%d pending=%d aborted_before=%d "
                             "partial_worker_responses=%d/%d",
                             lookup_id,
                             age,
-                            self._kvio_poll_count.get(lookup_id, 0),
+                            self._sc_lookup_poll_count.get(lookup_id, 0),
                             sum(v is None for v in self.reqs_status.values()),
                             len(self.aborted_lookups),
                             len(self.res_for_each_worker.get(lookup_id, [])),
@@ -459,21 +452,21 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
 
             dispatch_mono = time.monotonic()
             with self.lock:
-                if self._p0_client_lookup_admission is not None and (
-                    lookup_id not in self._p0_client_lookup_admitted
+                if self._sc_scheduler_lookup_admission is not None and (
+                    lookup_id not in self._sc_scheduler_lookup_admitted
                 ):
                     raise RuntimeError(
-                        f"Gate C permit missing for lookup_id={lookup_id}"
+                        f"scheduler lookup admission permit missing for lookup_id={lookup_id}"
                     )
-                # lookup_timeout_ms starts only after Gate C admission and
+                # lookup_timeout_ms starts only after scheduler admission and
                 # immediately before dispatching the lookup to workers.
                 self.first_lookup_time[lookup_id] = dispatch_mono
-                self._kvio_lookup_start_mono[lookup_id] = dispatch_mono
-                self._kvio_poll_count[lookup_id] = 1
+                self._sc_lookup_start_mono[lookup_id] = dispatch_mono
+                self._sc_lookup_poll_count[lookup_id] = 1
 
-            if _kvio_trace_enabled():
+            if io_trace_enabled():
                 logger.warning(
-                    "[KVIO_LOOKUP_REQUEST_SEND] lookup_id=%s hashes=%d "
+                    "[SC_IO_LOOKUP_REQUEST_SEND] lookup_id=%s hashes=%d "
                     "offset_tokens=%d workers=%d msg_bytes=%d mono=%.6f "
                     "offer_wait=%.6f",
                     lookup_id,
@@ -483,7 +476,7 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
                     len(msg_buf),
                     dispatch_mono,
                     dispatch_mono
-                    - self._kvio_lookup_offer_mono.get(lookup_id, dispatch_mono),
+                    - self._sc_lookup_offer_mono.get(lookup_id, dispatch_mono),
                 )
 
             for i in range(self.world_size):
@@ -492,10 +485,10 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
             time.sleep(self.lookup_backoff_time)
             return None
         except Exception:
-            # Gate C owns no worker-side cancellation policy. This release only
+            # Scheduler admission owns no worker-side cancellation policy. This release only
             # prevents a client permit leak when lookup construction/dispatch
             # itself fails before normal all-worker completion accounting.
-            self._p0_release_client_lookup(lookup_id, reason="dispatch_error")
+            self._sc_release_scheduler_lookup(lookup_id, reason="dispatch_error")
             with self.lock:
                 self.reqs_status[lookup_id] = 0
                 self.first_lookup_time.pop(lookup_id, None)
@@ -517,15 +510,15 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
                         self.res_for_each_worker[lookup_id].append(res)
                     all_res = self.res_for_each_worker[lookup_id]
 
-                    if _kvio_trace_enabled():
+                    if io_trace_enabled():
                         logger.warning(
-                            "[KVIO_LOOKUP_WORKER_RESPONSE] lookup_id=%s "
+                            "[SC_IO_LOOKUP_WORKER_RESPONSE] lookup_id=%s "
                             "response_index=%d/%d tokens=%d age=%.6f aborted=%s",
                             lookup_id,
                             len(all_res),
                             self.world_size,
                             res,
-                            time.monotonic() - self._kvio_lookup_start_mono.get(
+                            time.monotonic() - self._sc_lookup_start_mono.get(
                                 lookup_id, time.monotonic()
                             ),
                             lookup_id in self.aborted_lookups,
@@ -539,19 +532,19 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
                         # can use the minimum value as the number of
                         # hit tokens.
                         self.reqs_status[lookup_id] = min(all_res)
-                        self._p0_release_client_lookup(
+                        self._sc_release_scheduler_lookup(
                             lookup_id, reason="all_worker_responses"
                         )
-                        if _kvio_trace_enabled():
+                        if io_trace_enabled():
                             logger.warning(
-                                "[KVIO_LOOKUP_ALL_RESPONSES] lookup_id=%s "
+                                "[SC_IO_LOOKUP_ALL_RESPONSES] lookup_id=%s "
                                 "worker_tokens=%s min_tokens=%d age=%.6f "
                                 "aborted=%s",
                                 lookup_id,
                                 all_res,
                                 min(all_res),
                                 time.monotonic()
-                                - self._kvio_lookup_start_mono.get(
+                                - self._sc_lookup_start_mono.get(
                                     lookup_id, time.monotonic()
                                 ),
                                 lookup_id in self.aborted_lookups,
@@ -562,13 +555,13 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
 
     def clear_lookup_status(self, lookup_id: str) -> None:
         with self.lock:
-            if _kvio_trace_enabled():
+            if io_trace_enabled():
                 logger.warning(
-                    "[KVIO_LOOKUP_STATUS_CLEAR] lookup_id=%s age=%.6f "
+                    "[SC_IO_LOOKUP_STATUS_CLEAR] lookup_id=%s age=%.6f "
                     "status=%s aborted=%s",
                     lookup_id,
                     time.monotonic()
-                    - self._kvio_lookup_start_mono.get(
+                    - self._sc_lookup_start_mono.get(
                         lookup_id, time.monotonic()
                     ),
                     self.reqs_status.get(lookup_id),
@@ -576,19 +569,19 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
                 )
             self.reqs_status.pop(lookup_id, None)
             self.first_lookup_time.pop(lookup_id, None)
-            self._kvio_lookup_start_mono.pop(lookup_id, None)
-            self._kvio_lookup_offer_mono.pop(lookup_id, None)
-            self._kvio_poll_count.pop(lookup_id, None)
+            self._sc_lookup_start_mono.pop(lookup_id, None)
+            self._sc_lookup_offer_mono.pop(lookup_id, None)
+            self._sc_lookup_poll_count.pop(lookup_id, None)
 
     def cancel_lookup(self, lookup_id: str) -> None:
         """Mark lookup as aborted. Cleanup will happen after task finishes."""
-        if _kvio_trace_enabled():
+        if io_trace_enabled():
             logger.warning(
-                "[KVIO_LOOKUP_MARK_ABORTED] lookup_id=%s age=%.6f "
+                "[SC_IO_LOOKUP_MARK_ABORTED] lookup_id=%s age=%.6f "
                 "aborted_before=%d",
                 lookup_id,
                 time.monotonic()
-                - self._kvio_lookup_start_mono.get(
+                - self._sc_lookup_start_mono.get(
                     lookup_id, time.monotonic()
                 ),
                 len(self.aborted_lookups),
@@ -605,9 +598,9 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
             if self.reqs_status.get(lookup_id) is not None
         ]
         if finished_lookups:
-            if _kvio_trace_enabled():
+            if io_trace_enabled():
                 logger.warning(
-                    "[KVIO_LOOKUP_CLEANUP_READY] lookup_ids=%s "
+                    "[SC_IO_LOOKUP_CLEANUP_READY] lookup_ids=%s "
                     "remaining_aborted_before=%d",
                     finished_lookups,
                     len(self.aborted_lookups),
@@ -627,13 +620,13 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
         for i in range(self.world_size):
             self.push_sockets[i].send(msg_buf, copy=False)
         logger.debug("Sent cleanup message for lookup_id=%s", lookup_id)
-        if _kvio_trace_enabled():
+        if io_trace_enabled():
             logger.warning(
-                "[KVIO_LOOKUP_CLEANUP_SEND] lookup_id=%s workers=%d age=%.6f",
+                "[SC_IO_LOOKUP_CLEANUP_SEND] lookup_id=%s workers=%d age=%.6f",
                 lookup_id,
                 self.world_size,
                 time.monotonic()
-                - self._kvio_lookup_start_mono.get(
+                - self._sc_lookup_start_mono.get(
                     lookup_id, time.monotonic()
                 ),
             )

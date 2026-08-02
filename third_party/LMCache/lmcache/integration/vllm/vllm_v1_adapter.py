@@ -44,6 +44,10 @@ from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import validate_and_set_config_value
 from lmcache.v1.manager import LMCacheManager
+from lmcache.v1.sc_config import (
+    request_trace_enabled,
+    tier_trace_enabled,
+)
 
 if TYPE_CHECKING:
     # Third Party
@@ -59,28 +63,30 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# ===== SRIRAM REQ LOOP DEBUG START =====
-import os as _sr_os
-import time as _sr_time
-import traceback as _sr_traceback
-import builtins as _sr_builtins
-from collections import defaultdict as _sr_defaultdict
+# ===== SC REQUEST TRACE START =====
+import os as _sc_os
+import time as _sc_time
+import traceback as _sc_traceback
+import builtins as _sc_builtins
+from collections import defaultdict as _sc_defaultdict
 
-if not hasattr(_sr_builtins, "_SR_REQ_SEEN"):
-    _sr_builtins._SR_REQ_SEEN = _sr_defaultdict(lambda: {"count": 0, "last": 0.0})
+if not hasattr(_sc_builtins, "_SC_REQUEST_TRACE_STATE"):
+    _sc_builtins._SC_REQUEST_TRACE_STATE = _sc_defaultdict(lambda: {"count": 0, "last": 0.0})
 
 
-def _sr_req_loop_debug(req_id, total_tokens=None, computed=None, hit=None, need=None, extra=""):
+def _sc_request_trace(req_id, total_tokens=None, computed=None, hit=None, need=None, extra=""):
+    if not request_trace_enabled():
+        return
     try:
-        now = _sr_time.time()
-        table = _sr_builtins._SR_REQ_SEEN
+        now = _sc_time.time()
+        table = _sc_builtins._SC_REQUEST_TRACE_STATE
         s = table[str(req_id)]
         s["count"] += 1
         dt = now - s["last"] if s["last"] else 0.0
         s["last"] = now
 
         print(
-            f"[SRIRAM_REQDBG] pid={_sr_os.getpid()} req_id={req_id} "
+            f"[SC_REQUEST_TRACE] pid={_sc_os.getpid()} req_id={req_id} "
             f"count={s['count']} dt={dt:.3f} "
             f"total={total_tokens} computed={computed} hit={hit} need={need} "
             f"extra={extra}",
@@ -89,13 +95,13 @@ def _sr_req_loop_debug(req_id, total_tokens=None, computed=None, hit=None, need=
 
         if s["count"] in (2, 5, 10, 20, 50, 100):
             print(
-                "[SRIRAM_REQDBG_STACK]\n"
-                + "".join(_sr_traceback.format_stack(limit=18)),
+                "[SC_REQUEST_TRACE_STACK]\n"
+                + "".join(_sc_traceback.format_stack(limit=18)),
                 flush=True,
             )
     except Exception as e:
-        print(f"[SRIRAM_REQDBG_ERROR] {e!r}", flush=True)
-# ===== SRIRAM REQ LOOP DEBUG END =====
+        print(f"[SC_REQUEST_TRACE_ERROR] {e!r}", flush=True)
+# ===== SC REQUEST TRACE END =====
 @dataclass
 class LoadSpec:
     # Number of tokens cached in vLLM
@@ -527,9 +533,9 @@ class LMCacheConnectorV1Impl:
             VLLM_VERSION,
             getattr(self.lmcache_engine, "metadata", None),
         )
-        if os.environ.get("SRIRAM_TIER_DEBUG", "0") == "1":
+        if tier_trace_enabled():
             logger.warning(
-                "[SC] ACTIVE PATCHED ADAPTER file=%s gnn_enabled=%s tiers_file=%s",
+                "[SC_TIER_TRACE] ACTIVE PATCHED ADAPTER file=%s gnn_enabled=%s tiers_file=%s",
                 __file__,
                 os.environ.get("VLLM_KV_IMPORTANCE_ENABLE"),
                 os.environ.get("VLLM_KV_IMPORTANCE_TIERS"),
@@ -639,11 +645,12 @@ class LMCacheConnectorV1Impl:
                 )
                 return {}
 
-            logger.warning(
-                "[SC] Loaded importance tiers path=%s requests=%d",
-                path,
-                len(data),
-            )
+            if tier_trace_enabled():
+                logger.warning(
+                    "[SC_TIER_TRACE] Loaded importance tiers path=%s requests=%d",
+                    path,
+                    len(data),
+                )
             return data
         except Exception as error:
             logger.warning(
@@ -671,9 +678,9 @@ class LMCacheConnectorV1Impl:
                 tiers = candidate_tiers
                 matched_key = candidate_id
                 break
-        if os.environ.get("SRIRAM_TIER_DEBUG", "0") == "1":
+        if tier_trace_enabled():
             logger.warning(
-                "[SC] tier lookup req_id=%s matched_key=%s blocks=%d",
+                "[SC_TIER_TRACE] tier lookup req_id=%s matched_key=%s blocks=%d",
                 full_req_id,
                 matched_key,
                 len(tiers),
@@ -708,8 +715,8 @@ class LMCacheConnectorV1Impl:
         """Choose one LMCache destination for each LMCache chunk."""
         block_tiers = self._get_request_block_tiers(req_id)
         if not block_tiers:
-            if os.environ.get("SRIRAM_TIER_DEBUG", "0") == "1":
-                logger.warning("[SC] No block tiers found for request %s", req_id)
+            if tier_trace_enabled():
+                logger.warning("[SC_TIER_TRACE] No block tiers found for request %s", req_id)
             return None
 
         gnn_block_size = int(os.environ.get("GNN_KV_BLOCK_SIZE", "16"))
@@ -736,9 +743,9 @@ class LMCacheConnectorV1Impl:
             target_locations.append(
                 self._tier_to_lmcache_location(target_tier)
             )
-        if os.environ.get("SRIRAM_TIER_DEBUG", "0") == "1":
+        if tier_trace_enabled():
             logger.warning(
-                "[SC] req_id=%s target_tiers_count=%d sample=%s",
+                "[SC_TIER_TRACE] req_id=%s target_tiers_count=%d sample=%s",
                 req_id,
                 len(target_locations),
                 target_locations[:8],
@@ -1607,15 +1614,14 @@ class LMCacheConnectorV1Impl:
                 min_retrieve,
             )
         else:
-            if os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
-                _sr_req_loop_debug(
-                    req_id,
-                    total_tokens=request.num_tokens,
-                    computed=num_computed_tokens,
-                    hit=num_external_hit_tokens,
-                    need=max(need_to_allocate, 0),
-                    extra="before/after get_num_new_matched_tokens",
-                )
+            _sc_request_trace(
+                req_id,
+                total_tokens=request.num_tokens,
+                computed=num_computed_tokens,
+                hit=num_external_hit_tokens,
+                need=max(need_to_allocate, 0),
+                extra="before/after get_num_new_matched_tokens",
+            )
             logger.info(
                 "Reqid: %s, Total tokens %d, Inference Engine computed tokens: %d, "
                 "LMCache hit tokens: %d, need to load: %d",

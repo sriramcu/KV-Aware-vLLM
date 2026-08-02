@@ -83,5 +83,9 @@ def request_trace_enabled() -> bool:
     return env_flag("SC_LMCACHE_REQUEST_TRACE_ENABLE")
 
 
+def tier_trace_enabled() -> bool:
+    return env_flag("SC_LMCACHE_TIER_TRACE_ENABLE")
+
+
 def gpu_assert_snapshot_enabled() -> bool:
     return env_flag("SC_LMCACHE_GPU_ASSERT_SNAPSHOT_ENABLE")

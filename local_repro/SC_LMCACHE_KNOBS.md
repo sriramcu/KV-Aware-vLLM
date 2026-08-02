@@ -51,7 +51,8 @@ while scheduler admission and disk-put admission remain disabled.
 | `SC_LMCACHE_MEMORY_SNAPSHOT_ENABLE` | `0` | Heavy process/cgroup/GPU/disk snapshot on explicit diagnostic calls. |
 | `SC_LMCACHE_LOOKUP_TRACE_ENABLE` | `0` | Repeated worker lookup response trace and selected stacks. |
 | `SC_LMCACHE_REQUEST_TRACE_ENABLE` | `0` | Repeated vLLM request matching trace and selected stacks. |
-| `SC_LMCACHE_GPU_ASSERT_SNAPSHOT_ENABLE` | `0` | Heavy snapshot immediately before the GPU connector tensor assertion. |
+| `SC_LMCACHE_TIER_TRACE_ENABLE` | `0` | GNN sidecar matching, chunk-tier aggregation, and targeted-placement diagnostics. |
+| `SC_LMCACHE_GPU_ASSERT_SNAPSHOT_ENABLE` | `0` | Heavy snapshot immediately before the GPU connector tensor assertion; independent of the general memory-snapshot flag. |
 | `SC_DRIVER_RESOURCE_MONITOR_ENABLE` | `0` | Periodic driver-level process/GPU/disk monitor. |
 
 Related thresholds:
@@ -78,6 +79,7 @@ Related thresholds:
 | `SRIRAM_KV_MEM_DEBUG_INTERVAL_S` | `SC_LMCACHE_MEMORY_TRACE_INTERVAL_S` |
 | `SRIRAM_LONG_PIN_SECONDS` | `SC_LMCACHE_LONG_PIN_THRESHOLD_S` |
 | `SRIRAM_LONG_REF_SECONDS` | `SC_LMCACHE_LONG_REF_THRESHOLD_S` |
+| `SRIRAM_TIER_DEBUG` | `SC_LMCACHE_TIER_TRACE_ENABLE` |
 | `SRIRAM_LMCACHE_DIR` | `SC_LMCACHE_DATA_DIR` |
 | `[SRIRAM_MONITOR]` | `[SC_DRIVER_MONITOR]` controlled by `SC_DRIVER_RESOURCE_MONITOR_ENABLE` |
 

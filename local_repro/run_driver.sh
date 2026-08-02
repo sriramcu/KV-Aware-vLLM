@@ -17,13 +17,14 @@ RUN_ROOT="$HOME_DIR/runs/kvaware_repro"
 
 DATASET_NAME="${DATASET_NAME:-hotpotqa}"
 MAX_QUESTIONS="${MAX_QUESTIONS:-250}"
-# SUBMISSION_BATCH_SIZE="${MAX_QUESTIONS:-25}"
+SUBMISSION_BATCH_SIZE="${SUBMISSION_BATCH_SIZE:-8}"
 QUESTIONS_JSON="$REPO/Hierarchical_KV/LinearRAG/dataset/${DATASET_NAME}/questions.json"
 
 source "$HOME_DIR/venvs/kvaware/bin/activate"
 
-export SRIRAM_LONG_PIN_SECONDS=10
-export SRIRAM_LONG_REF_SECONDS=10
+# LMCache experiment controls are intentionally not hard-coded here. The
+# supplied sbatch files source local_repro/sc_lmcache_knobs.sh by default;
+# caller-provided SC_* values take precedence there.
 
 mkdir -p "$RUN_ROOT/logs"
 mkdir -p "$RUN_ROOT/sidecars"
@@ -55,11 +56,12 @@ JOB_TAG="${DATASET_NAME}_${MODE}_${SLURM_JOB_ID:-manual}"
 
 export VLLM_KV_IMPORTANCE_TIERS="$RUN_ROOT/sidecars/kv_importance_tiers_${JOB_TAG}.json"
 
-mkdir -p "$RUN_ROOT/lmcache_vllm"
-mkdir -p "$RUN_ROOT/lmcache_hit_hook"
-mkdir -p "$RUN_ROOT/prometheus_vllm"
+# An empty value from the shared knobs file means to use this job-specific path.
+export SC_LMCACHE_DATA_DIR="${SC_LMCACHE_DATA_DIR:-$RUN_ROOT/lmcache_vllm/${JOB_TAG}}"
+export LMCACHE_HOOK_LOG_DIR="$RUN_ROOT/lmcache_hit_hook/${JOB_TAG}"
+export PROMETHEUS_MULTIPROC_DIR="$RUN_ROOT/prometheus_vllm/${JOB_TAG}"
 
-# delete old jobs' cache dirs if no other job is running
+# Delete old jobs' cache directories only when no other user job is running.
 if [[ "${CLEAN_OLD_LMCACHE:-1}" == "1" ]]; then
   if squeue -u "$USER" -h | grep -v "${SLURM_JOB_ID:-NO_CURRENT_JOB}" | grep -q .; then
     echo "Other jobs are running; not deleting old LMCache caches."
@@ -72,15 +74,12 @@ if [[ "${CLEAN_OLD_LMCACHE:-1}" == "1" ]]; then
   fi
 fi
 
-export SRIRAM_LMCACHE_DIR="$RUN_ROOT/lmcache_vllm/${JOB_TAG}"
-export LMCACHE_HOOK_LOG_DIR="$RUN_ROOT/lmcache_hit_hook/${JOB_TAG}"
-export PROMETHEUS_MULTIPROC_DIR="$RUN_ROOT/prometheus_vllm/${JOB_TAG}"
+# Preserve the existing fresh-per-job behavior.
+rm -rf "$SC_LMCACHE_DATA_DIR" "$LMCACHE_HOOK_LOG_DIR" "$PROMETHEUS_MULTIPROC_DIR"
+mkdir -p "$SC_LMCACHE_DATA_DIR" "$LMCACHE_HOOK_LOG_DIR" "$PROMETHEUS_MULTIPROC_DIR"
 
-rm -rf "$SRIRAM_LMCACHE_DIR" "$LMCACHE_HOOK_LOG_DIR" "$PROMETHEUS_MULTIPROC_DIR"
-mkdir -p "$SRIRAM_LMCACHE_DIR" "$LMCACHE_HOOK_LOG_DIR" "$PROMETHEUS_MULTIPROC_DIR"
-
-# Use short node-local path only for sockets/temp files.
-export TMPDIR="/tmp/sr_${SLURM_JOB_ID:-manual}"
+# Use a short node-local path only for sockets and temporary files.
+export TMPDIR="/tmp/sc_${SLURM_JOB_ID:-manual}"
 export TEMP="$TMPDIR"
 export TMP="$TMPDIR"
 rm -rf "$TMPDIR"
@@ -97,20 +96,15 @@ echo "MAX_QUESTIONS=$MAX_QUESTIONS"
 echo "QUESTIONS_JSON=$QUESTIONS_JSON"
 echo "VLLM_KV_IMPORTANCE_ENABLE=$VLLM_KV_IMPORTANCE_ENABLE"
 echo "VLLM_KV_IMPORTANCE_TIERS=$VLLM_KV_IMPORTANCE_TIERS"
-echo "SRIRAM_LMCACHE_DIR=$SRIRAM_LMCACHE_DIR"
+echo "SC_LMCACHE_DATA_DIR=$SC_LMCACHE_DATA_DIR"
 echo "LMCACHE_HOOK_LOG_DIR=$LMCACHE_HOOK_LOG_DIR"
 echo "PROMETHEUS_MULTIPROC_DIR=$PROMETHEUS_MULTIPROC_DIR"
 echo "TMPDIR=$TMPDIR"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
 echo "CUDA_DEVICE_ORDER=${CUDA_DEVICE_ORDER:-unset}"
-echo "SRIRAM_KV_MEM_DEBUG=$SRIRAM_KV_MEM_DEBUG"
-echo "SRIRAM_KV_MEM_DEBUG_INTERVAL_S=${SRIRAM_KV_MEM_DEBUG_INTERVAL_S:-5}"
-echo "SRIRAM_KV_IO_TRACE=$SRIRAM_KV_IO_TRACE"
-echo "SRIRAM_LONG_PIN_SECONDS=$SRIRAM_LONG_PIN_SECONDS"
-echo "SRIRAM_LONG_REF_SECONDS=$SRIRAM_LONG_REF_SECONDS"
 echo "SUBMISSION_BATCH_SIZE=$SUBMISSION_BATCH_SIZE"
-echo "LMCACHE_P0_LOOKUP_MAX_INFLIGHT=$LMCACHE_P0_LOOKUP_MAX_INFLIGHT"
-echo "LMCACHE_P0_DISK_PUT_MAX_PENDING=$LMCACHE_P0_DISK_PUT_MAX_PENDING"
+echo "=== SC LMCACHE KNOBS ==="
+env | LC_ALL=C sort | grep '^SC_' || true
 
 if [[ ! -f "$QUESTIONS_JSON" ]]; then
   echo "Missing questions file: $QUESTIONS_JSON"
@@ -163,7 +157,7 @@ else:
 PY
 
 echo "=== CACHE SIZE ==="
-# du -sh "$SRIRAM_LMCACHE_DIR" || true
+du -sh "$SC_LMCACHE_DATA_DIR" || true
 
 echo "=== DONE ==="
 date

@@ -19,6 +19,12 @@ from lmcache.v1.cache_controller.message import OpType
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.sc_config import (
+    disk_put_admission_enabled,
+    env_int,
+    io_trace_enabled,
+    load_trace_enabled,
+)
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
 from lmcache.v1.storage_backend.batched_message_sender import BatchedMessageSender
 from lmcache.v1.storage_backend.cache_policy import get_cache_policy
@@ -35,13 +41,9 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _kvio_trace_enabled() -> bool:
-    return os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1"
-
-
-def _kvio_proc_io_snapshot() -> dict[str, int]:
+def _sc_io_proc_snapshot() -> dict[str, int]:
     values: dict[str, int] = {}
-    if not _kvio_trace_enabled():
+    if not io_trace_enabled():
         return values
     try:
         with open("/proc/self/io", "r", encoding="utf-8") as f:
@@ -49,11 +51,11 @@ def _kvio_proc_io_snapshot() -> dict[str, int]:
                 key, value = line.split(":", 1)
                 values[key.strip()] = int(value.strip())
     except Exception as exc:
-        logger.warning("[KVIO_PROC_IO_ERROR] pid=%d error=%r", os.getpid(), exc)
+        logger.warning("[SC_IO_PROC_IO_ERROR] pid=%d error=%r", os.getpid(), exc)
     return values
 
 
-def _kvio_io_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, int]:
+def _sc_io_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, int]:
     return {
         key: after.get(key, 0) - before.get(key, 0)
         for key in set(before) | set(after)
@@ -74,63 +76,62 @@ class LocalDiskWorker:
         self.loop = loop
         self._closed = False
         # Observability-only counters. They do not gate or reorder work.
-        self._kvio_state_lock = threading.Lock()
-        self._kvio_active = {"prefetch": 0, "put": 0, "delete": 0}
+        self._sc_io_state_lock = threading.Lock()
+        self._sc_io_active = {"prefetch": 0, "put": 0, "delete": 0}
 
-        # P0-B: bound disk puts before LocalDiskBackend takes an extra
-        # MemoryObj ref and before work enters the executor's unbounded queue.
-        # A value of 0 disables P0-B.
-        self._p0_put_limit = int(
-            os.environ.get(
-                "LMCACHE_P0_DISK_PUT_MAX_PENDING",
-                "8",
-            )
+        # Optional disk-put admission before LocalDiskBackend takes an extra
+        # MemoryObj reference or submits work to the executor queue.
+        self._sc_disk_put_admission_enabled = disk_put_admission_enabled()
+        self._sc_disk_put_limit = env_int(
+            "SC_LMCACHE_DISK_PUT_MAX_PENDING", 8, minimum=0
         )
-        if self._p0_put_limit < 0:
+        if self._sc_disk_put_admission_enabled and self._sc_disk_put_limit < 1:
             raise ValueError(
-                "LMCACHE_P0_DISK_PUT_MAX_PENDING must be >= 0, "
-                f"got {self._p0_put_limit}"
+                "SC_LMCACHE_DISK_PUT_MAX_PENDING must be >= 1 "
+                "when disk-put admission is enabled"
             )
-        self._p0_put_admission = (
-            threading.BoundedSemaphore(self._p0_put_limit)
-            if self._p0_put_limit > 0
+        self._sc_disk_put_admission = (
+            threading.BoundedSemaphore(self._sc_disk_put_limit)
+            if self._sc_disk_put_admission_enabled
             else None
         )
-        self._p0_put_state_lock = threading.Lock()
-        self._p0_put_inflight = 0
-        self._p0_put_waiters = 0
-        self._p0_put_peak = 0
+        self._sc_disk_put_state_lock = threading.Lock()
+        self._sc_disk_put_inflight = 0
+        self._sc_disk_put_waiters = 0
+        self._sc_disk_put_peak = 0
 
-        logger.info(
-            "P0 disk put admission: limit=%d (0 disables P0-B)",
-            self._p0_put_limit,
-        )
+        if self._sc_disk_put_admission_enabled or io_trace_enabled():
+            logger.info(
+                "SC disk-put admission: enabled=%s limit=%d",
+                self._sc_disk_put_admission_enabled,
+                self._sc_disk_put_limit,
+            )
 
-    def acquire_put_admission(self, key: CacheEngineKey) -> bool:
+    def acquire_disk_put_admission(self, key: CacheEngineKey) -> bool:
         """Block before ref_count_up until one bounded put slot is free.
 
         A disabled gate returns True immediately so callers continue through
         the original LMCache write path without admission throttling.
         """
-        semaphore = self._p0_put_admission
+        semaphore = self._sc_disk_put_admission
         if semaphore is None:
             return True
 
         queued_at = time.monotonic()
-        trace_enabled = _kvio_trace_enabled()
-        with self._p0_put_state_lock:
-            self._p0_put_waiters += 1
-            waiters = self._p0_put_waiters
-            inflight = self._p0_put_inflight
+        trace_enabled = io_trace_enabled()
+        with self._sc_disk_put_state_lock:
+            self._sc_disk_put_waiters += 1
+            waiters = self._sc_disk_put_waiters
+            inflight = self._sc_disk_put_inflight
 
         if trace_enabled:
             logger.warning(
-                "[P0_PUT_ADMISSION_WAIT] pid=%d key_hash=%s "
+                "[SC_DISK_PUT_ADMISSION_WAIT] pid=%d key_hash=%s "
                 "limit=%d inflight=%d waiters=%d queue_depth=%d "
                 "thread=%s",
                 os.getpid(),
                 key.chunk_hash,
-                self._p0_put_limit,
+                self._sc_disk_put_limit,
                 inflight,
                 waiters,
                 self.executor._queue.qsize(),
@@ -148,58 +149,60 @@ class LocalDiskWorker:
         if on_event_loop:
             acquired = semaphore.acquire(blocking=False)
             if not acquired:
-                with self._p0_put_state_lock:
-                    self._p0_put_waiters -= 1
-                    waiters = self._p0_put_waiters
-                    inflight = self._p0_put_inflight
-                logger.error(
-                    "[P0_PUT_ADMISSION_REJECT_LOOP_THREAD] "
-                    "pid=%d key_hash=%s waited=%.6f limit=%d "
-                    "inflight=%d waiters=%d queue_depth=%d",
-                    os.getpid(),
-                    key.chunk_hash,
-                    time.monotonic() - queued_at,
-                    self._p0_put_limit,
-                    inflight,
-                    waiters,
-                    self.executor._queue.qsize(),
-                )
+                with self._sc_disk_put_state_lock:
+                    self._sc_disk_put_waiters -= 1
+                    waiters = self._sc_disk_put_waiters
+                    inflight = self._sc_disk_put_inflight
+                if trace_enabled:
+                    logger.error(
+                        "[SC_DISK_PUT_ADMISSION_REJECT_LOOP_THREAD] "
+                        "pid=%d key_hash=%s waited=%.6f limit=%d "
+                        "inflight=%d waiters=%d queue_depth=%d",
+                        os.getpid(),
+                        key.chunk_hash,
+                        time.monotonic() - queued_at,
+                        self._sc_disk_put_limit,
+                        inflight,
+                        waiters,
+                        self.executor._queue.qsize(),
+                    )
                 return False
         else:
             while not semaphore.acquire(timeout=5.0):
-                logger.warning(
-                    "[P0_PUT_ADMISSION_STALLED] pid=%d key_hash=%s "
-                    "waited=%.6f limit=%d queue_depth=%d "
-                    "put_tasks=%d thread=%s",
-                    os.getpid(),
-                    key.chunk_hash,
-                    time.monotonic() - queued_at,
-                    self._p0_put_limit,
-                    self.executor._queue.qsize(),
-                    len(self.put_tasks),
-                    threading.current_thread().name,
-                )
+                if trace_enabled:
+                    logger.warning(
+                        "[SC_DISK_PUT_ADMISSION_STALLED] pid=%d key_hash=%s "
+                        "waited=%.6f limit=%d queue_depth=%d "
+                        "put_tasks=%d thread=%s",
+                        os.getpid(),
+                        key.chunk_hash,
+                        time.monotonic() - queued_at,
+                        self._sc_disk_put_limit,
+                        self.executor._queue.qsize(),
+                        len(self.put_tasks),
+                        threading.current_thread().name,
+                    )
 
-        with self._p0_put_state_lock:
-            self._p0_put_waiters -= 1
-            self._p0_put_inflight += 1
-            self._p0_put_peak = max(
-                self._p0_put_peak,
-                self._p0_put_inflight,
+        with self._sc_disk_put_state_lock:
+            self._sc_disk_put_waiters -= 1
+            self._sc_disk_put_inflight += 1
+            self._sc_disk_put_peak = max(
+                self._sc_disk_put_peak,
+                self._sc_disk_put_inflight,
             )
-            waiters = self._p0_put_waiters
-            inflight = self._p0_put_inflight
-            peak = self._p0_put_peak
+            waiters = self._sc_disk_put_waiters
+            inflight = self._sc_disk_put_inflight
+            peak = self._sc_disk_put_peak
 
         if trace_enabled:
             logger.warning(
-                "[P0_PUT_ADMISSION_ACQUIRE] pid=%d key_hash=%s "
+                "[SC_DISK_PUT_ADMISSION_ACQUIRE] pid=%d key_hash=%s "
                 "waited=%.6f limit=%d inflight=%d waiters=%d "
                 "peak=%d queue_depth=%d put_tasks=%d thread=%s",
                 os.getpid(),
                 key.chunk_hash,
                 time.monotonic() - queued_at,
-                self._p0_put_limit,
+                self._sc_disk_put_limit,
                 inflight,
                 waiters,
                 peak,
@@ -209,32 +212,32 @@ class LocalDiskWorker:
             )
         return True
 
-    def release_put_admission(
+    def release_disk_put_admission(
         self,
         key: CacheEngineKey,
         reason: str,
         error: Optional[BaseException] = None,
     ) -> None:
         """Release a put slot after completion or failed submission."""
-        semaphore = self._p0_put_admission
+        semaphore = self._sc_disk_put_admission
         if semaphore is None:
             return
 
-        with self._p0_put_state_lock:
-            self._p0_put_inflight -= 1
-            if self._p0_put_inflight < 0:
-                self._p0_put_inflight = 0
+        with self._sc_disk_put_state_lock:
+            self._sc_disk_put_inflight -= 1
+            if self._sc_disk_put_inflight < 0:
+                self._sc_disk_put_inflight = 0
                 raise RuntimeError(
-                    f"P0 put admission underflow for key={key}"
+                    f"SC disk-put admission underflow for key={key}"
                 )
-            inflight = self._p0_put_inflight
-            waiters = self._p0_put_waiters
-            peak = self._p0_put_peak
+            inflight = self._sc_disk_put_inflight
+            waiters = self._sc_disk_put_waiters
+            peak = self._sc_disk_put_peak
 
         semaphore.release()
-        if _kvio_trace_enabled() or error is not None:
+        if io_trace_enabled():
             logger.warning(
-                "[P0_PUT_ADMISSION_RELEASE] pid=%d key_hash=%s "
+                "[SC_DISK_PUT_ADMISSION_RELEASE] pid=%d key_hash=%s "
                 "reason=%s error=%r limit=%d inflight=%d "
                 "waiters=%d peak=%d queue_depth=%d put_tasks=%d "
                 "thread=%s",
@@ -242,7 +245,7 @@ class LocalDiskWorker:
                 key.chunk_hash,
                 reason,
                 error,
-                self._p0_put_limit,
+                self._sc_disk_put_limit,
                 inflight,
                 waiters,
                 peak,
@@ -268,18 +271,18 @@ class LocalDiskWorker:
         else:
             raise ValueError(f"Unknown task type: {task_type}")
 
-        kvio_id = str(kwargs.pop("_kvio_id", "unknown"))
+        sc_io_id = str(kwargs.pop("_sc_io_id", "unknown"))
         enqueued_at = time.monotonic()
         queue_depth_before = self.executor._queue.qsize()
-        if _kvio_trace_enabled():
-            with self._kvio_state_lock:
-                active_snapshot = dict(self._kvio_active)
+        if io_trace_enabled():
+            with self._sc_io_state_lock:
+                active_snapshot = dict(self._sc_io_active)
             logger.warning(
-                "[KVIO_DISKQ_ENQUEUE] pid=%d id=%s task_type=%s "
+                "[SC_IO_DISKQ_ENQUEUE] pid=%d id=%s task_type=%s "
                 "task=%s priority=%d queue_depth_before=%d active=%s "
                 "put_tasks=%d mono=%.6f",
                 os.getpid(),
-                kvio_id,
+                sc_io_id,
                 task_type,
                 getattr(task, "__name__", repr(task)),
                 priority,
@@ -291,16 +294,16 @@ class LocalDiskWorker:
 
         def traced_task(*task_args, **task_kwargs):
             started_at = time.monotonic()
-            with self._kvio_state_lock:
-                self._kvio_active[task_type] += 1
-                active_snapshot = dict(self._kvio_active)
-            if _kvio_trace_enabled():
+            with self._sc_io_state_lock:
+                self._sc_io_active[task_type] += 1
+                active_snapshot = dict(self._sc_io_active)
+            if io_trace_enabled():
                 logger.warning(
-                    "[KVIO_DISKQ_START] pid=%d id=%s task_type=%s "
+                    "[SC_IO_DISKQ_START] pid=%d id=%s task_type=%s "
                     "task=%s queue_wait=%.6f queue_depth_now=%d "
                     "active=%s put_tasks=%d thread=%s",
                     os.getpid(),
-                    kvio_id,
+                    sc_io_id,
                     task_type,
                     getattr(task, "__name__", repr(task)),
                     started_at - enqueued_at,
@@ -313,16 +316,16 @@ class LocalDiskWorker:
                 return task(*task_args, **task_kwargs)
             finally:
                 finished_at = time.monotonic()
-                with self._kvio_state_lock:
-                    self._kvio_active[task_type] -= 1
-                    active_after = dict(self._kvio_active)
-                if _kvio_trace_enabled():
+                with self._sc_io_state_lock:
+                    self._sc_io_active[task_type] -= 1
+                    active_after = dict(self._sc_io_active)
+                if io_trace_enabled():
                     logger.warning(
-                        "[KVIO_DISKQ_DONE] pid=%d id=%s task_type=%s "
+                        "[SC_IO_DISKQ_DONE] pid=%d id=%s task_type=%s "
                         "task=%s service=%.6f total=%.6f "
                         "queue_depth_now=%d active=%s put_tasks=%d thread=%s",
                         os.getpid(),
-                        kvio_id,
+                        sc_io_id,
                         task_type,
                         getattr(task, "__name__", repr(task)),
                         finished_at - started_at,
@@ -344,9 +347,9 @@ class LocalDiskWorker:
         with self.put_lock:
             if key in self.put_tasks:
                 self.put_tasks.remove(key)
-                if _kvio_trace_enabled():
+                if io_trace_enabled():
                     logger.warning(
-                        "[KVIO_PUT_TASK_REMOVE] pid=%d key_hash=%s "
+                        "[SC_IO_PUT_TASK_REMOVE] pid=%d key_hash=%s "
                         "remaining_put_tasks=%d",
                         os.getpid(),
                         key.chunk_hash,
@@ -360,9 +363,9 @@ class LocalDiskWorker:
             if key in self.put_tasks:
                 return False
             self.put_tasks.append(key)
-            if _kvio_trace_enabled():
+            if io_trace_enabled():
                 logger.warning(
-                    "[KVIO_PUT_TASK_INSERT] pid=%d key_hash=%s put_tasks=%d",
+                    "[SC_IO_PUT_TASK_INSERT] pid=%d key_hash=%s put_tasks=%d",
                     os.getpid(),
                     key.chunk_hash,
                     len(self.put_tasks),
@@ -377,11 +380,11 @@ class LocalDiskWorker:
         # Gracefully shut down the executor
         if self._closed:
             return
-        if _kvio_trace_enabled():
-            with self._kvio_state_lock:
-                active_snapshot = dict(self._kvio_active)
+        if io_trace_enabled():
+            with self._sc_io_state_lock:
+                active_snapshot = dict(self._sc_io_active)
             logger.warning(
-                "[KVIO_DISKQ_CLOSE_ENTER] pid=%d queue_depth=%d "
+                "[SC_IO_DISKQ_CLOSE_ENTER] pid=%d queue_depth=%d "
                 "active=%s put_tasks=%d",
                 os.getpid(),
                 self.executor._queue.qsize(),
@@ -390,9 +393,9 @@ class LocalDiskWorker:
             )
         self._closed = True
         self.executor.shutdown(wait=True)
-        if _kvio_trace_enabled():
+        if io_trace_enabled():
             logger.warning(
-                "[KVIO_DISKQ_CLOSE_DONE] pid=%d queue_depth=%d put_tasks=%d",
+                "[SC_IO_DISKQ_CLOSE_DONE] pid=%d queue_depth=%d put_tasks=%d",
                 os.getpid(),
                 self.executor._queue.qsize(),
                 len(self.put_tasks),
@@ -613,7 +616,7 @@ class LocalDiskBackend(StorageBackendInterface):
         """
         Submit a single put task to store KV cache to disk asynchronously.
 
-        P0-B acquires a bounded admission slot before incrementing the
+        Optional SC disk-put admission acquires a bounded slot before incrementing the
         MemoryObj refcount or placing the write in the executor queue.
 
         :param key: The cache key for this KV chunk.
@@ -631,15 +634,15 @@ class LocalDiskBackend(StorageBackendInterface):
             logger.debug(f"Put task for {key} is already in progress.")
             return None
 
-        if not self.disk_worker.acquire_put_admission(key):
-            logger.warning(
-                "Skipping disk put for %s because bounded admission rejected it.",
-                key,
-            )
+        if not self.disk_worker.acquire_disk_put_admission(key):
+            if io_trace_enabled():
+                logger.warning(
+                    "[SC_DISK_PUT_ADMISSION_REJECT] key=%s", key
+                )
             return None
 
         if not self.disk_worker.insert_put_task(key):
-            self.disk_worker.release_put_admission(
+            self.disk_worker.release_disk_put_admission(
                 key,
                 reason="duplicate_after_wait",
             )
@@ -673,7 +676,7 @@ class LocalDiskBackend(StorageBackendInterface):
 
         if not evict_success:
             self.disk_worker.remove_put_task(key)
-            self.disk_worker.release_put_admission(
+            self.disk_worker.release_disk_put_admission(
                 key,
                 reason="disk_capacity_rejected",
             )
@@ -690,14 +693,14 @@ class LocalDiskBackend(StorageBackendInterface):
                     key=key,
                     memory_obj=memory_obj,
                     on_complete_callback=on_complete_callback,
-                    _kvio_id=f"put:{key.chunk_hash}",
+                    _sc_io_id=f"put:{key.chunk_hash}",
                 ),
                 self.loop,
             )
         except BaseException as exc:
             memory_obj.ref_count_down()
             self.disk_worker.remove_put_task(key)
-            self.disk_worker.release_put_admission(
+            self.disk_worker.release_disk_put_admission(
                 key,
                 reason="submit_failed",
                 error=exc,
@@ -716,7 +719,7 @@ class LocalDiskBackend(StorageBackendInterface):
                     error = exc
                 if error is not None:
                     reason = "failed"
-            self.disk_worker.release_put_admission(
+            self.disk_worker.release_disk_put_admission(
                 key,
                 reason=reason,
                 error=error,
@@ -803,11 +806,11 @@ class LocalDiskBackend(StorageBackendInterface):
         mem_objs: list[MemoryObj] = []
         paths: list[str] = []
         started = time.monotonic()
-        debug_enabled = os.environ.get("SRIRAM_KV_MEM_DEBUG", "0") == "1"
+        trace_enabled = load_trace_enabled()
 
-        if debug_enabled:
+        if trace_enabled:
             logger.warning(
-                "[KVDBG_DISK_LOAD_START] "
+                "[SC_LOAD_DISK_LOAD_START] "
                 "pid=%d lookup_id=%s requested_keys=%d thread=%s",
                 os.getpid(),
                 lookup_id,
@@ -847,9 +850,9 @@ class LocalDiskBackend(StorageBackendInterface):
                     busy_loop=False,
                 )
                 allocation_elapsed = time.monotonic() - allocation_started
-                if _kvio_trace_enabled():
+                if io_trace_enabled():
                     logger.warning(
-                        "[KVIO_STAGE_ALLOC] pid=%d lookup_id=%s "
+                        "[SC_IO_STAGE_ALLOC] pid=%d lookup_id=%s "
                         "key_index=%d/%d key_hash=%s shape=%s dtype=%s fmt=%s "
                         "success=%s elapsed=%.6f",
                         os.getpid(),
@@ -865,22 +868,23 @@ class LocalDiskBackend(StorageBackendInterface):
                     )
 
                 if memory_obj is None:
-                    logger.error(
-                        "[KVDBG_DISK_STAGE_FAIL] "
-                        "pid=%d lookup_id=%s key_index=%d/%d "
-                        "allocated_so_far=%d elapsed=%.3fs thread=%s. "
-                        "Memory allocation failed during async disk load "
-                        "for key %s. CPU staging pool may be exhausted. "
-                        "Returning partial results.",
-                        os.getpid(),
-                        lookup_id,
-                        key_index,
-                        len(keys),
-                        len(mem_objs),
-                        time.monotonic() - started,
-                        threading.current_thread().name,
-                        key,
-                    )
+                    if trace_enabled:
+                        logger.error(
+                            "[SC_LOAD_DISK_STAGE_FAIL] "
+                            "pid=%d lookup_id=%s key_index=%d/%d "
+                            "allocated_so_far=%d elapsed=%.3fs thread=%s. "
+                            "Memory allocation failed during async disk load "
+                            "for key %s. CPU staging pool may be exhausted. "
+                            "Returning partial results.",
+                            os.getpid(),
+                            lookup_id,
+                            key_index,
+                            len(keys),
+                            len(mem_objs),
+                            time.monotonic() - started,
+                            threading.current_thread().name,
+                            key,
+                        )
                     return mem_objs
 
                 # Extra disk pin for the physical read. The lookup pin is
@@ -895,9 +899,9 @@ class LocalDiskBackend(StorageBackendInterface):
             mem_objs.append(memory_obj)
             paths.append(path)
 
-        if _kvio_trace_enabled():
+        if io_trace_enabled():
             logger.warning(
-                "[KVIO_STAGE_BATCH_DONE] pid=%d lookup_id=%s "
+                "[SC_IO_STAGE_BATCH_DONE] pid=%d lookup_id=%s "
                 "requested_keys=%d staged=%d elapsed=%.6f",
                 os.getpid(),
                 lookup_id,
@@ -914,25 +918,26 @@ class LocalDiskBackend(StorageBackendInterface):
                 keys=keys,
                 memory_objs=mem_objs,
                 lookup_id=lookup_id,
-                _kvio_id=lookup_id,
+                _sc_io_id=lookup_id,
             )
         except Exception:
-            logger.exception(
-                "[KVDBG_DISK_LOAD_FAILED] "
-                "pid=%d lookup_id=%s requested_keys=%d "
-                "allocated=%d elapsed=%.3fs thread=%s",
-                os.getpid(),
-                lookup_id,
-                len(keys),
-                len(mem_objs),
-                time.monotonic() - started,
-                threading.current_thread().name,
-            )
+            if trace_enabled:
+                logger.exception(
+                    "[SC_LOAD_DISK_LOAD_FAILED] "
+                    "pid=%d lookup_id=%s requested_keys=%d "
+                    "allocated=%d elapsed=%.3fs thread=%s",
+                    os.getpid(),
+                    lookup_id,
+                    len(keys),
+                    len(mem_objs),
+                    time.monotonic() - started,
+                    threading.current_thread().name,
+                )
             raise
 
-        if debug_enabled or time.monotonic() - started >= 1.0:
+        if trace_enabled:
             logger.warning(
-                "[KVDBG_DISK_LOAD_DONE] "
+                "[SC_LOAD_DISK_LOAD_DONE] "
                 "pid=%d lookup_id=%s requested_keys=%d returned=%d "
                 "elapsed=%.3fs thread=%s",
                 os.getpid(),
@@ -1027,9 +1032,9 @@ class LocalDiskBackend(StorageBackendInterface):
 
         logger.debug("Executing `async_load_bytes` from disk.")
         batch_started = time.monotonic()
-        if _kvio_trace_enabled():
+        if io_trace_enabled():
             logger.warning(
-                "[KVIO_READ_BATCH_START] pid=%d lookup_id=%s files=%d "
+                "[SC_IO_READ_BATCH_START] pid=%d lookup_id=%s files=%d "
                 "bytes=%d thread=%s mono=%.6f",
                 os.getpid(),
                 lookup_id,
@@ -1061,9 +1066,9 @@ class LocalDiskBackend(StorageBackendInterface):
             self.dict[key].unpin()
             self.disk_lock.release()
 
-        if _kvio_trace_enabled():
+        if io_trace_enabled():
             logger.warning(
-                "[KVIO_READ_BATCH_DONE] pid=%d lookup_id=%s files=%d "
+                "[SC_IO_READ_BATCH_DONE] pid=%d lookup_id=%s files=%d "
                 "elapsed=%.6f thread=%s",
                 os.getpid(),
                 lookup_id,
@@ -1101,7 +1106,7 @@ class LocalDiskBackend(StorageBackendInterface):
     def write_file(self, buffer, path, key: Optional[CacheEngineKey] = None):
         total_started = time.monotonic()
         size = len(buffer)
-        io_before = _kvio_proc_io_snapshot()
+        io_before = _sc_io_proc_snapshot()
         open_elapsed = 0.0
         write_elapsed = 0.0
         bytes_written = 0
@@ -1125,14 +1130,14 @@ class LocalDiskBackend(StorageBackendInterface):
                 os.close(fd)
 
         total_elapsed = time.monotonic() - total_started
-        io_after = _kvio_proc_io_snapshot()
+        io_after = _sc_io_proc_snapshot()
         logger.debug(
             f"Disk write size: {size} bytes, "
             f"Bandwidth: {size / max(total_elapsed, 1e-9) / 1e6:.2f} MB/s"
         )
-        if _kvio_trace_enabled():
+        if io_trace_enabled():
             logger.warning(
-                "[KVIO_FILE_WRITE] pid=%d key_hash=%s bytes_expected=%d "
+                "[SC_IO_FILE_WRITE] pid=%d key_hash=%s bytes_expected=%d "
                 "bytes_written=%d open=%.6f write=%.6f total=%.6f "
                 "odirect=%s proc_io_delta=%s thread=%s path=%s",
                 os.getpid(),
@@ -1143,7 +1148,7 @@ class LocalDiskBackend(StorageBackendInterface):
                 write_elapsed,
                 total_elapsed,
                 self.use_odirect,
-                _kvio_io_delta(io_before, io_after),
+                _sc_io_delta(io_before, io_after),
                 threading.current_thread().name,
                 path,
             )
@@ -1166,7 +1171,7 @@ class LocalDiskBackend(StorageBackendInterface):
                 "size is not aligned to disk block size."
             )
 
-        io_before = _kvio_proc_io_snapshot()
+        io_before = _sc_io_proc_snapshot()
         open_elapsed = 0.0
         read_elapsed = 0.0
         bytes_read = 0
@@ -1192,9 +1197,9 @@ class LocalDiskBackend(StorageBackendInterface):
             logger.warning(f"File not found on disk: {path}")
             if self.dict.get(key, None):
                 self.dict.pop(key)
-            if _kvio_trace_enabled():
+            if io_trace_enabled():
                 logger.warning(
-                    "[KVIO_FILE_READ_MISSING] pid=%d lookup_id=%s "
+                    "[SC_IO_FILE_READ_MISSING] pid=%d lookup_id=%s "
                     "file_index=%d/%d key_hash=%s elapsed=%.6f path=%s",
                     os.getpid(),
                     lookup_id,
@@ -1207,14 +1212,14 @@ class LocalDiskBackend(StorageBackendInterface):
             return
 
         total_elapsed = time.monotonic() - total_started
-        io_after = _kvio_proc_io_snapshot()
+        io_after = _sc_io_proc_snapshot()
         logger.debug(
             f"Disk read size: {size} bytes, "
             f"Bandwidth: {size / max(total_elapsed, 1e-9) / 1e6:.2f} MB/s"
         )
-        if _kvio_trace_enabled():
+        if io_trace_enabled():
             logger.warning(
-                "[KVIO_FILE_READ] pid=%d lookup_id=%s file_index=%d/%d "
+                "[SC_IO_FILE_READ] pid=%d lookup_id=%s file_index=%d/%d "
                 "key_hash=%s bytes_expected=%d bytes_read=%d "
                 "open=%.6f read=%.6f total=%.6f bandwidth_MBps=%.3f "
                 "odirect=%s proc_io_delta=%s thread=%s path=%s",
@@ -1230,7 +1235,7 @@ class LocalDiskBackend(StorageBackendInterface):
                 total_elapsed,
                 bytes_read / max(read_elapsed, 1e-9) / 1e6,
                 effective_odirect,
-                _kvio_io_delta(io_before, io_after),
+                _sc_io_delta(io_before, io_after),
                 threading.current_thread().name,
                 path,
             )

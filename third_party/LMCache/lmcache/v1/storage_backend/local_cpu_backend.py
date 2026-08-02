@@ -27,6 +27,7 @@ from lmcache.v1.memory_management import (
     PagedCpuGpuMemoryAllocator,
 )
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.sc_config import env_float, memory_trace_enabled
 from lmcache.v1.storage_backend.abstract_backend import AllocatorBackendInterface
 from lmcache.v1.storage_backend.batched_message_sender import BatchedMessageSender
 from lmcache.v1.storage_backend.cache_policy import get_cache_policy
@@ -59,10 +60,10 @@ class LocalCPUBackend(AllocatorBackendInterface):
         else:
             super().__init__("cpu")
 
-        self._sr_last_pressure_log = 0.0
-        self._sr_pressure_events = 0
-        self._sr_evicted_keys_since_log = 0
-        self._sr_evicted_bytes_since_log = 0
+        self._sc_last_pressure_log = 0.0
+        self._sc_pressure_events = 0
+        self._sc_evicted_keys_since_log = 0
+        self._sc_evicted_bytes_since_log = 0
 
         self.cache_policy = get_cache_policy(config.cache_policy)
         self.hot_cache = self.cache_policy.init_mutable_mapping()
@@ -111,27 +112,27 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
         self._setup_metrics()
 
-    def _sr_pressure_snapshot(
+    def _sc_pressure_snapshot(
         self,
         reason: str,
         requested_bytes: int = 0,
         force: bool = False,
     ) -> None:
         """Rate-limited LMCache pinned-pool diagnostic."""
-        if os.environ.get("SRIRAM_KV_MEM_DEBUG", "0") != "1":
+        if not memory_trace_enabled():
             return
 
-        self._sr_pressure_events += 1
+        self._sc_pressure_events += 1
 
         now = time.monotonic()
-        interval = float(
-            os.environ.get("SRIRAM_KV_MEM_DEBUG_INTERVAL_S", "5")
+        interval = env_float(
+            "SC_LMCACHE_MEMORY_TRACE_INTERVAL_S", 5.0, minimum=0.0
         )
 
-        if not force and now - self._sr_last_pressure_log < interval:
+        if not force and now - self._sc_last_pressure_log < interval:
             return
 
-        self._sr_last_pressure_log = now
+        self._sc_last_pressure_log = now
 
         # Persistent objects currently admitted to the CPU hot cache.
         with self.cpu_lock:
@@ -178,7 +179,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                     evictable_bytes += size
             except Exception:
                 logger.exception(
-                    "[KVDBG_CPU_POOL] Could not inspect MemoryObj"
+                    "[SC_MEMORY_CPU_POOL] Could not inspect MemoryObj"
                 )
 
         # The actual pinned-memory allocator is normally wrapped by
@@ -216,7 +217,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 )
             except Exception:
                 logger.exception(
-                    "[KVDBG_CPU_POOL] Address-manager inspection failed"
+                    "[SC_MEMORY_CPU_POOL] Address-manager inspection failed"
                 )
         elif hasattr(allocator, "free_blocks"):
             # Paged allocator.
@@ -239,7 +240,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             return 100.0 * value / heap_bytes if heap_bytes else 0.0
 
         logger.warning(
-            "[KVDBG_CPU_POOL] "
+            "[SC_MEMORY_CPU_POOL] "
             "pid=%d rank=%s reason=%s pressure_events=%d "
             "requested=%.3fGiB "
             "pool=%.3fGiB used=%.3fGiB free=%.3fGiB "
@@ -254,7 +255,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             os.getpid(),
             getattr(self.metadata, "worker_id", "NA"),
             reason,
-            self._sr_pressure_events,
+            self._sc_pressure_events,
             gib(requested_bytes),
             gib(heap_bytes),
             gib(used_bytes),
@@ -276,12 +277,12 @@ class LocalCPUBackend(AllocatorBackendInterface):
             percentage(non_hot_bytes),
             dict(pin_hist),
             dict(ref_hist),
-            self._sr_evicted_keys_since_log,
-            gib(self._sr_evicted_bytes_since_log),
+            self._sc_evicted_keys_since_log,
+            gib(self._sc_evicted_bytes_since_log),
         )
 
-        self._sr_evicted_keys_since_log = 0
-        self._sr_evicted_bytes_since_log = 0
+        self._sc_evicted_keys_since_log = 0
+        self._sc_evicted_bytes_since_log = 0
     def _setup_metrics(self) -> None:
         if self.metadata is None:
             return
@@ -797,7 +798,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             dtypes if isinstance(dtypes, list) else [dtypes],
         )
         if memory_obj is None:
-            self._sr_pressure_snapshot(
+            self._sc_pressure_snapshot(
                 reason="initial_allocate_failed",
                 requested_bytes=requested_bytes,
             )
@@ -827,7 +828,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                             len(evict_keys),
                         )
 
-                        # SRIRAM DEBUG: cpu_lock is already held here.
+                        # SC DEBUG: cpu_lock is already held here.
                         victim_objs = [
                             self.hot_cache[key]
                             for key in evict_keys
@@ -840,21 +841,21 @@ class LocalCPUBackend(AllocatorBackendInterface):
                             memory_obj.get_physical_size()
                             for memory_obj in victim_objs
                         )
-                        self._sr_evicted_keys_since_log += len(victim_objs)
-                        self._sr_evicted_bytes_since_log += victim_bytes
+                        self._sc_evicted_keys_since_log += len(victim_objs)
+                        self._sc_evicted_bytes_since_log += victim_bytes
 
                         # Existing removal. force=False because cpu_lock is held.
                         self.batched_remove(evict_keys, force=False)
                         evict_keys_count += len(evict_keys)
                     else:
-                        # _sr_pressure_snapshot() takes cpu_lock itself, so defer it.
+                        # _sc_pressure_snapshot() takes cpu_lock itself, so defer it.
                         no_evict_candidates = True
                         self.stats_monitor.update_local_cpu_evict_failed_count(
                             num_candidates
                         )
 
                 if no_evict_candidates:
-                    self._sr_pressure_snapshot(
+                    self._sc_pressure_snapshot(
                         reason="no_evict_candidates",
                         requested_bytes=requested_bytes,
                     )
@@ -879,7 +880,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
             memory_obj = self.memory_allocator.allocate(shapes, dtypes, fmt)
             if memory_obj is None:
-                self._sr_pressure_snapshot(
+                self._sc_pressure_snapshot(
                     reason="allocate_retry_failed",
                     requested_bytes=requested_bytes,
                 )
@@ -893,7 +894,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             )
 
         if memory_obj is None:
-            self._sr_pressure_snapshot(
+            self._sc_pressure_snapshot(
                 reason="allocate_returning_none",
                 requested_bytes=requested_bytes,
                 force=True,
@@ -953,7 +954,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             * batch_size
         )
         if memory_objs is None:
-            self._sr_pressure_snapshot(
+            self._sc_pressure_snapshot(
                 reason="initial_allocate_failed",
                 requested_bytes=requested_bytes,
             )
@@ -993,14 +994,14 @@ class LocalCPUBackend(AllocatorBackendInterface):
                                 self.hot_cache[key] for key in evict_key_all_layer
                             ]
 
-                            # SRIRAM DEBUG: count the actual per-layer objects and bytes
+                            # SC DEBUG: count the actual per-layer objects and bytes
                             # about to be freed by the batched eviction path.
                             victim_bytes = sum(
                                 memory_obj.get_physical_size()
                                 for memory_obj in old_mem_objs
                             )
-                            self._sr_evicted_keys_since_log += len(old_mem_objs)
-                            self._sr_evicted_bytes_since_log += victim_bytes
+                            self._sc_evicted_keys_since_log += len(old_mem_objs)
+                            self._sc_evicted_bytes_since_log += victim_bytes
 
                             # Existing eviction behavior.
                             for key in evict_key_all_layer:
@@ -1016,14 +1017,14 @@ class LocalCPUBackend(AllocatorBackendInterface):
                                 victim_bytes / 1024**2,
                             )
                     else:
-                        # _sr_pressure_snapshot() takes cpu_lock itself, so defer it.
+                        # _sc_pressure_snapshot() takes cpu_lock itself, so defer it.
                         no_evict_candidates = True
                         self.stats_monitor.update_local_cpu_evict_failed_count(
                             num_candidates
                         )
 
                 if no_evict_candidates:
-                    self._sr_pressure_snapshot(
+                    self._sc_pressure_snapshot(
                         reason="no_evict_candidates_batched",
                         requested_bytes=requested_bytes,
                     )
@@ -1050,7 +1051,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 shapes, dtypes, batch_size, fmt
             )
             if memory_objs is None:
-                self._sr_pressure_snapshot(
+                self._sc_pressure_snapshot(
                     reason="batched_allocate_retry_failed",
                     requested_bytes=requested_bytes,
                 )
@@ -1063,7 +1064,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 " attempts of local cpu backend batched_allocate()"
             )
         if memory_objs is None:
-            self._sr_pressure_snapshot(
+            self._sc_pressure_snapshot(
                 reason="batched_allocate_returning_none",
                 requested_bytes=requested_bytes,
                 force=True,

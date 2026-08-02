@@ -14,6 +14,11 @@ cd /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
 source /mnt/shared/gpfs/home/sriramc2/venvs/kvaware/bin/activate
 
 export PYTHONPATH=/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM:${PYTHONPATH:-}
+REPO=/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
+if [[ "${SC_LMCACHE_SOURCE_DEFAULT_KNOBS:-1}" == "1" ]]; then
+  # Existing environment values win over defaults in this file.
+  source "$REPO/local_repro/sc_lmcache_knobs.sh"
+fi
 export HF_HOME=/mnt/shared/gpfs/home/sriramc2/.cache/huggingface
 export HUGGINGFACE_HUB_CACHE=/mnt/shared/gpfs/home/sriramc2/.cache/huggingface/hub
 export TRANSFORMERS_CACHE=/mnt/shared/gpfs/home/sriramc2/.cache/huggingface/transformers

@@ -56,6 +56,11 @@ from lmcache.v1.memory_management import (  # noqa: E501
 )
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.pin_monitor import PinMonitor
+from lmcache.v1.sc_config import (
+    io_trace_enabled,
+    load_trace_enabled,
+    tier_trace_enabled,
+)
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 from lmcache.v1.system_detection import NUMADetector, NUMAMapping
 from lmcache.v1.token_database import (
@@ -207,8 +212,8 @@ class LMCacheEngine:
             lambda: defaultdict(list)
         )
 
-        # SRIRAM DEBUG: lookup_id -> first pin/lookup timestamp.
-        self._sr_lookup_start_times: dict[str, float] = {}
+        # SC load tracing: lookup_id -> first pin/lookup timestamp.
+        self._sc_lookup_start_times: dict[str, float] = {}
 
         InitializeUsageContext(config, metadata)
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
@@ -375,8 +380,8 @@ class LMCacheEngine:
         When target_tiers is absent, preserve normal LMCache behavior.
         This keeps wo_gnn unchanged.
         """
-        if os.environ.get("SRIRAM_TIER_DEBUG", "0") == "1":
-            logger.info("[SC] Entered _put_with_optional_target_tiers")
+        if tier_trace_enabled():
+            logger.info("[SC_TIER_TRACE] Entered _put_with_optional_target_tiers")
         assert self.storage_manager is not None
 
         # wo_gnn: preserve normal replication across enabled backends.
@@ -387,8 +392,8 @@ class LMCacheEngine:
                 transfer_spec=transfer_spec,
                 location=self.store_location,
             )
-            if os.environ.get("SRIRAM_TIER_DEBUG", "0") == "1":
-                logger.info("[SC] target_tiers = False inside _put_with_optional_target_tiers")
+            if tier_trace_enabled():
+                logger.info("[SC_TIER_TRACE] target_tiers absent; preserving normal replication")
             return
 
         if len(target_tiers) < len(keys):
@@ -416,13 +421,14 @@ class LMCacheEngine:
             group["keys"].append(key)
             group["memory_objs"].append(memory_obj)
 
-        logger.info(
-            "[KV placement] %s",
-            {
-                location: len(group["keys"])
-                for location, group in groups.items()
-            },
-        )
+        if tier_trace_enabled():
+            logger.info(
+                "[SC_TIER_TRACE] KV placement=%s",
+                {
+                    location: len(group["keys"])
+                    for location, group in groups.items()
+                },
+            )
 
         for location, group in groups.items():
             self.storage_manager.batched_put(
@@ -1184,7 +1190,7 @@ class LMCacheEngine:
         assert self.storage_manager is not None
 
         if pin and lookup_id is not None:
-            self._sr_lookup_start_times.setdefault(
+            self._sc_lookup_start_times.setdefault(
                 lookup_id,
                 time.monotonic(),
             )
@@ -1358,7 +1364,7 @@ class LMCacheEngine:
         assert self.storage_manager is not None
 
         if pin:
-            self._sr_lookup_start_times.setdefault(
+            self._sc_lookup_start_times.setdefault(
                 lookup_id,
                 time.monotonic(),
             )
@@ -1389,8 +1395,8 @@ class LMCacheEngine:
                 keys.append(key)
             cum_chunk_lengths.append(end)
 
-        kvio_submitted_at = time.monotonic()
-        kvio_future = asyncio.run_coroutine_threadsafe(
+        sc_io_submitted_at = time.monotonic()
+        sc_io_future = asyncio.run_coroutine_threadsafe(
             self.storage_manager.async_lookup_and_prefetch(
                 lookup_id,
                 keys,
@@ -1402,9 +1408,9 @@ class LMCacheEngine:
             self.storage_manager.loop,
         )
 
-        if os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
+        if io_trace_enabled():
             logger.warning(
-                "[KVIO_ENGINE_SUBMIT] lookup_id=%s keys=%d chunks=%d "
+                "[SC_IO_ENGINE_SUBMIT] lookup_id=%s keys=%d chunks=%d "
                 "keys_per_chunk=%d pin=%s search_range=%s mono=%.6f",
                 lookup_id,
                 len(keys),
@@ -1412,16 +1418,16 @@ class LMCacheEngine:
                 keys_per_chunk,
                 pin,
                 search_range,
-                kvio_submitted_at,
+                sc_io_submitted_at,
             )
 
-            def _kvio_engine_done(done_future):
-                elapsed = time.monotonic() - kvio_submitted_at
+            def _sc_io_engine_done(done_future):
+                elapsed = time.monotonic() - sc_io_submitted_at
                 try:
                     exc = done_future.exception()
                 except Exception as callback_exc:
                     logger.warning(
-                        "[KVIO_ENGINE_FUTURE_INSPECT_ERROR] "
+                        "[SC_IO_ENGINE_FUTURE_INSPECT_ERROR] "
                         "lookup_id=%s elapsed=%.6f error=%r",
                         lookup_id,
                         elapsed,
@@ -1429,7 +1435,7 @@ class LMCacheEngine:
                     )
                     return
                 logger.warning(
-                    "[KVIO_ENGINE_FUTURE_DONE] lookup_id=%s elapsed=%.6f "
+                    "[SC_IO_ENGINE_FUTURE_DONE] lookup_id=%s elapsed=%.6f "
                     "cancelled=%s exception=%r",
                     lookup_id,
                     elapsed,
@@ -1437,7 +1443,7 @@ class LMCacheEngine:
                     exc,
                 )
 
-            kvio_future.add_done_callback(_kvio_engine_done)
+            sc_io_future.add_done_callback(_sc_io_engine_done)
 
     def cleanup_memory_objs(self, lookup_id: str) -> None:
         """
@@ -1451,9 +1457,9 @@ class LMCacheEngine:
             event_status = self.event_manager.get_event_status(
                 EventType.LOADING, lookup_id
             )
-            if os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
+            if io_trace_enabled():
                 logger.warning(
-                    "[KVIO_ENGINE_CLEANUP_ENTER] lookup_id=%s "
+                    "[SC_IO_ENGINE_CLEANUP_ENTER] lookup_id=%s "
                     "event_status=%s",
                     lookup_id,
                     event_status,
@@ -1464,9 +1470,9 @@ class LMCacheEngine:
                 logger.debug(
                     "No completed event found for lookup_id=%s to clean up.", lookup_id
                 )
-                if os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
+                if io_trace_enabled():
                     logger.warning(
-                        "[KVIO_ENGINE_CLEANUP_DEFER] lookup_id=%s "
+                        "[SC_IO_ENGINE_CLEANUP_DEFER] lookup_id=%s "
                         "event_status=%s elapsed=%.6f",
                         lookup_id,
                         event_status,
@@ -1479,9 +1485,9 @@ class LMCacheEngine:
             memory_objs = future.result()
             # Flatten nested lists (each backend returns a list of chunks)
             memory_objs_flat = [mm for m in memory_objs for mm in m]
-            if os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
+            if io_trace_enabled():
                 logger.warning(
-                    "[KVIO_ENGINE_CLEANUP_OBJECTS] lookup_id=%s "
+                    "[SC_IO_ENGINE_CLEANUP_OBJECTS] lookup_id=%s "
                     "tiers=%d objects=%d",
                     lookup_id,
                     len(memory_objs),
@@ -1497,9 +1503,9 @@ class LMCacheEngine:
                     memory_obj.ref_count_down()
                 except Exception as e:
                     logger.error(f"Error releasing memory object: {e}")
-            if os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
+            if io_trace_enabled():
                 logger.warning(
-                    "[KVIO_ENGINE_CLEANUP_DONE] lookup_id=%s objects=%d "
+                    "[SC_IO_ENGINE_CLEANUP_DONE] lookup_id=%s objects=%d "
                     "elapsed=%.6f",
                     lookup_id,
                     len(memory_objs_flat),
@@ -1633,13 +1639,13 @@ class LMCacheEngine:
 
     @_lmcache_nvtx_annotate
     def lookup_unpin(self, lookup_id: str) -> None:
-        started = self._sr_lookup_start_times.pop(lookup_id, None)
+        started = self._sc_lookup_start_times.pop(lookup_id, None)
         age = (
             time.monotonic() - started
             if started is not None
             else -1.0
         )
-        debug_enabled = os.environ.get("SRIRAM_KV_MEM_DEBUG", "0") == "1"
+        trace_enabled = load_trace_enabled()
 
         if lookup_id in self.lookup_pins:
             assert self.storage_manager is not None
@@ -1649,9 +1655,9 @@ class LMCacheEngine:
                 for location, keys in mapping.items()
             }
 
-            if debug_enabled:
+            if trace_enabled:
                 logger.warning(
-                    "[KVDBG_LOOKUP_UNPIN] "
+                    "[SC_LOAD_LOOKUP_UNPIN] "
                     "pid=%d lookup_id=%s age=%.3fs "
                     "branch=lookup_pins locations=%s total_keys=%d",
                     os.getpid(),
@@ -1673,9 +1679,9 @@ class LMCacheEngine:
                 EventType.LOADING,
                 lookup_id,
             )
-            if debug_enabled:
+            if trace_enabled:
                 logger.warning(
-                    "[KVDBG_LOOKUP_UNPIN] "
+                    "[SC_LOAD_LOOKUP_UNPIN] "
                     "pid=%d lookup_id=%s age=%.3fs "
                     "branch=async_cleanup event_status=%s",
                     os.getpid(),
@@ -1685,9 +1691,9 @@ class LMCacheEngine:
                 )
             self.cleanup_memory_objs(lookup_id)
 
-        elif debug_enabled:
+        elif trace_enabled:
             logger.warning(
-                "[KVDBG_LOOKUP_UNPIN] "
+                "[SC_LOAD_LOOKUP_UNPIN] "
                 "pid=%d lookup_id=%s age=%.3fs "
                 "branch=no_tracked_state",
                 os.getpid(),

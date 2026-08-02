@@ -25,38 +25,38 @@ from vllm.engine.arg_utils import EngineArgs
 
 import hashlib
 
-# ===== SRIRAM PROCESS MONITOR START =====
-import os as _sr_os
-import time as _sr_time
-import threading as _sr_threading
-import shutil as _sr_shutil
-import subprocess as _sr_subprocess
+# ===== SC DRIVER RESOURCE MONITOR START =====
+import os as _sc_os
+import time as _sc_time
+import threading as _sc_threading
+import shutil as _sc_shutil
+import subprocess as _sc_subprocess
 
 
-def _sr_top_processes():
+def _sc_top_processes():
     try:
-        return _sr_subprocess.check_output(
+        return _sc_subprocess.check_output(
             [
                 "bash",
                 "-lc",
                 "ps -u $USER -o pid,ppid,rss,vsz,stat,etime,cmd --sort=-rss | head -20",
             ],
-            stderr=_sr_subprocess.STDOUT,
+            stderr=_sc_subprocess.STDOUT,
             timeout=3,
             text=True,
         ).replace("\n", " || ")
     except Exception as e:
         return repr(e)
 
-def _sr_disk_usage(path):
+def _sc_disk_usage(path):
     try:
-        u = _sr_shutil.disk_usage(path)
+        u = _sc_shutil.disk_usage(path)
         return f"{path}: used={u.used/1024**3:.1f}G free={u.free/1024**3:.1f}G total={u.total/1024**3:.1f}G"
     except Exception as e:
         return f"{path}: {e!r}"
 
 
-def _sr_status():
+def _sc_status():
     vals = {}
     try:
         with open("/proc/self/status") as f:
@@ -69,22 +69,22 @@ def _sr_status():
     return vals
 
 
-def _sr_gpu():
+def _sc_gpu():
     try:
-        return _sr_subprocess.check_output(
+        return _sc_subprocess.check_output(
             [
                 "nvidia-smi",
                 "--query-gpu=index,memory.used,memory.free,memory.total,utilization.gpu",
                 "--format=csv,noheader,nounits",
             ],
-            stderr=_sr_subprocess.STDOUT,
+            stderr=_sc_subprocess.STDOUT,
             timeout=3,
             text=True,
         ).replace("\n", " | ")
     except Exception as e:
         return repr(e)
 
-def _sr_meminfo():
+def _sc_meminfo():
     try:
         keys = ("MemTotal:", "MemFree:", "MemAvailable:", "Buffers:", "Cached:", "SwapTotal:", "SwapFree:")
         out = []
@@ -96,27 +96,48 @@ def _sr_meminfo():
     except Exception as e:
         return repr(e)
 
-def _sr_monitor_loop():
+def _sc_env_flag(name: str, default: bool = False) -> bool:
+    raw = _sc_os.environ.get(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off", ""}:
+        return False
+    raise ValueError(f"{name} has invalid boolean value {raw!r}")
+
+
+def _sc_monitor_loop():
+    interval_s = float(
+        _sc_os.environ.get("SC_DRIVER_RESOURCE_MONITOR_INTERVAL_S", "30")
+    )
     while True:
         print(
-            "[SRIRAM_MONITOR] "
-            f"pid={_sr_os.getpid()} "
-            f"status={_sr_status()} "
-            f"tmp={_sr_disk_usage('/tmp')} "
-            f"shm={_sr_disk_usage('/dev/shm')} "
-            f"lmcache={_sr_disk_usage(_sr_os.environ.get('SRIRAM_LMCACHE_DIR', '/tmp'))} "
-            f"gpu={_sr_gpu()}",
-            f"top_procs={_sr_top_processes()} ",
-            f"meminfo={_sr_meminfo()} ",
+            "[SC_DRIVER_MONITOR] "
+            f"pid={_sc_os.getpid()} "
+            f"status={_sc_status()} "
+            f"tmp={_sc_disk_usage('/tmp')} "
+            f"shm={_sc_disk_usage('/dev/shm')} "
+            f"lmcache={_sc_disk_usage((_sc_os.environ.get('SC_LMCACHE_DATA_DIR') or '/tmp'))} "
+            f"gpu={_sc_gpu()}",
+            f"top_procs={_sc_top_processes()} ",
+            f"meminfo={_sc_meminfo()} ",
             flush=True,
         )
-        _sr_time.sleep(30)
+        _sc_time.sleep(interval_s)
 
 
-def _sr_start_monitor():
-    t = _sr_threading.Thread(target=_sr_monitor_loop, daemon=True)
+def _sc_start_monitor():
+    if not _sc_env_flag("SC_DRIVER_RESOURCE_MONITOR_ENABLE", False):
+        return
+    t = _sc_threading.Thread(
+        target=_sc_monitor_loop,
+        daemon=True,
+        name="sc-driver-resource-monitor",
+    )
     t.start()
-# ===== SRIRAM PROCESS MONITOR END =====
+# ===== SC DRIVER RESOURCE MONITOR END =====
 
 def passage_prefix_signature(sorted_passage, n=2):
     """Legacy signature: hash the first n passages as one opaque prefix."""
@@ -235,9 +256,9 @@ sys.path.insert(0, vllm_root)
 # )
 # from kvcache_visualize import visualize as kv_visualize
 LM_CACHE_DISK_PATH = os.environ.get(
-    "SRIRAM_LMCACHE_DIR",
+    "SC_LMCACHE_DATA_DIR",
     "/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/lmcache_vllm/manual",
-)
+) or "/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/lmcache_vllm/manual"
 # LM_CACHE_DISK_PATH = "/scratch/sriramc2/vllm/"
 
 # Define duplicated LMCache settings once so the generated YAML and the
@@ -480,8 +501,17 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
         enable_prefix_caching=True,
     )
 
-    print("[SRIRAM BEFORE LLM] CUDA_VISIBLE_DEVICES=", os.environ.get("CUDA_VISIBLE_DEVICES"), flush=True)
-    print("[SRIRAM BEFORE LLM] CUDA_DEVICE_ORDER=", os.environ.get("CUDA_DEVICE_ORDER"), flush=True)
+    if _sc_io_trace_enabled():
+        print(
+            "[SC_BEFORE_LLM] CUDA_VISIBLE_DEVICES=",
+            os.environ.get("CUDA_VISIBLE_DEVICES"),
+            flush=True,
+        )
+        print(
+            "[SC_BEFORE_LLM] CUDA_DEVICE_ORDER=",
+            os.environ.get("CUDA_DEVICE_ORDER"),
+            flush=True,
+        )
 
     print(
         "[LMCache configuration] disk path:",
@@ -495,13 +525,13 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
     finally:
         LMCacheEngineBuilder.destroy(ENGINE_NAME)
 
-def _kvio_trace_enabled() -> bool:
-    return os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1"
+def _sc_io_trace_enabled() -> bool:
+    return _sc_env_flag("SC_LMCACHE_IO_TRACE_ENABLE", False)
 
 
-def _kvio_proc_io_snapshot() -> dict[str, int]:
+def _sc_io_proc_snapshot() -> dict[str, int]:
     values: dict[str, int] = {}
-    if not _kvio_trace_enabled():
+    if not _sc_io_trace_enabled():
         return values
     try:
         with open("/proc/self/io", "r", encoding="utf-8") as f:
@@ -509,7 +539,7 @@ def _kvio_proc_io_snapshot() -> dict[str, int]:
                 key, value = line.split(":", 1)
                 values[key.strip()] = int(value.strip())
     except Exception as exc:
-        print(f"[KVIO_DRIVER_PROC_IO_ERROR] error={exc!r}", flush=True)
+        print(f"[SC_IO_DRIVER_PROC_IO_ERROR] error={exc!r}", flush=True)
     return values
 
 
@@ -554,10 +584,10 @@ def generate_in_submission_batches(
 
         batch_start = time.time()
         batch_start_mono = time.monotonic()
-        batch_io_before = _kvio_proc_io_snapshot()
-        if _kvio_trace_enabled():
+        batch_io_before = _sc_io_proc_snapshot()
+        if _sc_io_trace_enabled():
             print(
-                "[KVIO_DRIVER_BATCH_START] "
+                "[SC_IO_DRIVER_BATCH_START] "
                 f"phase={phase_name} batch={batch_number}/{total_batches} "
                 f"requests={start_idx}:{end_idx} wall={batch_start:.6f} "
                 f"mono={batch_start_mono:.6f} proc_io={batch_io_before}",
@@ -572,14 +602,14 @@ def generate_in_submission_batches(
         batch_end = time.time()
         batch_end_mono = time.monotonic()
         batch_elapsed = batch_end - batch_start
-        batch_io_after = _kvio_proc_io_snapshot()
-        if _kvio_trace_enabled():
+        batch_io_after = _sc_io_proc_snapshot()
+        if _sc_io_trace_enabled():
             io_delta = {
                 key: batch_io_after.get(key, 0) - batch_io_before.get(key, 0)
                 for key in set(batch_io_before) | set(batch_io_after)
             }
             print(
-                "[KVIO_DRIVER_BATCH_DONE] "
+                "[SC_IO_DRIVER_BATCH_DONE] "
                 f"phase={phase_name} batch={batch_number}/{total_batches} "
                 f"requests={start_idx}:{end_idx} wall={batch_end:.6f} "
                 f"mono={batch_end_mono:.6f} elapsed={batch_end_mono - batch_start_mono:.6f} "
@@ -835,7 +865,7 @@ def main():
     if not args.question and not args.questions_json:
         raise ValueError("provide either --question or --questions_json")
     
-    _sr_start_monitor()
+    _sc_start_monitor()
     setup_environment_variables()
 
     questions = load_questions(args)
@@ -1012,20 +1042,20 @@ def main():
             f"first generation took {cold_time_taken:.2f} seconds.",
             flush=True,
         )
-        if _kvio_trace_enabled():
+        if _sc_io_trace_enabled():
             print(
-                "[KVIO_PHASE_BOUNDARY] "
+                "[SC_IO_PHASE_BOUNDARY] "
                 f"phase=cold_done wall={time.time():.6f} "
-                f"mono={time.monotonic():.6f} proc_io={_kvio_proc_io_snapshot()}",
+                f"mono={time.monotonic():.6f} proc_io={_sc_io_proc_snapshot()}",
                 flush=True,
             )
 
         print("Warm run starting...", flush=True)
-        if _kvio_trace_enabled():
+        if _sc_io_trace_enabled():
             print(
-                "[KVIO_PHASE_BOUNDARY] "
+                "[SC_IO_PHASE_BOUNDARY] "
                 f"phase=warm_start wall={time.time():.6f} "
-                f"mono={time.monotonic():.6f} proc_io={_kvio_proc_io_snapshot()}",
+                f"mono={time.monotonic():.6f} proc_io={_sc_io_proc_snapshot()}",
                 flush=True,
             )
         warm_start = time.time()

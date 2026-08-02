@@ -32,6 +32,7 @@ from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
 from lmcache.v1.memory_management import GPUMemoryAllocator  # noqa: E501
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.sc_config import gpu_assert_snapshot_enabled
 import lmcache.c_ops as lmc_ops
 
 logger = init_logger(__name__)
@@ -280,21 +281,21 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
         """
         if memory_obj.tensor is None:
-            try:
+            if gpu_assert_snapshot_enabled():
                 try:
-                    from lmcache.v1.memory_management import _sr_mem_snapshot
-                except Exception:
-                    _sr_mem_snapshot = None
-                    
-                if _sr_mem_snapshot is not None and os.environ.get("SRIRAM_KV_IO_TRACE", "0") == "1":
-                    _sr_mem_snapshot(
+                    from lmcache.v1.memory_management import _sc_memory_snapshot
+
+                    _sc_memory_snapshot(
                         "GPU_CONNECTOR_TENSOR_NONE_BEFORE_ASSERT",
                         memory_obj,
                         extra=f"start={start} end={end} kwargs={kwargs}",
                         stack=True,
+                        force=True,
                     )
-            except Exception as e:
-                print(f"[SRIRAM_GPUCONNECTOR_ASSERTDBG_ERROR] {e!r}", flush=True)
+                except Exception as exc:
+                    logger.exception(
+                        "[SC_GPU_ASSERT_SNAPSHOT_ERROR] error=%r", exc
+                    )
             assert memory_obj.tensor is not None
 
         self.initialize_kvcaches_ptr(**kwargs)
