@@ -17,8 +17,8 @@ if [[ "${SC_LMCACHE_SOURCE_DEFAULT_KNOBS:-1}" == "1" ]]; then
   source "$REPO/local_repro/sc_lmcache_knobs.sh"
 fi
 export PYTHONFAULTHANDLER=1
-export MAX_QUESTIONS=250
-export SUBMISSION_BATCH_SIZE=50
+export MAX_QUESTIONS="${MAX_QUESTIONS:-250}"
+export SUBMISSION_BATCH_SIZE="${SUBMISSION_BATCH_SIZE:-50}"
 # export CUDA_DEVICE_ORDER=PCI_BUS_ID
 # export CUDA_VISIBLE_DEVICES=0
 export DATASET_NAME="medical"
