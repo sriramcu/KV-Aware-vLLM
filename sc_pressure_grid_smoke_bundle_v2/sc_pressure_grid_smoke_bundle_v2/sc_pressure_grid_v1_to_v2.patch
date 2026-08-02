@@ -1,0 +1,61 @@
+diff --git a/local_repro/cpu_offload_lmcache_sriram.py b/local_repro/cpu_offload_lmcache_sriram.py
+index accea419c14ebbbeaee90111393f4d9388d65a11..0a16ffd64e4c63b09b435d0046c45748cfec2f3b 100644
+--- a/local_repro/cpu_offload_lmcache_sriram.py
++++ b/local_repro/cpu_offload_lmcache_sriram.py
+@@ -1151,9 +1151,12 @@ def main():
+             f"first generation took {cold_time_taken:.2f} seconds.",
+             flush=True,
+         )
+-        cold_request_metrics, _ = _sc_emit_phase_metrics(
+-            "cold", cold_outputs, cold_time_taken
+-        )
++        cold_request_metrics = None
++        if _sc_io_trace_enabled():
++            cold_request_metrics, _ = _sc_emit_phase_metrics(
++                "cold", cold_outputs, cold_time_taken
++            )
++
+         if _sc_io_trace_enabled():
+             print(
+                 "[SC_IO_PHASE_BOUNDARY] "
+@@ -1197,11 +1200,18 @@ def main():
+                 "Failed to restore warm outputs to cold/source request order"
+             )
+ 
+-        warm_request_metrics, _ = _sc_emit_phase_metrics(
+-            "warm", warm_outputs, warm_time_taken
+-        )
+-        _sc_emit_output_consistency(cold_request_metrics, warm_request_metrics)
+-        print("[SC_DRIVER_METRICS_DONE]", flush=True)
++        if _sc_io_trace_enabled():
++            warm_request_metrics, _ = _sc_emit_phase_metrics(
++                "warm", warm_outputs, warm_time_taken
++            )
++            if cold_request_metrics is None:
++                raise RuntimeError(
++                    "Cold request metrics missing while IO tracing is enabled"
++                )
++            _sc_emit_output_consistency(
++                cold_request_metrics, warm_request_metrics
++            )
++            print("[SC_DRIVER_METRICS_DONE]", flush=True)
+ 
+         outputs = warm_outputs
+         # start = warm_start
+diff --git a/local_repro/grid_search/README.md b/local_repro/grid_search/README.md
+index 7e803d1a893c8403d85be41fd490fa0611ec1231..2e33f1b83f5b9b8d30c5564521ff6131a86bebd6 100644
+--- a/local_repro/grid_search/README.md
++++ b/local_repro/grid_search/README.md
+@@ -85,8 +85,10 @@ traces remain disabled.
+ 
+ ## Simple structured metrics
+ 
+-The driver emits JSON log records for exact prompt/output-token counts, finish
+-reasons, phase throughput, and cold/warm output consistency:
++When `SC_LMCACHE_IO_TRACE_ENABLE=1`, the driver emits JSON log records for
++exact prompt/output-token counts, finish reasons, phase throughput, and
++cold/warm output consistency. Setting that existing switch to `0` disables all
++four lightweight driver-metric records as well as the detailed IO trace:
+ 
+ ```text
+ [SC_DRIVER_REQUEST_METRIC] {...}

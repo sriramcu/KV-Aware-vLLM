@@ -1,0 +1,1404 @@
+diff --git a/local_repro/cpu_offload_lmcache_sriram.py b/local_repro/cpu_offload_lmcache_sriram.py
+index 32c287b33f0245fa7528af4e58f2260a7a59ca87..0a16ffd64e4c63b09b435d0046c45748cfec2f3b 100644
+--- a/local_repro/cpu_offload_lmcache_sriram.py
++++ b/local_repro/cpu_offload_lmcache_sriram.py
+@@ -543,6 +543,115 @@ def _sc_io_proc_snapshot() -> dict[str, int]:
+     return values
+ 
+ 
++def _sc_request_output_metric(phase_name, source_index, output):
++    completion = output.outputs[0]
++    prompt_token_ids = getattr(output, "prompt_token_ids", None)
++    output_token_ids = getattr(completion, "token_ids", None)
++    generated_text = getattr(completion, "text", "") or ""
++    finish_reason = getattr(completion, "finish_reason", None)
++    metric = {
++        "phase": phase_name,
++        "source_index": source_index,
++        "request_id": str(getattr(output, "request_id", "")),
++        "prompt_tokens": (
++            len(prompt_token_ids) if prompt_token_ids is not None else None
++        ),
++        "output_tokens": (
++            len(output_token_ids) if output_token_ids is not None else None
++        ),
++        "finish_reason": (
++            str(finish_reason) if finish_reason is not None else None
++        ),
++        "output_sha256": hashlib.sha256(
++            generated_text.encode("utf-8")
++        ).hexdigest(),
++    }
++    print(
++        "[SC_DRIVER_REQUEST_METRIC] "
++        + json.dumps(metric, sort_keys=True, separators=(",", ":")),
++        flush=True,
++    )
++    return metric
++
++
++def _sc_emit_phase_metrics(phase_name, outputs, elapsed_seconds):
++    request_metrics = [
++        _sc_request_output_metric(phase_name, source_index, output)
++        for source_index, output in enumerate(outputs)
++    ]
++    prompt_counts = [
++        metric["prompt_tokens"]
++        for metric in request_metrics
++        if metric["prompt_tokens"] is not None
++    ]
++    output_counts = [
++        metric["output_tokens"]
++        for metric in request_metrics
++        if metric["output_tokens"] is not None
++    ]
++    finish_reasons = {}
++    for metric in request_metrics:
++        reason = metric["finish_reason"] or "unknown"
++        finish_reasons[reason] = finish_reasons.get(reason, 0) + 1
++
++    requests = len(request_metrics)
++    prompt_tokens = sum(prompt_counts) if len(prompt_counts) == requests else None
++    output_tokens = sum(output_counts) if len(output_counts) == requests else None
++    elapsed = float(elapsed_seconds)
++    summary = {
++        "phase": phase_name,
++        "requests": requests,
++        "elapsed_seconds": elapsed,
++        "requests_per_second": requests / elapsed if elapsed > 0 else None,
++        "prompt_tokens": prompt_tokens,
++        "prompt_tokens_per_second": (
++            prompt_tokens / elapsed
++            if prompt_tokens is not None and elapsed > 0
++            else None
++        ),
++        "output_tokens": output_tokens,
++        "output_tokens_per_second": (
++            output_tokens / elapsed
++            if output_tokens is not None and elapsed > 0
++            else None
++        ),
++        "finish_reasons": finish_reasons,
++    }
++    print(
++        "[SC_DRIVER_PHASE_SUMMARY] "
++        + json.dumps(summary, sort_keys=True, separators=(",", ":")),
++        flush=True,
++    )
++    return request_metrics, summary
++
++
++def _sc_emit_output_consistency(cold_metrics, warm_metrics):
++    if len(cold_metrics) != len(warm_metrics):
++        raise RuntimeError(
++            "Cold/warm request metric lengths differ: "
++            f"{len(cold_metrics)} != {len(warm_metrics)}"
++        )
++    mismatch_indices = [
++        index
++        for index, (cold, warm) in enumerate(zip(cold_metrics, warm_metrics))
++        if cold["output_sha256"] != warm["output_sha256"]
++        or cold["output_tokens"] != warm["output_tokens"]
++        or cold["finish_reason"] != warm["finish_reason"]
++    ]
++    summary = {
++        "requests": len(cold_metrics),
++        "mismatch_count": len(mismatch_indices),
++        "mismatch_source_indices": mismatch_indices[:100],
++        "mismatch_indices_truncated": len(mismatch_indices) > 100,
++    }
++    print(
++        "[SC_DRIVER_OUTPUT_CONSISTENCY] "
++        + json.dumps(summary, sort_keys=True, separators=(",", ":")),
++        flush=True,
++    )
++    return summary
++
++
+ def generate_in_submission_batches(
+     llm,
+     llm_inputs,
+@@ -1042,6 +1151,12 @@ def main():
+             f"first generation took {cold_time_taken:.2f} seconds.",
+             flush=True,
+         )
++        cold_request_metrics = None
++        if _sc_io_trace_enabled():
++            cold_request_metrics, _ = _sc_emit_phase_metrics(
++                "cold", cold_outputs, cold_time_taken
++            )
++
+         if _sc_io_trace_enabled():
+             print(
+                 "[SC_IO_PHASE_BOUNDARY] "
+@@ -1085,6 +1200,19 @@ def main():
+                 "Failed to restore warm outputs to cold/source request order"
+             )
+ 
++        if _sc_io_trace_enabled():
++            warm_request_metrics, _ = _sc_emit_phase_metrics(
++                "warm", warm_outputs, warm_time_taken
++            )
++            if cold_request_metrics is None:
++                raise RuntimeError(
++                    "Cold request metrics missing while IO tracing is enabled"
++                )
++            _sc_emit_output_consistency(
++                cold_request_metrics, warm_request_metrics
++            )
++            print("[SC_DRIVER_METRICS_DONE]", flush=True)
++
+         outputs = warm_outputs
+         # start = warm_start
+ 
+diff --git a/local_repro/grid_search/README.md b/local_repro/grid_search/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..2e33f1b83f5b9b8d30c5564521ff6131a86bebd6
+--- /dev/null
++++ b/local_repro/grid_search/README.md
+@@ -0,0 +1,102 @@
++# SC LMCache pressure grid
++
++This directory contains a foreground, resumable Slurm grid runner. It submits
++one H100 job at a time; the master process itself is not a Slurm job.
++
++## Smoke grid
++
++From the repository root:
++
++```bash
++./local_repro/grid_search/run_smoke_grid.sh
++```
++
++The smoke wrapper runs all 16 configurations with `MAX_QUESTIONS=1`. To inspect
++the grid without submitting anything:
++
++```bash
++./local_repro/grid_search/run_smoke_grid.sh --print-grid
++```
++
++The default persistent directory is:
++
++```text
++~/runs/kvaware_repro/pressure_grid/sc-pressure-grid-v1_maxq_1/
++```
++
++Important files:
++
++```text
++grid_state.json       authoritative resumable state
++grid_progress.txt     human-readable status, atomically refreshed every poll
++active_job_id.txt     master-managed copy of the current Slurm job ID
++runs/*/config.json    exact configuration for each grid point
++runs/*/summary.json   simple metrics parsed after a terminal job
++runs/*/slurm-*.out    stdout for each submitted attempt
++runs/*/slurm-*.err    stderr for each submitted attempt
++```
++
++When all configurations are terminal, the runner creates:
++
++```text
++~/runs/kvaware_repro/pressure_grid/sc-pressure-grid-v1_maxq_1.zip
++```
++
++## Interrupt and resume
++
++Between jobs the runner prints an interruptible four-second warning countdown.
++After the countdown it briefly defers Ctrl-C while it writes the current state,
++submits with `sbatch`, captures the job ID, and persists that ID. It then prints
++that Ctrl-C is safe again.
++
++Ctrl-C while waiting stops only the foreground master. It does not cancel the
++Slurm job. Run the same command again to resume. The master uses
++`grid_state.json` as the authority and repairs `active_job_id.txt` when needed.
++
++A real Slurm job that reaches `FAILED`, `TIMEOUT`, `OUT_OF_MEMORY`, `CANCELLED`,
++or another terminal failure is recorded and the grid advances without retrying.
++Only an unfinished run whose persisted job ID cannot be associated with any
++`squeue` or `sacct` record after the recovery grace is resubmitted.
++
++A run is successful only when Slurm reports `COMPLETED` and its stdout contains
++`=== DONE ===`.
++
++## Real grid
++
++After validating the smoke archive, use a distinct automatically selected state
++directory for 250 questions:
++
++```bash
++python local_repro/grid_search/run_pressure_grid.py --max-questions 250
++```
++
++The grid is one-factor-at-a-time around the fresh refactored baseline:
++
++- scheduler admission: default, max 1, max 12, wait 100 ms, wait 1000 ms;
++- worker admission per TP rank: max 1, 4, 12;
++- disk-put admission: max pending 8, 1, 32;
++- dataset: Medical versus HotpotQA;
++- submission batch size: 50 versus 10 and 250;
++- vLLM `max_num_seqs`: 4 versus 12.
++
++GNN remains disabled. The fixed diagnostics are IO, load, memory pressure, and
++the driver resource monitor; heavier request, lookup-stack, tier, and snapshot
++traces remain disabled.
++
++## Simple structured metrics
++
++When `SC_LMCACHE_IO_TRACE_ENABLE=1`, the driver emits JSON log records for
++exact prompt/output-token counts, finish reasons, phase throughput, and
++cold/warm output consistency. Setting that existing switch to `0` disables all
++four lightweight driver-metric records as well as the detailed IO trace:
++
++```text
++[SC_DRIVER_REQUEST_METRIC] {...}
++[SC_DRIVER_PHASE_SUMMARY] {...}
++[SC_DRIVER_OUTPUT_CONSISTENCY] {...}
++[SC_DRIVER_METRICS_DONE]
++```
++
++The master copies the phase summaries and a few inexpensive failure counters
++into each `summary.json`. Detailed pressure and contention analysis should still
++be performed from the complete `.out` logs.
+diff --git a/local_repro/grid_search/run_pressure_grid.py b/local_repro/grid_search/run_pressure_grid.py
+new file mode 100755
+index 0000000000000000000000000000000000000000..c853c7f914127b71ae0ec2c6f305ab6e8cda9a0c
+--- /dev/null
++++ b/local_repro/grid_search/run_pressure_grid.py
+@@ -0,0 +1,1066 @@
++#!/usr/bin/env python3
++"""Foreground, resumable Slurm runner for the SC LMCache pressure grid."""
++
++from __future__ import annotations
++
++import argparse
++import contextlib
++import datetime as dt
++import hashlib
++import json
++import os
++import re
++import shlex
++import signal
++import subprocess
++import sys
++import time
++import zipfile
++from collections import Counter
++from pathlib import Path
++from typing import Any, Iterator
++
++GRID_VERSION = "sc-pressure-grid-v1"
++SCHEMA_VERSION = 1
++TERMINAL_SLURM_STATES = {
++    "BOOT_FAIL",
++    "CANCELLED",
++    "COMPLETED",
++    "DEADLINE",
++    "FAILED",
++    "NODE_FAIL",
++    "OUT_OF_MEMORY",
++    "PREEMPTED",
++    "REVOKED",
++    "SPECIAL_EXIT",
++    "TIMEOUT",
++}
++ACTIVE_SLURM_STATES = {
++    "CONFIGURING",
++    "COMPLETING",
++    "PENDING",
++    "RUNNING",
++    "RESIZING",
++    "REQUEUED",
++    "REQUEUE_FED",
++    "REQUEUE_HOLD",
++    "SIGNALING",
++    "STAGE_OUT",
++    "SUSPENDED",
++}
++DONE_MARKER = "=== DONE ==="
++
++
++def utc_now() -> str:
++    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
++
++
++def canonical_json(value: Any) -> str:
++    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
++
++
++def sha256_text(value: str) -> str:
++    return hashlib.sha256(value.encode("utf-8")).hexdigest()
++
++
++def atomic_write_text(path: Path, text: str) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
++    with tmp.open("w", encoding="utf-8") as handle:
++        handle.write(text)
++        handle.flush()
++        os.fsync(handle.fileno())
++    os.replace(tmp, path)
++
++
++def atomic_write_json(path: Path, value: Any) -> None:
++    atomic_write_text(path, json.dumps(value, indent=2, sort_keys=True) + "\n")
++
++
++def read_json(path: Path) -> dict[str, Any]:
++    with path.open("r", encoding="utf-8") as handle:
++        value = json.load(handle)
++    if not isinstance(value, dict):
++        raise ValueError(f"Expected JSON object in {path}")
++    return value
++
++
++def normalize_slurm_state(value: str) -> str:
++    value = value.strip().upper()
++    value = value.split("+", 1)[0]
++    value = value.split(" ", 1)[0]
++    return value
++
++
++def run_checked(command: list[str]) -> subprocess.CompletedProcess[str]:
++    try:
++        return subprocess.run(
++            command,
++            check=True,
++            text=True,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++        )
++    except FileNotFoundError as exc:
++        raise RuntimeError(f"Required command not found: {command[0]}") from exc
++    except subprocess.CalledProcessError as exc:
++        rendered = shlex.join(command)
++        raise RuntimeError(
++            f"Command failed ({exc.returncode}): {rendered}\n"
++            f"stdout:\n{exc.stdout}\nstderr:\n{exc.stderr}"
++        ) from exc
++
++
++def base_environment(max_questions: int) -> dict[str, str]:
++    return {
++        "MAX_QUESTIONS": str(max_questions),
++        "DATASET_NAME": "medical",
++        "SUBMISSION_BATCH_SIZE": "50",
++        "VLLM_MAX_NUM_SEQS": "4",
++        "VLLM_KV_IMPORTANCE_ENABLE": "0",
++        "SC_LMCACHE_SOURCE_DEFAULT_KNOBS": "1",
++        "SC_LMCACHE_PROFILE": "custom",
++        "SC_LMCACHE_SCHEDULER_LOOKUP_ADMISSION_ENABLE": "0",
++        "SC_LMCACHE_SCHEDULER_LOOKUP_MAX_INFLIGHT": "4",
++        "SC_LMCACHE_SCHEDULER_LOOKUP_ADMISSION_WAIT_MS": "0",
++        "SC_LMCACHE_WORKER_LOOKUP_ADMISSION_ENABLE": "0",
++        "SC_LMCACHE_WORKER_LOOKUP_MAX_INFLIGHT": "1",
++        "SC_LMCACHE_DISK_PUT_ADMISSION_ENABLE": "0",
++        "SC_LMCACHE_DISK_PUT_MAX_PENDING": "8",
++        "SC_LMCACHE_IO_TRACE_ENABLE": "1",
++        "SC_LMCACHE_LOAD_TRACE_ENABLE": "1",
++        "SC_LMCACHE_MEMORY_TRACE_ENABLE": "1",
++        "SC_LMCACHE_MEMORY_SNAPSHOT_ENABLE": "0",
++        "SC_LMCACHE_LOOKUP_TRACE_ENABLE": "0",
++        "SC_LMCACHE_REQUEST_TRACE_ENABLE": "0",
++        "SC_LMCACHE_TIER_TRACE_ENABLE": "0",
++        "SC_LMCACHE_GPU_ASSERT_SNAPSHOT_ENABLE": "0",
++        "SC_LMCACHE_MEMORY_TRACE_INTERVAL_S": "5",
++        "SC_LMCACHE_LONG_PIN_THRESHOLD_S": "10",
++        "SC_LMCACHE_LONG_REF_THRESHOLD_S": "10",
++        "SC_DRIVER_RESOURCE_MONITOR_ENABLE": "1",
++        "SC_DRIVER_RESOURCE_MONITOR_INTERVAL_S": "30",
++        "CLEAN_OLD_LMCACHE": "1",
++    }
++
++
++def make_grid(max_questions: int) -> list[dict[str, Any]]:
++    base = base_environment(max_questions)
++    rows: list[tuple[str, str, dict[str, str]]] = [
++        ("00_baseline", "Fresh refactored baseline; all admission gates disabled", {}),
++        (
++            "01_scheduler_default",
++            "Scheduler admission enabled; max inflight 4; wait 0 ms",
++            {"SC_LMCACHE_SCHEDULER_LOOKUP_ADMISSION_ENABLE": "1"},
++        ),
++        (
++            "02_scheduler_max_1",
++            "Scheduler admission enabled; max inflight 1",
++            {
++                "SC_LMCACHE_SCHEDULER_LOOKUP_ADMISSION_ENABLE": "1",
++                "SC_LMCACHE_SCHEDULER_LOOKUP_MAX_INFLIGHT": "1",
++            },
++        ),
++        (
++            "03_scheduler_max_12",
++            "Scheduler admission enabled; max inflight 12",
++            {
++                "SC_LMCACHE_SCHEDULER_LOOKUP_ADMISSION_ENABLE": "1",
++                "SC_LMCACHE_SCHEDULER_LOOKUP_MAX_INFLIGHT": "12",
++            },
++        ),
++        (
++            "04_scheduler_wait_100ms",
++            "Scheduler admission enabled; max inflight 4; wait 100 ms",
++            {
++                "SC_LMCACHE_SCHEDULER_LOOKUP_ADMISSION_ENABLE": "1",
++                "SC_LMCACHE_SCHEDULER_LOOKUP_ADMISSION_WAIT_MS": "100",
++            },
++        ),
++        (
++            "05_scheduler_wait_1000ms",
++            "Scheduler admission enabled; max inflight 4; wait 1000 ms",
++            {
++                "SC_LMCACHE_SCHEDULER_LOOKUP_ADMISSION_ENABLE": "1",
++                "SC_LMCACHE_SCHEDULER_LOOKUP_ADMISSION_WAIT_MS": "1000",
++            },
++        ),
++        (
++            "06_worker_max_1",
++            "Worker admission enabled; max inflight 1 per TP rank",
++            {"SC_LMCACHE_WORKER_LOOKUP_ADMISSION_ENABLE": "1"},
++        ),
++        (
++            "07_worker_max_4",
++            "Worker admission enabled; max inflight 4 per TP rank",
++            {
++                "SC_LMCACHE_WORKER_LOOKUP_ADMISSION_ENABLE": "1",
++                "SC_LMCACHE_WORKER_LOOKUP_MAX_INFLIGHT": "4",
++            },
++        ),
++        (
++            "08_worker_max_12",
++            "Worker admission enabled; max inflight 12 per TP rank",
++            {
++                "SC_LMCACHE_WORKER_LOOKUP_ADMISSION_ENABLE": "1",
++                "SC_LMCACHE_WORKER_LOOKUP_MAX_INFLIGHT": "12",
++            },
++        ),
++        (
++            "09_disk_put_default",
++            "Disk-put admission enabled; max pending 8",
++            {"SC_LMCACHE_DISK_PUT_ADMISSION_ENABLE": "1"},
++        ),
++        (
++            "10_disk_put_max_1",
++            "Disk-put admission enabled; max pending 1",
++            {
++                "SC_LMCACHE_DISK_PUT_ADMISSION_ENABLE": "1",
++                "SC_LMCACHE_DISK_PUT_MAX_PENDING": "1",
++            },
++        ),
++        (
++            "11_disk_put_max_32",
++            "Disk-put admission enabled; max pending 32",
++            {
++                "SC_LMCACHE_DISK_PUT_ADMISSION_ENABLE": "1",
++                "SC_LMCACHE_DISK_PUT_MAX_PENDING": "32",
++            },
++        ),
++        ("12_dataset_hotpotqa", "HotpotQA dataset", {"DATASET_NAME": "hotpotqa"}),
++        (
++            "13_submission_batch_10",
++            "Submission batch size 10",
++            {"SUBMISSION_BATCH_SIZE": "10"},
++        ),
++        (
++            "14_submission_batch_250",
++            "Submission batch size 250",
++            {"SUBMISSION_BATCH_SIZE": "250"},
++        ),
++        (
++            "15_max_num_seqs_12",
++            "vLLM max_num_seqs 12",
++            {"VLLM_MAX_NUM_SEQS": "12"},
++        ),
++    ]
++
++    grid: list[dict[str, Any]] = []
++    for index, (run_id, description, overrides) in enumerate(rows):
++        env = dict(base)
++        env.update(overrides)
++        config_core = {
++            "index": index,
++            "run_id": run_id,
++            "description": description,
++            "environment": env,
++        }
++        grid.append(
++            {
++                **config_core,
++                "config_sha256": sha256_text(canonical_json(config_core)),
++            }
++        )
++    return grid
++
++
++def default_state_dir(max_questions: int) -> Path:
++    return (
++        Path.home()
++        / "runs"
++        / "kvaware_repro"
++        / "pressure_grid"
++        / f"{GRID_VERSION}_maxq_{max_questions}"
++    )
++
++
++def git_metadata(repo: Path) -> dict[str, Any]:
++    metadata: dict[str, Any] = {"repo": str(repo)}
++    for key, command in {
++        "commit": ["git", "-C", str(repo), "rev-parse", "HEAD"],
++        "branch": ["git", "-C", str(repo), "branch", "--show-current"],
++        "status": ["git", "-C", str(repo), "status", "--short"],
++    }.items():
++        try:
++            metadata[key] = run_checked(command).stdout.strip()
++        except RuntimeError as exc:
++            metadata[key] = f"unavailable: {exc}"
++    return metadata
++
++
++def initialize_state(
++    state_dir: Path,
++    repo: Path,
++    sbatch_script: Path,
++    max_questions: int,
++    grid: list[dict[str, Any]],
++) -> dict[str, Any]:
++    state_dir.mkdir(parents=True, exist_ok=True)
++    runs_dir = state_dir / "runs"
++    runs_dir.mkdir(parents=True, exist_ok=True)
++
++    grid_sha256 = sha256_text(canonical_json(grid))
++    run_states = []
++    for config in grid:
++        run_dir = runs_dir / config["run_id"]
++        run_dir.mkdir(parents=True, exist_ok=True)
++        atomic_write_json(run_dir / "config.json", config)
++        run_states.append(
++            {
++                "run_id": config["run_id"],
++                "status": "pending",
++                "job_id": None,
++                "slurm_state": None,
++                "attempts": [],
++                "submitted_at": None,
++                "last_seen_at": None,
++                "terminal_observed_at": None,
++                "finished_at": None,
++                "summary_path": None,
++                "failure_reason": None,
++            }
++        )
++
++    state = {
++        "schema_version": SCHEMA_VERSION,
++        "grid_version": GRID_VERSION,
++        "grid_sha256": grid_sha256,
++        "max_questions": max_questions,
++        "created_at": utc_now(),
++        "updated_at": utc_now(),
++        "repo_metadata": git_metadata(repo),
++        "sbatch_script": str(sbatch_script),
++        "state_dir": str(state_dir),
++        "runs": run_states,
++        "archive_path": None,
++        "archive_sha256": None,
++    }
++    atomic_write_json(state_dir / "grid_manifest.json", {"grid": grid, "grid_sha256": grid_sha256})
++    atomic_write_json(state_dir / "grid_state.json", state)
++    atomic_write_text(state_dir / "active_job_id.txt", "")
++    return state
++
++
++def validate_loaded_state(
++    state: dict[str, Any], max_questions: int, grid: list[dict[str, Any]]
++) -> None:
++    expected_hash = sha256_text(canonical_json(grid))
++    checks = {
++        "schema_version": SCHEMA_VERSION,
++        "grid_version": GRID_VERSION,
++        "max_questions": max_questions,
++        "grid_sha256": expected_hash,
++    }
++    mismatches = {
++        key: {"expected": expected, "actual": state.get(key)}
++        for key, expected in checks.items()
++        if state.get(key) != expected
++    }
++    if mismatches:
++        raise RuntimeError(
++            "Existing grid state does not match this runner invocation:\n"
++            + json.dumps(mismatches, indent=2, sort_keys=True)
++        )
++    if len(state.get("runs", [])) != len(grid):
++        raise RuntimeError("Existing state has a different number of grid runs")
++
++
++def save_state(state_dir: Path, state: dict[str, Any]) -> None:
++    state["updated_at"] = utc_now()
++    atomic_write_json(state_dir / "grid_state.json", state)
++
++
++def status_counts(state: dict[str, Any]) -> Counter[str]:
++    return Counter(str(run.get("status", "unknown")) for run in state["runs"])
++
++
++def first_unfinished_index(state: dict[str, Any]) -> int | None:
++    for index, run in enumerate(state["runs"]):
++        if run.get("status") not in {"completed", "failed"}:
++            return index
++    return None
++
++
++def write_progress(
++    state_dir: Path,
++    state: dict[str, Any],
++    grid: list[dict[str, Any]],
++    note: str = "",
++) -> None:
++    counts = status_counts(state)
++    total = len(grid)
++    terminal = counts["completed"] + counts["failed"]
++    current_index = first_unfinished_index(state)
++    lines = [
++        "SC LMCache pressure grid",
++        f"Grid version: {GRID_VERSION}",
++        f"MAX_QUESTIONS: {state['max_questions']}",
++        f"Progress: {terminal} / {total} terminal",
++        f"Completed: {counts['completed']}",
++        f"Failed: {counts['failed']}",
++        f"Pending/in progress: {total - terminal}",
++        f"Last update: {utc_now()}",
++    ]
++    if note:
++        lines.append(f"Note: {note}")
++    if current_index is None:
++        lines.append("Current: none; grid is terminal")
++    else:
++        config = grid[current_index]
++        run = state["runs"][current_index]
++        env = config["environment"]
++        lines.extend(
++            [
++                "",
++                f"Current index: {current_index + 1} / {total}",
++                f"Current run: {config['run_id']}",
++                f"Description: {config['description']}",
++                f"State: {run.get('status')}",
++                f"Slurm job ID: {run.get('job_id') or '-'}",
++                f"Slurm state: {run.get('slurm_state') or '-'}",
++                f"Dataset: {env['DATASET_NAME']}",
++                f"Submission batch size: {env['SUBMISSION_BATCH_SIZE']}",
++                f"max_num_seqs: {env['VLLM_MAX_NUM_SEQS']}",
++                "Behavioral knobs:",
++                f"  scheduler_enable={env['SC_LMCACHE_SCHEDULER_LOOKUP_ADMISSION_ENABLE']}",
++                f"  scheduler_max={env['SC_LMCACHE_SCHEDULER_LOOKUP_MAX_INFLIGHT']}",
++                f"  scheduler_wait_ms={env['SC_LMCACHE_SCHEDULER_LOOKUP_ADMISSION_WAIT_MS']}",
++                f"  worker_enable={env['SC_LMCACHE_WORKER_LOOKUP_ADMISSION_ENABLE']}",
++                f"  worker_max={env['SC_LMCACHE_WORKER_LOOKUP_MAX_INFLIGHT']}",
++                f"  disk_put_enable={env['SC_LMCACHE_DISK_PUT_ADMISSION_ENABLE']}",
++                f"  disk_put_max={env['SC_LMCACHE_DISK_PUT_MAX_PENDING']}",
++            ]
++        )
++        next_index = current_index + 1
++        if next_index < total:
++            lines.append(f"Next run: {grid[next_index]['run_id']}")
++    if state.get("archive_path"):
++        lines.append(f"Archive: {state['archive_path']}")
++    atomic_write_text(state_dir / "grid_progress.txt", "\n".join(lines) + "\n")
++
++
++def managed_active_job_file(state_dir: Path, job_id: str | None) -> None:
++    try:
++        atomic_write_text(
++            state_dir / "active_job_id.txt",
++            f"{job_id}\n" if job_id else "",
++        )
++    except OSError as exc:
++        # This file is only a convenience mirror. Recovery always uses the
++        # atomically written grid_state.json, so an unreadable or unwritable
++        # active-job file must not stop the grid.
++        print(
++            f"Warning: could not update active_job_id.txt: {exc}; "
++            "continuing with grid_state.json",
++            flush=True,
++        )
++
++
++def check_active_file(state_dir: Path, state_job_id: str | None) -> str | None:
++    path = state_dir / "active_job_id.txt"
++    try:
++        raw = path.read_text(encoding="utf-8").strip()
++    except (FileNotFoundError, OSError, UnicodeError):
++        return "active_job_id.txt is missing or unreadable; grid_state.json remains authoritative"
++    if not raw:
++        if state_job_id:
++            return "active_job_id.txt is empty; restoring it from grid_state.json"
++        return None
++    tokens = raw.split()
++    if len(tokens) != 1 or not tokens[0].isdigit():
++        return "active_job_id.txt is malformed; ignoring it and using grid_state.json"
++    if state_job_id and tokens[0] != str(state_job_id):
++        return (
++            f"active_job_id.txt contains {tokens[0]}, but state records {state_job_id}; "
++            "ignoring the file"
++        )
++    if not state_job_id:
++        return "active_job_id.txt has a job ID but no run is active in state; ignoring it"
++    return None
++
++
++class DeferredInterrupts:
++    def __init__(self) -> None:
++        self.received: list[int] = []
++        self.old_handlers: dict[int, Any] = {}
++
++    def _handler(self, signum: int, _frame: Any) -> None:
++        self.received.append(signum)
++        print(
++            f"\nReceived signal {signum}; deferring it until the protected submission section ends.",
++            flush=True,
++        )
++
++    def __enter__(self) -> "DeferredInterrupts":
++        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
++            self.old_handlers[signum] = signal.getsignal(signum)
++            signal.signal(signum, self._handler)
++        return self
++
++    def __exit__(self, _exc_type: Any, _exc: Any, _tb: Any) -> None:
++        for signum, handler in self.old_handlers.items():
++            signal.signal(signum, handler)
++
++    def raise_if_deferred(self) -> None:
++        if self.received:
++            raise KeyboardInterrupt
++
++
++def countdown_before_submission() -> None:
++    print("", flush=True)
++    print("Entering non-interruptible submission section in:", flush=True)
++    for remaining in range(4, 0, -1):
++        print(f"{remaining}...", flush=True)
++        time.sleep(1)
++    print("Do not interrupt now.", flush=True)
++
++
++def slurm_job_name(max_questions: int, index: int, run_id: str) -> str:
++    compact = re.sub(r"[^A-Za-z0-9_]", "_", run_id)
++    return f"scg_q{max_questions}_{index:02d}_{compact}"[:120]
++
++
++def build_export_argument(config: dict[str, Any]) -> str:
++    env = dict(config["environment"])
++    env.update(
++        {
++            "GRID_RUN_ID": config["run_id"],
++            "GRID_RUN_LABEL": config["run_id"],
++            "GRID_CONFIG_SHA256": config["config_sha256"],
++        }
++    )
++    for key, value in env.items():
++        if any(char in str(value) for char in (",", "\n", "\x00")):
++            raise ValueError(f"Unsafe value for sbatch --export: {key}={value!r}")
++    return "ALL," + ",".join(f"{key}={value}" for key, value in sorted(env.items()))
++
++
++def submit_run(
++    *,
++    state_dir: Path,
++    state: dict[str, Any],
++    grid: list[dict[str, Any]],
++    index: int,
++    sbatch_script: Path,
++) -> None:
++    config = grid[index]
++    run = state["runs"][index]
++    run_dir = state_dir / "runs" / config["run_id"]
++    countdown_before_submission()
++
++    deferred = DeferredInterrupts()
++    with deferred:
++        run["status"] = "submitting"
++        run["failure_reason"] = None
++        run["slurm_state"] = None
++        run["terminal_observed_at"] = None
++        save_state(state_dir, state)
++        write_progress(state_dir, state, grid, "Inside protected submission section")
++
++        job_name = slurm_job_name(state["max_questions"], index, config["run_id"])
++        output_pattern = run_dir / "slurm-%j.out"
++        error_pattern = run_dir / "slurm-%j.err"
++        command = [
++            "sbatch",
++            "--parsable",
++            f"--job-name={job_name}",
++            f"--output={output_pattern}",
++            f"--error={error_pattern}",
++            f"--export={build_export_argument(config)}",
++            str(sbatch_script),
++        ]
++
++        try:
++            result = run_checked(command)
++            raw_job_id = result.stdout.strip().splitlines()[-1]
++            job_id = raw_job_id.split(";", 1)[0]
++            if not job_id.isdigit():
++                raise RuntimeError(f"Could not parse sbatch job ID from: {raw_job_id!r}")
++        except Exception as exc:
++            run["status"] = "submission_error"
++            run["failure_reason"] = str(exc)
++            save_state(state_dir, state)
++            write_progress(state_dir, state, grid, f"Submission failed: {exc}")
++            raise
++
++        submitted_at = utc_now()
++        attempt = {
++            "attempt_number": len(run["attempts"]) + 1,
++            "job_id": job_id,
++            "job_name": job_name,
++            "submitted_at": submitted_at,
++            "output_path": str(run_dir / f"slurm-{job_id}.out"),
++            "error_path": str(run_dir / f"slurm-{job_id}.err"),
++            "terminal_state": None,
++            "exit_code": None,
++            "finished_at": None,
++            "result": None,
++        }
++        run["attempts"].append(attempt)
++        run["job_id"] = job_id
++        run["status"] = "submitted"
++        run["submitted_at"] = submitted_at
++        run["last_seen_at"] = None
++        save_state(state_dir, state)
++        managed_active_job_file(state_dir, job_id)
++        write_progress(state_dir, state, grid, f"Submitted Slurm job {job_id}")
++
++    print("Leaving non-interruptible section. You may press Ctrl-C safely.", flush=True)
++    print(f"Submitted {config['run_id']} as Slurm job {run['job_id']}.", flush=True)
++    deferred.raise_if_deferred()
++
++
++def query_squeue(job_id: str) -> str | None:
++    result = run_checked(["squeue", "-h", "-j", job_id, "-o", "%T"])
++    states = [normalize_slurm_state(line) for line in result.stdout.splitlines() if line.strip()]
++    if not states:
++        return None
++    return states[0]
++
++
++def query_sacct(job_id: str) -> dict[str, str] | None:
++    result = run_checked(
++        [
++            "sacct",
++            "-X",
++            "-n",
++            "-P",
++            "-j",
++            job_id,
++            "--format=JobIDRaw,JobName,State,ExitCode,Elapsed,Start,End",
++        ]
++    )
++    for line in result.stdout.splitlines():
++        fields = line.split("|")
++        if len(fields) < 7:
++            continue
++        if fields[0].strip() != job_id:
++            continue
++        return {
++            "job_id": fields[0].strip(),
++            "job_name": fields[1].strip(),
++            "state": normalize_slurm_state(fields[2]),
++            "state_raw": fields[2].strip(),
++            "exit_code": fields[3].strip(),
++            "elapsed": fields[4].strip(),
++            "start": fields[5].strip(),
++            "end": fields[6].strip(),
++        }
++    return None
++
++
++def age_seconds(iso_value: str | None) -> float | None:
++    if not iso_value:
++        return None
++    try:
++        parsed = dt.datetime.fromisoformat(iso_value)
++        return (dt.datetime.now(dt.timezone.utc) - parsed).total_seconds()
++    except ValueError:
++        return None
++
++
++def read_log_text(path: Path) -> str:
++    try:
++        return path.read_text(encoding="utf-8", errors="replace")
++    except FileNotFoundError:
++        return ""
++
++
++def parse_simple_summary(log_path: Path) -> dict[str, Any]:
++    text = read_log_text(log_path)
++    summary: dict[str, Any] = {
++        "log_path": str(log_path),
++        "log_exists": log_path.exists(),
++        "log_size_bytes": log_path.stat().st_size if log_path.exists() else 0,
++        "done_marker_present": DONE_MARKER in text,
++        "traceback_count": text.count("Traceback (most recent call last):"),
++        "lookup_timeout_count": text.count("SC_IO_LOOKUP_TIMEOUT"),
++        "resource_tracker_warning_count": text.count("resource_tracker:"),
++        "phase_summaries": [],
++        "output_consistency": None,
++        "batch_elapsed_seconds": {"cold": [], "warm": []},
++    }
++
++    for match in re.finditer(r"^\[SC_DRIVER_PHASE_SUMMARY\]\s+(\{.*\})$", text, re.MULTILINE):
++        try:
++            summary["phase_summaries"].append(json.loads(match.group(1)))
++        except json.JSONDecodeError:
++            pass
++    matches = list(
++        re.finditer(r"^\[SC_DRIVER_OUTPUT_CONSISTENCY\]\s+(\{.*\})$", text, re.MULTILINE)
++    )
++    if matches:
++        try:
++            summary["output_consistency"] = json.loads(matches[-1].group(1))
++        except json.JSONDecodeError:
++            pass
++
++    for match in re.finditer(
++        r"\[SC_IO_DRIVER_BATCH_DONE\].*?phase=(cold|warm).*?elapsed=([0-9.]+)", text
++    ):
++        summary["batch_elapsed_seconds"][match.group(1)].append(float(match.group(2)))
++
++    cold = re.findall(r"first generation took ([0-9.]+) seconds", text, re.IGNORECASE)
++    warm = re.findall(r"Second generation took ([0-9.]+) seconds", text, re.IGNORECASE)
++    summary["cold_elapsed_seconds_fallback"] = float(cold[-1]) if cold else None
++    summary["warm_elapsed_seconds_fallback"] = float(warm[-1]) if warm else None
++    return summary
++
++
++def finalize_run(
++    *,
++    state_dir: Path,
++    state: dict[str, Any],
++    grid: list[dict[str, Any]],
++    index: int,
++    sacct_record: dict[str, str] | None,
++    success: bool,
++    failure_reason: str | None,
++) -> None:
++    config = grid[index]
++    run = state["runs"][index]
++    attempt = run["attempts"][-1]
++    job_id = str(run["job_id"])
++    log_path = Path(attempt["output_path"])
++    simple = parse_simple_summary(log_path)
++    finished_at = utc_now()
++    slurm_state = sacct_record["state"] if sacct_record else run.get("slurm_state")
++    attempt.update(
++        {
++            "terminal_state": slurm_state,
++            "exit_code": sacct_record.get("exit_code") if sacct_record else None,
++            "finished_at": finished_at,
++            "result": "completed" if success else "failed",
++        }
++    )
++    run["status"] = "completed" if success else "failed"
++    run["slurm_state"] = slurm_state
++    run["finished_at"] = finished_at
++    run["failure_reason"] = failure_reason
++    run["terminal_observed_at"] = None
++    summary_path = state_dir / "runs" / config["run_id"] / "summary.json"
++    run["summary_path"] = str(summary_path)
++    summary = {
++        "grid_version": GRID_VERSION,
++        "run": config,
++        "result": run["status"],
++        "failure_reason": failure_reason,
++        "job_id": job_id,
++        "slurm": sacct_record,
++        "simple_metrics": simple,
++        "finished_at": finished_at,
++    }
++    atomic_write_json(summary_path, summary)
++    save_state(state_dir, state)
++    managed_active_job_file(state_dir, None)
++    write_progress(state_dir, state, grid, f"Run {config['run_id']} is {run['status']}")
++
++
++def monitor_current_run(
++    *,
++    state_dir: Path,
++    state: dict[str, Any],
++    grid: list[dict[str, Any]],
++    index: int,
++    poll_seconds: float,
++    missing_job_grace_seconds: float,
++    completed_log_grace_seconds: float,
++) -> None:
++    config = grid[index]
++    run = state["runs"][index]
++    job_id = str(run.get("job_id") or "")
++    if not job_id.isdigit():
++        # No trustworthy submitted job exists. This is the narrow recovery case
++        # where the same configuration is safe to submit again.
++        run["status"] = "pending"
++        run["job_id"] = None
++        save_state(state_dir, state)
++        managed_active_job_file(state_dir, None)
++        write_progress(state_dir, state, grid, "No persisted job ID; current run will be resubmitted")
++        return
++
++    warning = check_active_file(state_dir, job_id)
++    if warning:
++        print(f"Recovery note: {warning}", flush=True)
++        managed_active_job_file(state_dir, job_id)
++
++    while True:
++        squeue_state = query_squeue(job_id)
++        if squeue_state is not None:
++            run["status"] = "running" if squeue_state == "RUNNING" else "submitted"
++            run["slurm_state"] = squeue_state
++            run["last_seen_at"] = utc_now()
++            run["terminal_observed_at"] = None
++            save_state(state_dir, state)
++            write_progress(
++                state_dir,
++                state,
++                grid,
++                f"Job {job_id} is {squeue_state}; polling every {poll_seconds:g} seconds",
++            )
++            print(
++                f"[{utc_now()}] {config['run_id']} job {job_id}: {squeue_state}",
++                flush=True,
++            )
++            time.sleep(poll_seconds)
++            continue
++
++        sacct_record = query_sacct(job_id)
++        if sacct_record is None:
++            reference = run.get("last_seen_at") or run.get("submitted_at")
++            missing_age = age_seconds(reference)
++            if missing_age is None or missing_age < missing_job_grace_seconds:
++                note = (
++                    f"Job {job_id} not currently visible; waiting for Slurm accounting "
++                    f"({missing_age or 0:.0f}/{missing_job_grace_seconds:.0f}s grace)"
++                )
++                write_progress(state_dir, state, grid, note)
++                print(note, flush=True)
++                time.sleep(poll_seconds)
++                continue
++
++            # The ID cannot be associated with a real Slurm record. Record the
++            # lost attempt and retry only this unfinished configuration.
++            attempt = run["attempts"][-1]
++            attempt.update(
++                {
++                    "terminal_state": "LOST_JOB_RECORD",
++                    "finished_at": utc_now(),
++                    "result": "lost; resubmit current configuration",
++                }
++            )
++            run["status"] = "pending"
++            run["job_id"] = None
++            run["slurm_state"] = "LOST_JOB_RECORD"
++            run["failure_reason"] = (
++                f"Slurm job {job_id} was absent from squeue and sacct beyond the recovery grace"
++            )
++            save_state(state_dir, state)
++            managed_active_job_file(state_dir, None)
++            write_progress(state_dir, state, grid, "Lost job record; current run will be resubmitted")
++            print(f"Job {job_id} cannot be found; resubmitting {config['run_id']}.", flush=True)
++            return
++
++        slurm_state = sacct_record["state"]
++        run["slurm_state"] = slurm_state
++        run["last_seen_at"] = utc_now()
++        save_state(state_dir, state)
++
++        if slurm_state not in TERMINAL_SLURM_STATES:
++            write_progress(state_dir, state, grid, f"Accounting reports {slurm_state}")
++            print(f"[{utc_now()}] {config['run_id']} job {job_id}: {slurm_state}", flush=True)
++            time.sleep(poll_seconds)
++            continue
++
++        attempt = run["attempts"][-1]
++        log_path = Path(attempt["output_path"])
++        log_has_done = DONE_MARKER in read_log_text(log_path)
++        if slurm_state == "COMPLETED" and not log_has_done:
++            if not run.get("terminal_observed_at"):
++                run["terminal_observed_at"] = utc_now()
++                save_state(state_dir, state)
++            terminal_age = age_seconds(run.get("terminal_observed_at")) or 0.0
++            if terminal_age < completed_log_grace_seconds:
++                note = (
++                    f"Job {job_id} is COMPLETED but the output marker is not visible yet; "
++                    f"waiting {terminal_age:.0f}/{completed_log_grace_seconds:.0f}s"
++                )
++                write_progress(state_dir, state, grid, note)
++                print(note, flush=True)
++                time.sleep(min(poll_seconds, 10.0))
++                continue
++
++        if slurm_state == "COMPLETED" and log_has_done:
++            finalize_run(
++                state_dir=state_dir,
++                state=state,
++                grid=grid,
++                index=index,
++                sacct_record=sacct_record,
++                success=True,
++                failure_reason=None,
++            )
++            print(f"Completed {config['run_id']} with job {job_id}.", flush=True)
++        else:
++            if slurm_state == "COMPLETED":
++                reason = f"Slurm completed, but {DONE_MARKER!r} is missing from {log_path}"
++            else:
++                reason = f"Slurm terminal state is {slurm_state} (exit {sacct_record['exit_code']})"
++            finalize_run(
++                state_dir=state_dir,
++                state=state,
++                grid=grid,
++                index=index,
++                sacct_record=sacct_record,
++                success=False,
++                failure_reason=reason,
++            )
++            print(f"Recorded {config['run_id']} as failed: {reason}", flush=True)
++        return
++
++
++def create_archive(state_dir: Path, state: dict[str, Any], grid: list[dict[str, Any]]) -> Path:
++    archive_path = state_dir.parent / f"{state_dir.name}.zip"
++    temporary_path = archive_path.with_suffix(".zip.tmp")
++    if temporary_path.exists():
++        temporary_path.unlink()
++
++    atomic_write_json(
++        state_dir / "archive_manifest.json",
++        {
++            "created_at": utc_now(),
++            "grid_version": GRID_VERSION,
++            "max_questions": state["max_questions"],
++            "grid_sha256": state["grid_sha256"],
++            "terminal_counts": dict(status_counts(state)),
++            "archive_path": str(archive_path),
++        },
++    )
++
++    with zipfile.ZipFile(
++        temporary_path,
++        mode="w",
++        compression=zipfile.ZIP_DEFLATED,
++        compresslevel=6,
++        allowZip64=True,
++    ) as archive:
++        for path in sorted(state_dir.rglob("*")):
++            if not path.is_file():
++                continue
++            relative = path.relative_to(state_dir.parent)
++            archive.write(path, arcname=str(relative))
++    os.replace(temporary_path, archive_path)
++
++    digest = hashlib.sha256()
++    with archive_path.open("rb") as handle:
++        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
++            digest.update(chunk)
++    state["archive_path"] = str(archive_path)
++    state["archive_sha256"] = digest.hexdigest()
++    save_state(state_dir, state)
++    write_progress(state_dir, state, grid, "All runs terminal; archive created")
++    return archive_path
++
++
++def print_grid(grid: list[dict[str, Any]]) -> None:
++    for config in grid:
++        env = config["environment"]
++        print(
++            f"{config['index'] + 1:02d}. {config['run_id']}: {config['description']}\n"
++            f"    dataset={env['DATASET_NAME']} batch={env['SUBMISSION_BATCH_SIZE']} "
++            f"max_num_seqs={env['VLLM_MAX_NUM_SEQS']} "
++            f"sched={env['SC_LMCACHE_SCHEDULER_LOOKUP_ADMISSION_ENABLE']}/"
++            f"{env['SC_LMCACHE_SCHEDULER_LOOKUP_MAX_INFLIGHT']}/"
++            f"{env['SC_LMCACHE_SCHEDULER_LOOKUP_ADMISSION_WAIT_MS']}ms "
++            f"worker={env['SC_LMCACHE_WORKER_LOOKUP_ADMISSION_ENABLE']}/"
++            f"{env['SC_LMCACHE_WORKER_LOOKUP_MAX_INFLIGHT']} "
++            f"disk_put={env['SC_LMCACHE_DISK_PUT_ADMISSION_ENABLE']}/"
++            f"{env['SC_LMCACHE_DISK_PUT_MAX_PENDING']}"
++        )
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument(
++        "--max-questions",
++        type=int,
++        default=1,
++        help="Questions per dataset. Defaults to 1 for the smoke grid.",
++    )
++    parser.add_argument(
++        "--state-dir",
++        type=Path,
++        default=None,
++        help="Persistent state/output directory. Defaults under ~/runs/kvaware_repro/pressure_grid.",
++    )
++    parser.add_argument("--poll-seconds", type=float, default=20.0)
++    parser.add_argument("--missing-job-grace-seconds", type=float, default=180.0)
++    parser.add_argument("--completed-log-grace-seconds", type=float, default=60.0)
++    parser.add_argument(
++        "--print-grid",
++        action="store_true",
++        help="Print the 16 configurations and exit without creating state or submitting jobs.",
++    )
++    return parser.parse_args()
++
++
++def main() -> int:
++    args = parse_args()
++    if args.max_questions <= 0:
++        raise SystemExit("--max-questions must be greater than zero")
++    if args.poll_seconds <= 0:
++        raise SystemExit("--poll-seconds must be greater than zero")
++
++    script_path = Path(__file__).resolve()
++    repo = script_path.parents[2]
++    sbatch_script = script_path.with_name("submit_pressure_grid.sbatch")
++    if not sbatch_script.is_file():
++        raise SystemExit(f"Missing sbatch script: {sbatch_script}")
++
++    grid = make_grid(args.max_questions)
++    if args.print_grid:
++        print_grid(grid)
++        return 0
++
++    state_dir = (args.state_dir or default_state_dir(args.max_questions)).expanduser().resolve()
++    state_path = state_dir / "grid_state.json"
++    if state_path.exists():
++        state = read_json(state_path)
++        validate_loaded_state(state, args.max_questions, grid)
++    else:
++        state = initialize_state(state_dir, repo, sbatch_script, args.max_questions, grid)
++
++    write_progress(state_dir, state, grid, "Master started or resumed")
++    print(f"Persistent state: {state_path}", flush=True)
++    print(f"Human-readable progress: {state_dir / 'grid_progress.txt'}", flush=True)
++    print(f"Managed active job ID: {state_dir / 'active_job_id.txt'}", flush=True)
++
++    try:
++        while True:
++            index = first_unfinished_index(state)
++            if index is None:
++                archive_path = create_archive(state_dir, state, grid)
++                print("All 16 grid configurations are terminal.", flush=True)
++                print(f"Archive: {archive_path}", flush=True)
++                print(f"SHA256: {state['archive_sha256']}", flush=True)
++                return 0
++
++            run = state["runs"][index]
++            status = run.get("status")
++            if status in {"pending", "submission_error", "submitting"} and not run.get("job_id"):
++                submit_run(
++                    state_dir=state_dir,
++                    state=state,
++                    grid=grid,
++                    index=index,
++                    sbatch_script=sbatch_script,
++                )
++                continue
++
++            if status in {"submitted", "running", "submitting"} or run.get("job_id"):
++                monitor_current_run(
++                    state_dir=state_dir,
++                    state=state,
++                    grid=grid,
++                    index=index,
++                    poll_seconds=args.poll_seconds,
++                    missing_job_grace_seconds=args.missing_job_grace_seconds,
++                    completed_log_grace_seconds=args.completed_log_grace_seconds,
++                )
++                continue
++
++            raise RuntimeError(
++                f"Unhandled state for {grid[index]['run_id']}: {json.dumps(run, indent=2)}"
++            )
++    except KeyboardInterrupt:
++        index = first_unfinished_index(state)
++        current = grid[index]["run_id"] if index is not None else "none"
++        write_progress(state_dir, state, grid, "Master stopped by user; active Slurm job was not cancelled")
++        print("\nMaster stopped cleanly. No active Slurm job was cancelled.", flush=True)
++        print(f"Current run: {current}", flush=True)
++        print(f"Resume with the same command. State: {state_path}", flush=True)
++        return 130
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/local_repro/grid_search/run_smoke_grid.sh b/local_repro/grid_search/run_smoke_grid.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..78c399b5b7bba6ebffdff7bbb2005484c6b297f2
+--- /dev/null
++++ b/local_repro/grid_search/run_smoke_grid.sh
+@@ -0,0 +1,4 @@
++#!/bin/bash
++set -euo pipefail
++REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
++exec python "$REPO/local_repro/grid_search/run_pressure_grid.py" --max-questions 1 "$@"
+diff --git a/local_repro/grid_search/submit_pressure_grid.sbatch b/local_repro/grid_search/submit_pressure_grid.sbatch
+new file mode 100755
+index 0000000000000000000000000000000000000000..3e3e11bcff941f9d63e8db37d825838f8faba59e
+--- /dev/null
++++ b/local_repro/grid_search/submit_pressure_grid.sbatch
+@@ -0,0 +1,40 @@
++#!/bin/bash
++#SBATCH --partition=gpu-h100-dchen
++#SBATCH --time=06:00:00
++#SBATCH --nodes=1
++#SBATCH --ntasks=1
++#SBATCH --gres=gpu:2
++#SBATCH --cpus-per-task=16
++
++set -euxo pipefail
++
++REPO=/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
++export PYTHONPATH="$REPO:${PYTHONPATH:-}"
++
++if [[ "${SC_LMCACHE_SOURCE_DEFAULT_KNOBS:-1}" == "1" ]]; then
++  # The grid exports every tested SC_* value explicitly. The shared file fills
++  # in only unrelated defaults and validates the values before Python starts.
++  source "$REPO/local_repro/sc_lmcache_knobs.sh"
++fi
++
++: "${GRID_RUN_ID:?GRID_RUN_ID is required}"
++: "${GRID_RUN_LABEL:?GRID_RUN_LABEL is required}"
++: "${GRID_CONFIG_SHA256:?GRID_CONFIG_SHA256 is required}"
++: "${MAX_QUESTIONS:?MAX_QUESTIONS is required}"
++: "${SUBMISSION_BATCH_SIZE:?SUBMISSION_BATCH_SIZE is required}"
++: "${DATASET_NAME:?DATASET_NAME is required}"
++: "${VLLM_MAX_NUM_SEQS:?VLLM_MAX_NUM_SEQS is required}"
++
++export PYTHONFAULTHANDLER=1
++
++printf '%s\n' \
++  "=== SC PRESSURE GRID JOB ===" \
++  "GRID_RUN_ID=$GRID_RUN_ID" \
++  "GRID_RUN_LABEL=$GRID_RUN_LABEL" \
++  "GRID_CONFIG_SHA256=$GRID_CONFIG_SHA256" \
++  "MAX_QUESTIONS=$MAX_QUESTIONS" \
++  "DATASET_NAME=$DATASET_NAME" \
++  "SUBMISSION_BATCH_SIZE=$SUBMISSION_BATCH_SIZE" \
++  "VLLM_MAX_NUM_SEQS=$VLLM_MAX_NUM_SEQS"
++
++"$REPO/local_repro/run_driver.sh" wo_gnn 2>&1
+diff --git a/local_repro/run_driver.sh b/local_repro/run_driver.sh
+index 65feaabedb0a493e5945d59810f71a28e78173f6..f91502d4b159c8da1f215bf8da1635583c4c6134 100755
+--- a/local_repro/run_driver.sh
++++ b/local_repro/run_driver.sh
+@@ -103,6 +103,10 @@ echo "TMPDIR=$TMPDIR"
+ echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
+ echo "CUDA_DEVICE_ORDER=${CUDA_DEVICE_ORDER:-unset}"
+ echo "SUBMISSION_BATCH_SIZE=$SUBMISSION_BATCH_SIZE"
++echo "VLLM_MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:-4}"
++echo "GRID_RUN_ID=${GRID_RUN_ID:-none}"
++echo "GRID_RUN_LABEL=${GRID_RUN_LABEL:-none}"
++echo "GRID_CONFIG_SHA256=${GRID_CONFIG_SHA256:-none}"
+ echo "=== SC LMCACHE KNOBS ==="
+ env | LC_ALL=C sort | grep '^SC_' || true
+ 
