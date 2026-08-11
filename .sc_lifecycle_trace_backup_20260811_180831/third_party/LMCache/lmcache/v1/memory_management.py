@@ -24,7 +24,6 @@ from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.pin_monitor import PinMonitor
 from lmcache.v1.sc_config import (
     env_float,
-    lifecycle_trace_enabled,
     memory_snapshot_enabled,
     memory_trace_enabled,
 )
@@ -35,7 +34,6 @@ logger = init_logger(__name__)
 
 # ===== SC MEMORY SNAPSHOT START =====
 import os as _sc_os
-import sys as _sc_sys
 import time as _sc_time
 import traceback as _sc_traceback
 import subprocess as _sc_subprocess
@@ -163,66 +161,6 @@ def _sc_memory_snapshot(tag, obj=None, extra="", stack=False, force=False):
     except Exception as e:
         print(f"[SC_MEMORY_SNAPSHOT_ERROR] tag={tag} err={e!r}", flush=True)
 # ===== SC MEMORY SNAPSHOT END =====
-
-
-# ===== SC MEMORY LIFECYCLE TRACE START =====
-def _sc_lifecycle_callsite():
-    try:
-        # actual caller -> MemoryObj method -> trace helper -> here
-        frame = _sc_sys._getframe(3)
-        return (
-            f"{_sc_os.path.basename(frame.f_code.co_filename)}:"
-            f"{frame.f_lineno}:{frame.f_code.co_name}"
-        )
-    except Exception:
-        return "unknown"
-
-
-def _sc_memory_lifecycle_trace(
-    event,
-    obj,
-    *,
-    lookup_id="",
-    key=None,
-    backend="",
-    site="",
-    before_ref=None,
-    before_pin=None,
-    extra="",
-):
-    if not lifecycle_trace_enabled():
-        return
-    try:
-        meta = getattr(obj, "meta", None)
-        key_hash = getattr(key, "chunk_hash", None) if key is not None else None
-        if not site:
-            site = _sc_lifecycle_callsite()
-        logger.warning(
-            "[SC_LIFECYCLE] "
-            "event=%s mono_ns=%d pid=%d thread=%s "
-            "obj_id=%d address=%s valid=%s "
-            "ref=%s pin=%s before_ref=%s before_pin=%s "
-            "lookup_id=%s key_hash=%s backend=%s site=%s extra=%s",
-            event,
-            _sc_time.monotonic_ns(),
-            _sc_os.getpid(),
-            threading.current_thread().name,
-            id(obj),
-            getattr(meta, "address", None),
-            getattr(obj, "valid", None),
-            getattr(meta, "ref_count", None),
-            getattr(meta, "pin_count", None),
-            before_ref,
-            before_pin,
-            lookup_id,
-            key_hash,
-            backend,
-            site,
-            extra,
-        )
-    except Exception:
-        logger.exception("[SC_LIFECYCLE_ERROR] event=%s", event)
-# ===== SC MEMORY LIFECYCLE TRACE END =====
 
 
 # Helper functions for thread safety
@@ -814,7 +752,6 @@ class TensorMemoryObj(MemoryObj):
 
     def invalidate(self):
         self.valid = False
-        _sc_memory_lifecycle_trace("INVALIDATE", self)
 
     def is_valid(self):
         return self.valid
@@ -848,24 +785,16 @@ class TensorMemoryObj(MemoryObj):
 
     def ref_count_up(self):
         with self.lock:
-            before_ref = self.meta.ref_count
             if (
                 self.meta.ref_count == 1
                 and self._sc_ref_gt1_started is None
             ):
                 self._sc_ref_gt1_started = _sc_time.monotonic()
             self.meta.ref_count += 1
-            _sc_memory_lifecycle_trace(
-                "REF_UP", self, before_ref=before_ref
-            )
 
     def ref_count_down(self):
         with self.lock:
-            before_ref = self.meta.ref_count
             self.meta.ref_count -= 1
-            _sc_memory_lifecycle_trace(
-                "REF_DOWN", self, before_ref=before_ref
-            )
 
             if self.meta.ref_count == 1:
                 started = self._sc_ref_gt1_started
@@ -915,16 +844,12 @@ class TensorMemoryObj(MemoryObj):
 
     def pin(self) -> bool:
         with self.lock:
-            before_pin = self.meta.pin_count
             # if pin_count is 0, indicates that the object is pinned for the first time
             if self.meta.pin_count == 0:
                 TensorMemoryObj.monitor.update_pinned_memory_objs_count(1)
                 self._sc_pin_started = _sc_time.monotonic()
 
             self.meta.pin_count += 1
-            _sc_memory_lifecycle_trace(
-                "PIN", self, before_pin=before_pin
-            )
 
             # Register/update with PinMonitor for timeout tracking on every pin
             pin_monitor = PinMonitor.GetOrCreate()
@@ -933,11 +858,7 @@ class TensorMemoryObj(MemoryObj):
 
     def unpin(self) -> bool:
         with self.lock:
-            before_pin = self.meta.pin_count
             self.meta.pin_count -= 1
-            _sc_memory_lifecycle_trace(
-                "UNPIN", self, before_pin=before_pin
-            )
 
             # if pin_count is 0, indicates that the object is unpinned
             if self.meta.pin_count == 0:
@@ -1789,14 +1710,8 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
         if not memory_obj.is_valid():
             return
 
-        _sc_memory_lifecycle_trace(
-            "ALLOCATOR_FREE_ENTER", memory_obj, site="TensorMemoryAllocator.free"
-        )
         self.address_manager.free(memory_obj.meta.address, memory_obj.meta.phy_size)
         memory_obj.invalidate()
-        _sc_memory_lifecycle_trace(
-            "ALLOCATOR_FREE_DONE", memory_obj, site="TensorMemoryAllocator.free"
-        )
 
         # For debug
         self.num_active_allocations -= 1
@@ -1834,11 +1749,6 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
             if not memory_obj.is_valid():
                 logger.warning("Trying to free an invalidated MemoryObj")
                 continue
-            _sc_memory_lifecycle_trace(
-                "ALLOCATOR_BATCH_FREE_ENTER",
-                memory_obj,
-                site="TensorMemoryAllocator.batched_free",
-            )
             memory_obj.invalidate()
 
             if curr_start is None:

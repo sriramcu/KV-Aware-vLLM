@@ -36,7 +36,6 @@ from lmcache.v1.event_manager import EventManager, EventStatus, EventType
 from lmcache.v1.memory_management import (
     MemoryFormat,
     MemoryObj,
-    _sc_memory_lifecycle_trace,
 )
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.sc_config import (
@@ -969,24 +968,6 @@ class StorageManager:
                 break
 
         retrieved_length = cum_chunk_lengths_total[total_retrieved_chunks]
-
-        remaining_ready_keys = total_retrieved_chunks * keys_per_chunk
-        for tier_idx, tier_result in enumerate(res):
-            if remaining_ready_keys <= 0:
-                break
-            ready_slice = tier_result[:remaining_ready_keys]
-            for key, memory_obj in ready_slice:
-                _sc_memory_lifecycle_trace(
-                    "LOOKUP_READY",
-                    memory_obj,
-                    lookup_id=lookup_id,
-                    key=key,
-                    backend="StorageManager",
-                    site="StorageManager.prefetch_all_done_callback",
-                    extra=f"tier={tier_idx} retrieved_length={retrieved_length}",
-                )
-            remaining_ready_keys -= len(ready_slice)
-
         logger.info(
             f"Responding to scheduler for lookup id {lookup_id}"
             f" with retrieved length {retrieved_length}"

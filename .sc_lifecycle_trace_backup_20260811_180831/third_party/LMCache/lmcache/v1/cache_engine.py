@@ -53,7 +53,6 @@ from lmcache.v1.memory_management import (  # noqa: E501
     MixedMemoryAllocator,
     PagedTensorMemoryAllocator,
     TensorMemoryObj,
-    _sc_memory_lifecycle_trace,
 )
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.pin_monitor import PinMonitor
@@ -1499,14 +1498,6 @@ class LMCacheEngine:
             for key, memory_obj in memory_objs_flat:
                 try:
                     logger.debug("Releasing memory object for lookup_id=%s", lookup_id)
-                    _sc_memory_lifecycle_trace(
-                        "ABORT_CLEANUP_RELEASE",
-                        memory_obj,
-                        lookup_id=lookup_id,
-                        key=key,
-                        backend="LMCacheEngine",
-                        site="LMCacheEngine.cleanup_memory_objs",
-                    )
                     if memory_obj.is_pinned:
                         memory_obj.unpin()
                     memory_obj.ref_count_down()
@@ -1827,14 +1818,6 @@ class LMCacheEngine:
 
         for backend_results in keyed_memory_objs:
             for key, memory_obj in backend_results:
-                _sc_memory_lifecycle_trace(
-                    "RETRIEVE_EVENT_READ",
-                    memory_obj,
-                    lookup_id=kwargs["req_id"],
-                    key=key,
-                    backend="LMCacheEngine",
-                    site="LMCacheEngine._async_process_tokens_internal",
-                )
                 memory_obj_map[key] = memory_obj
 
         # TODO(Jiayi): hashing inside `process_tokens` can be skipped.
@@ -1850,15 +1833,6 @@ class LMCacheEngine:
                 # returned chunks are expected to be contiguous.
                 # break at the first missing chunk.
                 break
-            _sc_memory_lifecycle_trace(
-                "RETRIEVE_CLAIM",
-                memory_obj,
-                lookup_id=kwargs["req_id"],
-                key=key,
-                backend="LMCacheEngine",
-                site="LMCacheEngine._async_process_tokens_internal",
-                extra=f"start={start} end={end}",
-            )
             chunks.append((key, memory_obj, start, end))
             tot_kv_size += memory_obj.get_size()
             ret_mask[start:end] = True
@@ -1867,14 +1841,6 @@ class LMCacheEngine:
         # NOTE: free the memory objects that are not hit.
         for key, mem_obj in memory_obj_map.items():
             if key not in used_keys:
-                _sc_memory_lifecycle_trace(
-                    "RETRIEVE_UNUSED_REF_DOWN",
-                    mem_obj,
-                    lookup_id=kwargs["req_id"],
-                    key=key,
-                    backend="LMCacheEngine",
-                    site="LMCacheEngine._async_process_tokens_internal",
-                )
                 mem_obj.ref_count_down()
 
         return chunks, tot_kv_size

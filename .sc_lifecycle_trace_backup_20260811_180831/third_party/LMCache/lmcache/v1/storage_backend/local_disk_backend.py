@@ -17,11 +17,7 @@ from lmcache.observability import LMCStatsMonitor
 from lmcache.utils import CacheEngineKey, DiskCacheMetadata, _lmcache_nvtx_annotate
 from lmcache.v1.cache_controller.message import OpType
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.memory_management import (
-    MemoryFormat,
-    MemoryObj,
-    _sc_memory_lifecycle_trace,
-)
+from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.sc_config import (
     disk_put_admission_enabled,
@@ -688,13 +684,6 @@ class LocalDiskBackend(StorageBackendInterface):
 
         # This extra ref is now taken only after bounded admission succeeds.
         memory_obj.ref_count_up()
-        _sc_memory_lifecycle_trace(
-            "DISK_PUT_REF_UP",
-            memory_obj,
-            key=key,
-            backend="LocalDiskBackend",
-            site="LocalDiskBackend.submit_put_task",
-        )
 
         try:
             future = asyncio.run_coroutine_threadsafe(
@@ -1016,13 +1005,6 @@ class LocalDiskBackend(StorageBackendInterface):
         dtype = memory_obj.metadata.dtype
         fmt = memory_obj.metadata.fmt
         cached_positions = memory_obj.metadata.cached_positions
-        _sc_memory_lifecycle_trace(
-            "DISK_PUT_REF_DOWN",
-            memory_obj,
-            key=key,
-            backend="LocalDiskBackend",
-            site="LocalDiskBackend.async_save_bytes_to_disk",
-        )
         memory_obj.ref_count_down()
 
         self.insert_key(key, size, shape, dtype, fmt, cached_positions=cached_positions)

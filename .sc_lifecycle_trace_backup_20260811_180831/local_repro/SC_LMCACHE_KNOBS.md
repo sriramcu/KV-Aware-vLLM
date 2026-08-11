@@ -53,7 +53,6 @@ while scheduler admission and disk-put admission remain disabled.
 | `SC_LMCACHE_REQUEST_TRACE_ENABLE` | `0` | Repeated vLLM request matching trace and selected stacks. |
 | `SC_LMCACHE_TIER_TRACE_ENABLE` | `0` | GNN sidecar matching, chunk-tier aggregation, and targeted-placement diagnostics. |
 | `SC_LMCACHE_GPU_ASSERT_SNAPSHOT_ENABLE` | `0` | Heavy snapshot immediately before the GPU connector tensor assertion; independent of the general memory-snapshot flag. |
-| `SC_LMCACHE_LIFECYCLE_TRACE_ENABLE` | `0` | Very verbose per-`MemoryObj` lookup/ref/pin/free/invalidation/GPU-consumption lifecycle trace for targeted debugging. |
 | `SC_DRIVER_RESOURCE_MONITOR_ENABLE` | `0` | Periodic driver-level process/GPU/disk monitor. |
 
 Related thresholds:

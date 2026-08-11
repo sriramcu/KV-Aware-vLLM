@@ -89,7 +89,3 @@ def tier_trace_enabled() -> bool:
 
 def gpu_assert_snapshot_enabled() -> bool:
     return env_flag("SC_LMCACHE_GPU_ASSERT_SNAPSHOT_ENABLE")
-
-
-def lifecycle_trace_enabled() -> bool:
-    return env_flag("SC_LMCACHE_LIFECYCLE_TRACE_ENABLE")

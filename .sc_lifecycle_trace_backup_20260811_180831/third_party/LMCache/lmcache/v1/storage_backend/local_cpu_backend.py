@@ -24,7 +24,6 @@ from lmcache.v1.memory_management import (
     MemoryFormat,
     MemoryObj,
     MixedMemoryAllocator,
-    _sc_memory_lifecycle_trace,
     PagedCpuGpuMemoryAllocator,
 )
 from lmcache.v1.metadata import LMCacheMetadata
@@ -411,14 +410,6 @@ class LocalCPUBackend(AllocatorBackendInterface):
             for key in keys:
                 mem_obj = self.hot_cache[key]
                 mem_obj.ref_count_up()
-                _sc_memory_lifecycle_trace(
-                    "CPU_LOOKUP_GET_REF",
-                    mem_obj,
-                    lookup_id=lookup_id,
-                    key=key,
-                    backend="LocalCPUBackend",
-                    site="LocalCPUBackend.batched_get_non_blocking",
-                )
                 mem_objs.append(mem_obj)
         return mem_objs
 
@@ -436,14 +427,6 @@ class LocalCPUBackend(AllocatorBackendInterface):
                     return num_hit_chunks
                 if pin:
                     self.hot_cache[key].pin()
-                    _sc_memory_lifecycle_trace(
-                        "CPU_LOOKUP_PIN",
-                        self.hot_cache[key],
-                        lookup_id=lookup_id,
-                        key=key,
-                        backend="LocalCPUBackend",
-                        site="LocalCPUBackend.batched_async_contains",
-                    )
                     # vllm lookup sets pin to True
                     self.keys_in_request.append(key)
                 num_hit_chunks += 1
@@ -462,13 +445,6 @@ class LocalCPUBackend(AllocatorBackendInterface):
             if key not in self.hot_cache:
                 return False
             memory_obj = self.hot_cache[key]
-            _sc_memory_lifecycle_trace(
-                "CPU_KEY_UNPIN",
-                memory_obj,
-                key=key,
-                backend="LocalCPUBackend",
-                site="LocalCPUBackend.unpin",
-            )
             memory_obj.unpin()
             return True
 
@@ -481,13 +457,6 @@ class LocalCPUBackend(AllocatorBackendInterface):
             return False
 
         memory_obj = self.hot_cache.pop(key)
-        _sc_memory_lifecycle_trace(
-            "CPU_CACHE_REMOVE",
-            memory_obj,
-            key=key,
-            backend="LocalCPUBackend",
-            site="LocalCPUBackend.remove",
-        )
         memory_obj.ref_count_down()
 
         if force:

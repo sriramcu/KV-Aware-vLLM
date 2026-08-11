@@ -30,11 +30,7 @@ from lmcache.v1.gpu_connector.utils import (
 )
 from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
 from lmcache.v1.memory_management import GPUMemoryAllocator  # noqa: E501
-from lmcache.v1.memory_management import (
-    MemoryFormat,
-    MemoryObj,
-    _sc_memory_lifecycle_trace,
-)
+from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.sc_config import gpu_assert_snapshot_enabled
 import lmcache.c_ops as lmc_ops
@@ -284,14 +280,6 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         :raises AssertionError: If the memory object does not have a tensor.
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
         """
-        _sc_memory_lifecycle_trace(
-            "GPU_TO_GPU_ENTER",
-            memory_obj,
-            lookup_id=str(kwargs.get("req_id", "")),
-            backend="VLLMPagedMemGPUConnectorV2",
-            site="VLLMPagedMemGPUConnectorV2.to_gpu",
-            extra=f"start={start} end={end}",
-        )
         if memory_obj.tensor is None:
             if gpu_assert_snapshot_enabled():
                 try:
@@ -433,14 +421,6 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
             for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
                 self.to_gpu(memory_obj, start, end, **kwargs)
         self.load_stream.synchronize()
-        for memory_obj in memory_objs:
-            _sc_memory_lifecycle_trace(
-                "GPU_COPY_DONE",
-                memory_obj,
-                lookup_id=str(kwargs.get("req_id", "")),
-                backend="VLLMPagedMemGPUConnectorV2",
-                site="VLLMPagedMemGPUConnectorV2.batched_to_gpu",
-            )
 
     # TODO(Jiayi): need to optimize to enable real batching
     def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):

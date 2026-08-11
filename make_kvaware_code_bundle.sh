@@ -13,7 +13,7 @@ set -euo pipefail
 #
 # Usage:
 #   cd /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
-#   bash /path/to/make_kvaware_code_bundle_updated_v3.sh
+#   bash /path/to/make_kvaware_code_bundle_updated_v4.sh
 #
 # Optional overrides:
 #   REPO=/path/to/KV-Aware-vLLM
@@ -176,6 +176,8 @@ for name in sorted(os.environ):
     if (
         name.startswith("LMCACHE_")
         or name.startswith("VLLM_")
+        or name.startswith("SC_")
+        or name.startswith("GRID_")
         or name.startswith("SRIRAM_")
         or name.startswith("DYN_KVBM_")
         or name in {
@@ -213,6 +215,11 @@ $REPO/
 ├── local_repro/
 │   ├── cpu_offload_lmcache_sriram.py
 │   ├── run_driver.sh
+│   ├── grid_search/
+│   │   ├── run_pressure_grid.py
+│   │   ├── rerun_failed_grid_job.py
+│   │   ├── run_future_combo_grid.py
+│   │   └── submit_*grid.sbatch
 │   └── sbatch/
 ├── vllm/
 │   ├── entrypoints/
@@ -243,7 +250,7 @@ $REPO/
 Runtime/build paths:
 ├── venv: $HOME_DIR/venvs/kvaware
 ├── run root: $HOME_DIR/runs/kvaware_repro
-└── LMCache disk data: job-specific directory below the run root
+└── LMCache disk data: SC_LMCACHE_DATA_DIR when explicitly set; otherwise a job-specific directory below the run root
 
 This is intentionally a high-level map, not a recursive listing of every file.
 EOF
@@ -275,7 +282,7 @@ append_existing_files_from_find < <(
     | sort
 )
 
-# Include local P0/Gate C bundles, tests, summaries, and documentation when
+# Include local admission-control/P0 historical bundles, tests, summaries, and documentation when
 # present, but not generated logs or archive payloads.
 append_existing_files_from_find < <(
   find . -maxdepth 4 -type f \
@@ -438,6 +445,7 @@ section "CURATED PATH EXISTENCE SNAPSHOT"
   for path in \
     "local_repro" \
     "local_repro/sbatch" \
+    "local_repro/grid_search" \
     "vllm/v1/core/sched" \
     "vllm/distributed/kv_transfer/kv_connector/v1" \
     "third_party/LMCache" \
@@ -476,7 +484,7 @@ git -C "$LMCACHE_ROOT" diff >> "$OUT" 2>&1 || true
 
 section "GREP SUMMARY: lifecycle, debug hooks, admission controls, and settings"
 grep -R \
-  "SRIRAM_REQDBG\|SRIRAM_LOOKUPDBG\|SRIRAM_MONITOR\|SRIRAM_MEMDBG\|KVDBG_\|KVIO_\|VLLM_KV_IMPORTANCE\|max_num_seqs\|submission_batch_size\|enable_async_loading\|lookup_timeout_ms\|pin_timeout_sec\|local_disk\|max_local_disk_size\|SRIRAM_LMCACHE_DIR\|LMCACHE_P0_CLIENT_LOOKUP_MAX_INFLIGHT\|LMCACHE_P0_CLIENT_LOOKUP_ADMISSION_TIMEOUT_MS\|LMCACHE_P0_LOOKUP_MAX_INFLIGHT\|LMCACHE_P0_DISK_PUT_MAX_PENDING\|P0_CLIENT_LOOKUP_ADMISSION\|P0_LOOKUP_ADMISSION\|P0_PUT_ADMISSION" \
+  "SC_LMCACHE_\|SC_IO_\|SC_LOAD_\|SC_MEMORY_\|SC_SCHEDULER_\|SC_WORKER_\|SC_DISK_PUT_\|SC_DRIVER_\|SC_LMCACHE_DATA_DIR\|GRID_RUN_\|GRID_CONFIG_SHA256\|SRIRAM_REQDBG\|SRIRAM_LOOKUPDBG\|SRIRAM_MONITOR\|SRIRAM_MEMDBG\|KVDBG_\|KVIO_\|VLLM_KV_IMPORTANCE\|max_num_seqs\|submission_batch_size\|enable_async_loading\|lookup_timeout_ms\|pin_timeout_sec\|local_disk\|max_local_disk_size\|SRIRAM_LMCACHE_DIR\|LMCACHE_P0_CLIENT_LOOKUP_MAX_INFLIGHT\|LMCACHE_P0_CLIENT_LOOKUP_ADMISSION_TIMEOUT_MS\|LMCACHE_P0_LOOKUP_MAX_INFLIGHT\|LMCACHE_P0_DISK_PUT_MAX_PENDING\|P0_CLIENT_LOOKUP_ADMISSION\|P0_LOOKUP_ADMISSION\|P0_PUT_ADMISSION" \
   -n local_repro vllm Hierarchical_KV third_party/LMCache \
   lmcache_hit_hook.py kvcache_monitor.py kvcache_visualize.py lmcache_config.yaml \
   2>/dev/null >> "$OUT" || true
