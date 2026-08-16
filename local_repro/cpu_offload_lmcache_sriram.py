@@ -265,7 +265,7 @@ LM_CACHE_DISK_PATH = os.environ.get(
 # environment-variable overrides cannot accidentally diverge.
 LM_CACHE_CHUNK_SIZE = 512
 LM_CACHE_LOCAL_CPU = True
-LM_CACHE_MAX_LOCAL_CPU_SIZE = 100.0
+LM_CACHE_MAX_LOCAL_CPU_SIZE = float(os.environ.get("SC_LMCACHE_MAX_LOCAL_CPU_SIZE", "100.0"))
 LM_CACHE_LOCAL_DISK = True
 LM_CACHE_MAX_LOCAL_DISK_SIZE = 450.0
 LM_CACHE_ENABLE_KV_EVENTS = True
@@ -346,7 +346,6 @@ def setup_environment_variables():
 
     if LM_CACHE_LOCAL_DISK:
         os.makedirs(f"{LM_CACHE_DISK_PATH}", exist_ok=True)
-        print("XYZ created lmcache disk path")
         os.environ["LMCACHE_LOCAL_DISK"] = f"file://{LM_CACHE_DISK_PATH}"
         os.environ["LMCACHE_MAX_LOCAL_DISK_SIZE"] = str(
             LM_CACHE_MAX_LOCAL_DISK_SIZE
