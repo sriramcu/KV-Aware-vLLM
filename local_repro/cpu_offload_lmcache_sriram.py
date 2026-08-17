@@ -108,6 +108,124 @@ def _sc_env_flag(name: str, default: bool = False) -> bool:
     raise ValueError(f"{name} has invalid boolean value {raw!r}")
 
 
+def _sc_wait_for_cold_warm_put_barrier() -> float:
+    """Wait until every TP rank reports zero pending LocalDiskBackend PUTs.
+
+    This is an experiment-only phase barrier. Rank-local status files are
+    maintained by LocalDiskWorker in a node-local control directory, so the
+    barrier itself does not probe or scan the configured cache data tier.
+    """
+    if not _sc_env_flag("SC_LMCACHE_COLD_WARM_PUT_BARRIER_ENABLE", False):
+        print("[SC_PUT_BARRIER_DISABLED]", flush=True)
+        return 0.0
+
+    raw_status_dir = _sc_os.environ.get("SC_LMCACHE_PUT_BARRIER_STATUS_DIR", "").strip()
+    if not raw_status_dir:
+        raise RuntimeError(
+            "SC_LMCACHE_COLD_WARM_PUT_BARRIER_ENABLE=1 requires "
+            "SC_LMCACHE_PUT_BARRIER_STATUS_DIR"
+        )
+
+    status_dir = Path(raw_status_dir)
+    expected_workers = int(
+        _sc_os.environ.get(
+            "SC_LMCACHE_PUT_BARRIER_EXPECTED_WORKERS",
+            _sc_os.environ.get("VLLM_TENSOR_PARALLEL_SIZE", "2"),
+        )
+    )
+    timeout_s = float(_sc_os.environ.get("SC_LMCACHE_PUT_BARRIER_TIMEOUT_S", "1200"))
+    poll_s = float(_sc_os.environ.get("SC_LMCACHE_PUT_BARRIER_POLL_S", "0.25"))
+    stable_s = float(_sc_os.environ.get("SC_LMCACHE_PUT_BARRIER_STABLE_S", "1.0"))
+
+    if expected_workers <= 0:
+        raise ValueError("SC_LMCACHE_PUT_BARRIER_EXPECTED_WORKERS must be > 0")
+    if timeout_s <= 0 or poll_s <= 0 or stable_s < 0:
+        raise ValueError(
+            "Barrier timeout/poll must be > 0 and stable interval must be >= 0"
+        )
+
+    started = time.monotonic()
+    zero_since = None
+    next_log = 0.0
+    print(
+        "[SC_PUT_BARRIER_START] "
+        f"status_dir={status_dir} expected_workers={expected_workers} "
+        f"timeout_s={timeout_s:.3f} poll_s={poll_s:.3f} stable_s={stable_s:.3f}",
+        flush=True,
+    )
+
+    while True:
+        elapsed = time.monotonic() - started
+        statuses = {}
+        parse_errors = {}
+        for rank in range(expected_workers):
+            path = status_dir / f"rank_{rank}.json"
+            try:
+                with path.open("r", encoding="utf-8") as handle:
+                    record = json.load(handle)
+                statuses[str(rank)] = {
+                    "pending_puts": int(record["pending_puts"]),
+                    "seq": int(record.get("seq", -1)),
+                    "pid": record.get("pid"),
+                    "queue_depth": record.get("queue_depth"),
+                    "active": record.get("active"),
+                    "reason": record.get("reason"),
+                }
+            except Exception as exc:
+                parse_errors[str(rank)] = repr(exc)
+
+        all_present = len(statuses) == expected_workers and not parse_errors
+        all_zero = all_present and all(
+            record["pending_puts"] == 0 for record in statuses.values()
+        )
+
+        now = time.monotonic()
+        if all_zero:
+            if zero_since is None:
+                zero_since = now
+            if now - zero_since >= stable_s:
+                total = now - started
+                # Tell workers they can stop publishing per-PUT barrier status
+                # before warm begins; this keeps barrier bookkeeping out of the
+                # measured warm phase.
+                release_path = status_dir / "barrier_released"
+                release_path.write_text(
+                    f"released_after={total:.6f}\n", encoding="utf-8"
+                )
+                print(
+                    "[SC_PUT_BARRIER_DONE] "
+                    f"elapsed={total:.6f} stable_elapsed={now - zero_since:.6f} "
+                    f"statuses={json.dumps(statuses, sort_keys=True)}",
+                    flush=True,
+                )
+                return total
+        else:
+            zero_since = None
+
+        if elapsed >= next_log:
+            print(
+                "[SC_PUT_BARRIER_POLL] "
+                f"elapsed={elapsed:.6f} all_present={all_present} all_zero={all_zero} "
+                f"statuses={json.dumps(statuses, sort_keys=True)} "
+                f"errors={json.dumps(parse_errors, sort_keys=True)}",
+                flush=True,
+            )
+            next_log = elapsed + 5.0
+
+        if elapsed >= timeout_s:
+            print(
+                "[SC_PUT_BARRIER_TIMEOUT] "
+                f"elapsed={elapsed:.6f} statuses={json.dumps(statuses, sort_keys=True)} "
+                f"errors={json.dumps(parse_errors, sort_keys=True)}",
+                flush=True,
+            )
+            raise TimeoutError(
+                f"Cold-to-warm PUT barrier timed out after {elapsed:.1f}s"
+            )
+
+        time.sleep(poll_s)
+
+
 def _sc_monitor_loop():
     interval_s = float(
         _sc_os.environ.get("SC_DRIVER_RESOURCE_MONITOR_INTERVAL_S", "30")
@@ -1161,6 +1279,13 @@ def main():
                 "[SC_IO_PHASE_BOUNDARY] "
                 f"phase=cold_done wall={time.time():.6f} "
                 f"mono={time.monotonic():.6f} proc_io={_sc_io_proc_snapshot()}",
+                flush=True,
+            )
+
+        barrier_time_taken = _sc_wait_for_cold_warm_put_barrier()
+        if _sc_env_flag("SC_LMCACHE_COLD_WARM_PUT_BARRIER_ENABLE", False):
+            print(
+                f"Cold-to-warm PUT barrier took {barrier_time_taken:.2f} seconds.",
                 flush=True,
             )
 

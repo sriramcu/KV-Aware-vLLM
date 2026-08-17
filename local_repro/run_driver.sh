@@ -85,6 +85,14 @@ export TMP="$TMPDIR"
 rm -rf "$TMPDIR"
 mkdir -p "$TMPDIR"
 
+# The PUT-drain barrier exchanges tiny rank-local status files through /tmp so
+# barrier control traffic never touches the NFS/scratch tier being measured.
+if [[ "${SC_LMCACHE_COLD_WARM_PUT_BARRIER_ENABLE:-0}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ ]]; then
+  export SC_LMCACHE_PUT_BARRIER_STATUS_DIR="${SC_LMCACHE_PUT_BARRIER_STATUS_DIR:-$TMPDIR/lmcache_put_barrier_status}"
+  rm -rf "$SC_LMCACHE_PUT_BARRIER_STATUS_DIR"
+  mkdir -p "$SC_LMCACHE_PUT_BARRIER_STATUS_DIR"
+fi
+
 echo "=== RUN CONFIG ==="
 date
 hostname

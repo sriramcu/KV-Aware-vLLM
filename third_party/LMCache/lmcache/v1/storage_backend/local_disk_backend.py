@@ -3,6 +3,7 @@
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
 import asyncio
+import json
 import os
 import threading
 import time
@@ -45,6 +46,18 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _sc_env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off", ""}:
+        return False
+    raise ValueError(f"{name} has invalid boolean value {raw!r}")
+
+
 def _sc_io_proc_snapshot() -> dict[str, int]:
     values: dict[str, int] = {}
     if not io_trace_enabled():
@@ -83,6 +96,17 @@ class LocalDiskWorker:
         self._sc_io_state_lock = threading.Lock()
         self._sc_io_active = {"prefetch": 0, "put": 0, "delete": 0}
 
+        # Optional rank-local status file used by the driver-side cold->warm
+        # PUT-drain barrier. It is configured by LocalDiskBackend once TP rank
+        # metadata is available.
+        self._sc_put_status_path: Optional[str] = None
+        self._sc_put_status_release_path: Optional[str] = None
+        self._sc_put_status_disabled = False
+        self._sc_put_status_rank: Optional[int] = None
+        self._sc_put_status_seq = 0
+        self._sc_put_status_last_written = -1
+        self._sc_put_status_write_lock = threading.Lock()
+
         # Optional disk-put admission before LocalDiskBackend takes an extra
         # MemoryObj reference or submits work to the executor queue.
         self._sc_disk_put_admission_enabled = disk_put_admission_enabled()
@@ -110,6 +134,80 @@ class LocalDiskWorker:
                 self._sc_disk_put_admission_enabled,
                 self._sc_disk_put_limit,
             )
+
+    def configure_put_barrier_status(self, status_dir: str, rank: int) -> None:
+        """Publish this rank's pending-PUT count for the driver phase barrier."""
+        os.makedirs(status_dir, exist_ok=True)
+        self._sc_put_status_rank = int(rank)
+        self._sc_put_status_path = os.path.join(status_dir, f"rank_{rank}.json")
+        self._sc_put_status_release_path = os.path.join(
+            status_dir, "barrier_released"
+        )
+        self._sc_put_status_disabled = False
+        with self.put_lock:
+            seq = self._sc_put_status_seq
+            pending = len(self.put_tasks)
+        self._sc_write_put_status(seq, pending, reason="init")
+        logger.info(
+            "SC PUT barrier status: rank=%d path=%s",
+            rank,
+            self._sc_put_status_path,
+        )
+
+    def _sc_write_put_status(self, seq: int, pending: int, reason: str) -> None:
+        path = self._sc_put_status_path
+        rank = self._sc_put_status_rank
+        if path is None or rank is None or self._sc_put_status_disabled:
+            return
+        release_path = self._sc_put_status_release_path
+        if release_path is not None and os.path.exists(release_path):
+            self._sc_put_status_disabled = True
+            return
+
+        with self._sc_io_state_lock:
+            active = dict(self._sc_io_active)
+        record = {
+            "pid": os.getpid(),
+            "rank": rank,
+            "seq": int(seq),
+            "pending_puts": int(pending),
+            "queue_depth": int(self.executor._queue.qsize()),
+            "active": active,
+            "reason": reason,
+            "updated_wall": time.time(),
+            "updated_mono": time.monotonic(),
+        }
+
+        # remove/insert can be called from different threads. Do not let an
+        # older snapshot overwrite a newer zero-pending state.
+        with self._sc_put_status_write_lock:
+            if seq < self._sc_put_status_last_written:
+                return
+            tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+            try:
+                with open(tmp, "w", encoding="utf-8") as handle:
+                    json.dump(record, handle, sort_keys=True)
+                    handle.write("\n")
+                os.replace(tmp, path)
+                self._sc_put_status_last_written = seq
+            except Exception as exc:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                logger.error(
+                    "[SC_PUT_BARRIER_STATUS_WRITE_ERROR] pid=%d rank=%d "
+                    "seq=%d pending_puts=%d error=%r",
+                    os.getpid(),
+                    rank,
+                    seq,
+                    pending,
+                    exc,
+                )
+
+    def put_task_count(self) -> int:
+        with self.put_lock:
+            return len(self.put_tasks)
 
     def acquire_disk_put_admission(self, key: CacheEngineKey) -> bool:
         """Block before ref_count_up until one bounded put slot is free.
@@ -348,9 +446,12 @@ class LocalDiskWorker:
         )
 
     def remove_put_task(self, key: CacheEngineKey):
+        status = None
         with self.put_lock:
             if key in self.put_tasks:
                 self.put_tasks.remove(key)
+                self._sc_put_status_seq += 1
+                status = (self._sc_put_status_seq, len(self.put_tasks))
                 if io_trace_enabled():
                     logger.warning(
                         "[SC_IO_PUT_TASK_REMOVE] pid=%d key_hash=%s "
@@ -361,12 +462,17 @@ class LocalDiskWorker:
                     )
             else:
                 logger.warning(f"Key {key} not found in put tasks.")
+        if status is not None:
+            self._sc_write_put_status(*status, reason="remove")
 
     def insert_put_task(self, key: CacheEngineKey) -> bool:
+        status = None
         with self.put_lock:
             if key in self.put_tasks:
                 return False
             self.put_tasks.append(key)
+            self._sc_put_status_seq += 1
+            status = (self._sc_put_status_seq, len(self.put_tasks))
             if io_trace_enabled():
                 logger.warning(
                     "[SC_IO_PUT_TASK_INSERT] pid=%d key_hash=%s put_tasks=%d",
@@ -374,7 +480,9 @@ class LocalDiskWorker:
                     key.chunk_hash,
                     len(self.put_tasks),
                 )
-            return True
+        assert status is not None
+        self._sc_write_put_status(*status, reason="insert")
+        return True
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
         with self.put_lock:
@@ -461,6 +569,31 @@ class LocalDiskBackend(StorageBackendInterface):
         logger.info("Using O_DIRECT for disk I/O: %s", self.use_odirect)
 
         self.disk_worker = LocalDiskWorker(loop)
+
+        self._sc_resident_put_dedup_enabled = _sc_env_flag(
+            "SC_LMCACHE_DISK_RESIDENT_PUT_DEDUP_ENABLE", False
+        )
+        self._sc_put_residency_trace_enabled = _sc_env_flag(
+            "SC_LMCACHE_DISK_PUT_RESIDENCY_TRACE_ENABLE", False
+        )
+        logger.info(
+            "SC disk resident PUT dedup: enabled=%s residency_trace=%s",
+            self._sc_resident_put_dedup_enabled,
+            self._sc_put_residency_trace_enabled,
+        )
+
+        barrier_status_dir = os.environ.get(
+            "SC_LMCACHE_PUT_BARRIER_STATUS_DIR", ""
+        ).strip()
+        if barrier_status_dir:
+            if metadata is None:
+                raise RuntimeError(
+                    "SC_LMCACHE_PUT_BARRIER_STATUS_DIR requires LMCache metadata "
+                    "so each TP worker can publish a distinct rank file"
+                )
+            self.disk_worker.configure_put_barrier_status(
+                barrier_status_dir, int(metadata.worker_id)
+            )
 
         # TODO(Jiayi): We need a disk space allocator to avoid fragmentation
         # and hide the following details away from the backend.
@@ -611,6 +744,62 @@ class LocalDiskBackend(StorageBackendInterface):
                 key=key.chunk_hash,
             )
 
+    def _sc_resident_snapshot(
+        self,
+        key: CacheEngineKey,
+        *,
+        refresh_on_dedup: bool = False,
+    ) -> dict[str, Any]:
+        """Read LocalDiskBackend's authoritative in-memory residency metadata."""
+        with self.disk_lock:
+            meta = self.dict.get(key)
+            resident = meta is not None
+            if resident and refresh_on_dedup:
+                # Preserve the eviction-policy effect that the existing rewrite
+                # would eventually produce in insert_key(), without doing I/O.
+                self.cache_policy.update_on_hit(key, self.dict)
+            return {
+                "resident": resident,
+                "pin_count": getattr(meta, "pin_count", None) if meta is not None else None,
+                "meta_size": getattr(meta, "size", None) if meta is not None else None,
+                "dict_size": len(self.dict),
+                "current_cache_size": self.current_cache_size,
+                "usage": self.usage,
+            }
+
+    def _sc_trace_put_residency(
+        self,
+        key: CacheEngineKey,
+        *,
+        action: str,
+        snapshot: Optional[dict[str, Any]] = None,
+        physical_size: Optional[int] = None,
+    ) -> None:
+        if not self._sc_put_residency_trace_enabled:
+            return
+        if snapshot is None:
+            snapshot = {}
+        logger.warning(
+            "[SC_DISK_PUT_RESIDENCY] pid=%d key_hash=%s action=%s "
+            "dedup_enabled=%s resident=%s pin_count=%s meta_size=%s "
+            "physical_size=%s dict_size=%s current_cache_size=%s usage=%s "
+            "put_tasks=%d queue_depth=%d thread=%s",
+            os.getpid(),
+            key.chunk_hash,
+            action,
+            self._sc_resident_put_dedup_enabled,
+            snapshot.get("resident", "unknown"),
+            snapshot.get("pin_count", "unknown"),
+            snapshot.get("meta_size", "unknown"),
+            physical_size if physical_size is not None else "unknown",
+            snapshot.get("dict_size", "unknown"),
+            snapshot.get("current_cache_size", "unknown"),
+            snapshot.get("usage", "unknown"),
+            self.disk_worker.put_task_count(),
+            self.disk_worker.executor._queue.qsize(),
+            threading.current_thread().name,
+        )
+
     def submit_put_task(
         self,
         key: CacheEngineKey,
@@ -630,19 +819,47 @@ class LocalDiskBackend(StorageBackendInterface):
             and logged.
         """
         assert memory_obj.tensor is not None
+        required_size = memory_obj.get_physical_size()
 
         # Fast duplicate check avoids waiting for a slot for work that is
         # already pending. insert_put_task() repeats the check atomically after
         # admission to close the race between concurrent submitters.
         if self.exists_in_put_tasks(key):
             logger.debug(f"Put task for {key} is already in progress.")
+            self._sc_trace_put_residency(
+                key, action="skip_inflight", physical_size=required_size
+            )
             return None
+
+        # A completed resident key can be identified from the backend's
+        # in-memory metadata; no filesystem stat/read is required. When dedup is
+        # enabled, preserve the old rewrite's cache-policy refresh and skip the
+        # physical write before taking a MemoryObj ref or touching capacity.
+        initial_snapshot = None
+        if self._sc_resident_put_dedup_enabled or self._sc_put_residency_trace_enabled:
+            initial_snapshot = self._sc_resident_snapshot(
+                key, refresh_on_dedup=self._sc_resident_put_dedup_enabled
+            )
+            if initial_snapshot["resident"] and self._sc_resident_put_dedup_enabled:
+                self._sc_trace_put_residency(
+                    key,
+                    action="skip_resident",
+                    snapshot=initial_snapshot,
+                    physical_size=required_size,
+                )
+                return None
 
         if not self.disk_worker.acquire_disk_put_admission(key):
             if io_trace_enabled():
                 logger.warning(
                     "[SC_DISK_PUT_ADMISSION_REJECT] key=%s", key
                 )
+            self._sc_trace_put_residency(
+                key,
+                action="reject_admission",
+                snapshot=initial_snapshot,
+                physical_size=required_size,
+            )
             return None
 
         if not self.disk_worker.insert_put_task(key):
@@ -650,10 +867,49 @@ class LocalDiskBackend(StorageBackendInterface):
                 key,
                 reason="duplicate_after_wait",
             )
+            self._sc_trace_put_residency(
+                key,
+                action="skip_inflight_after_wait",
+                snapshot=initial_snapshot,
+                physical_size=required_size,
+            )
             return None
 
+        # Close the resident-check race: a previously in-flight same-key PUT
+        # may have finished between the fast checks above and our put-task claim.
+        final_snapshot = initial_snapshot
+        if self._sc_resident_put_dedup_enabled:
+            final_snapshot = self._sc_resident_snapshot(
+                key, refresh_on_dedup=True
+            )
+            if final_snapshot["resident"]:
+                self.disk_worker.remove_put_task(key)
+                self.disk_worker.release_disk_put_admission(
+                    key, reason="resident_dedup_after_claim"
+                )
+                self._sc_trace_put_residency(
+                    key,
+                    action="skip_resident_after_claim",
+                    snapshot=final_snapshot,
+                    physical_size=required_size,
+                )
+                return None
+
+        if final_snapshot is None and self._sc_put_residency_trace_enabled:
+            final_snapshot = self._sc_resident_snapshot(key)
+        action = (
+            "enqueue_resident_rewrite"
+            if final_snapshot is not None and final_snapshot.get("resident")
+            else "enqueue_new"
+        )
+        self._sc_trace_put_residency(
+            key,
+            action=action,
+            snapshot=final_snapshot,
+            physical_size=required_size,
+        )
+
         # TODO(Jiayi): Fragmentation is not considered here.
-        required_size = memory_obj.get_physical_size()
         all_evict_keys = []
         evict_success = True
         with self.disk_lock:
