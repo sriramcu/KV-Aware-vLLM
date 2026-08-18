@@ -3,6 +3,7 @@ set -euo pipefail
 
 # Creates a targeted, full-content "gitingest-like" bundle for debugging
 # KV-Aware-vLLM / vendored LMCache / Hierarchical_KV runs in a new chat.
+# Version 5 adds PVTSC/fairness/lifecycle coverage and storage-mount identity.
 #
 # LMCache is expected to live in:
 #   $REPO/third_party/LMCache
@@ -13,7 +14,7 @@ set -euo pipefail
 #
 # Usage:
 #   cd /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
-#   bash /path/to/make_kvaware_code_bundle_updated_v4.sh
+#   bash /path/to/make_kvaware_code_bundle_updated_v5.sh
 #
 # Optional overrides:
 #   REPO=/path/to/KV-Aware-vLLM
@@ -209,6 +210,27 @@ PY
   python -m pip check 2>/dev/null || true
 } > "$OUT"
 
+section "STORAGE MOUNT SNAPSHOT"
+{
+  echo "IMPORTANT: do not infer filesystem type from the /mnt/shared/gpfs path name."
+  echo "Home/repo mount identity:"
+  findmnt -T "$HOME_DIR" -o TARGET,SOURCE,FSTYPE,OPTIONS 2>/dev/null || true
+  df -T "$HOME_DIR" 2>/dev/null || true
+  echo
+
+  if [[ -n "${SC_LMCACHE_DATA_DIR:-}" ]]; then
+    echo "Active SC_LMCACHE_DATA_DIR=$SC_LMCACHE_DATA_DIR"
+    if [[ -e "$SC_LMCACHE_DATA_DIR" ]]; then
+      findmnt -T "$SC_LMCACHE_DATA_DIR" -o TARGET,SOURCE,FSTYPE,OPTIONS 2>/dev/null || true
+      df -T "$SC_LMCACHE_DATA_DIR" 2>/dev/null || true
+    else
+      echo "SC_LMCACHE_DATA_DIR does not exist on this host at bundle-generation time."
+    fi
+  else
+    echo "SC_LMCACHE_DATA_DIR is not set in the bundle-generation shell."
+  fi
+} >> "$OUT"
+
 section "HIGH-LEVEL DIRECTORY STRUCTURE"
 cat >> "$OUT" <<EOF
 $REPO/
@@ -271,6 +293,9 @@ echo "Adding targeted repository files..."
 # ---------------------------------------------------------------------------
 append_file "local_repro/cpu_offload_lmcache_sriram.py"
 append_file "local_repro/run_driver.sh"
+if [[ -f "local_repro/sbatch/17_h100_pvtsc_q250.sbatch" ]]; then
+  append_file "local_repro/sbatch/17_h100_pvtsc_q250.sbatch"
+fi
 append_file "lmcache_hit_hook.py"
 append_file "kvcache_monitor.py"
 append_file "kvcache_visualize.py"
@@ -291,7 +316,13 @@ append_existing_files_from_find < <(
       -iname '*gate*c*.patch' -o \
       -iname '*p0*.patch' -o \
       -iname '*bounded*prefetch*.md' -o \
-      -iname '*setup*guide*.md' \
+      -iname '*setup*guide*.md' -o \
+      -iname '*pvtsc*' -o \
+      -iname '*serializer*fairness*' -o \
+      -iname '*put*barrier*residen*' -o \
+      -iname '*round4*' -o \
+      -iname '*round5*' -o \
+      -iname '*round6*' \
     \) \
     ! -name '*.out' \
     ! -name '*.err' \
@@ -372,6 +403,7 @@ append_file "$LMCACHE_PKG/v1/pin_monitor.py"
 append_file "$LMCACHE_PKG/v1/memory_management.py"
 
 append_file "$LMCACHE_PKG/v1/lookup_client/factory.py"
+append_file "$LMCACHE_PKG/v1/lookup_client/async_lookup_message.py"
 append_file "$LMCACHE_PKG/v1/lookup_client/lmcache_async_lookup_client.py"
 
 append_file "$LMCACHE_PKG/v1/storage_backend/__init__.py"
@@ -426,7 +458,9 @@ if [[ -d "$LMCACHE_ROOT/tests" ]]; then
         -iname '*storage*' -o \
         -iname '*disk*' -o \
         -iname '*admission*' -o \
-        -iname '*p0*' \
+        -iname '*p0*' -o \
+        -iname '*pvtsc*' -o \
+        -iname '*fair*' \
       \) | sort
   )
 fi
@@ -450,7 +484,9 @@ section "CURATED PATH EXISTENCE SNAPSHOT"
     "vllm/distributed/kv_transfer/kv_connector/v1" \
     "third_party/LMCache" \
     "third_party/LMCache/lmcache/v1/lookup_client" \
+    "third_party/LMCache/lmcache/v1/lookup_client/async_lookup_message.py" \
     "third_party/LMCache/lmcache/v1/storage_backend" \
+    "local_repro/sbatch/17_h100_pvtsc_q250.sbatch" \
     "Hierarchical_KV" \
     "Hierarchical_KV/LinearRAG" \
     "p0_first_half_bundle"
@@ -484,7 +520,7 @@ git -C "$LMCACHE_ROOT" diff >> "$OUT" 2>&1 || true
 
 section "GREP SUMMARY: lifecycle, debug hooks, admission controls, and settings"
 grep -R \
-  "SC_LMCACHE_\|SC_IO_\|SC_LOAD_\|SC_MEMORY_\|SC_SCHEDULER_\|SC_WORKER_\|SC_DISK_PUT_\|SC_DRIVER_\|SC_LMCACHE_DATA_DIR\|GRID_RUN_\|GRID_CONFIG_SHA256\|SRIRAM_REQDBG\|SRIRAM_LOOKUPDBG\|SRIRAM_MONITOR\|SRIRAM_MEMDBG\|KVDBG_\|KVIO_\|VLLM_KV_IMPORTANCE\|max_num_seqs\|submission_batch_size\|enable_async_loading\|lookup_timeout_ms\|pin_timeout_sec\|local_disk\|max_local_disk_size\|SRIRAM_LMCACHE_DIR\|LMCACHE_P0_CLIENT_LOOKUP_MAX_INFLIGHT\|LMCACHE_P0_CLIENT_LOOKUP_ADMISSION_TIMEOUT_MS\|LMCACHE_P0_LOOKUP_MAX_INFLIGHT\|LMCACHE_P0_DISK_PUT_MAX_PENDING\|P0_CLIENT_LOOKUP_ADMISSION\|P0_LOOKUP_ADMISSION\|P0_PUT_ADMISSION" \
+  "SC_LMCACHE_\|SC_IO_\|SC_LOAD_\|SC_MEMORY_\|SC_SCHEDULER_\|SC_WORKER_\|SC_DISK_PUT_\|SC_DRIVER_\|SC_LMCACHE_DATA_DIR\|PVTSC\|SERIALIZER_FAIRNESS\|CPU_BURST_RATIO\|RESIDENT_PUT_DEDUP\|COLD_WARM_PUT_BARRIER\|readinto\|AsyncPQThreadPoolExecutor\|proc_io_delta\|GRID_RUN_\|GRID_CONFIG_SHA256\|SRIRAM_REQDBG\|SRIRAM_LOOKUPDBG\|SRIRAM_MONITOR\|SRIRAM_MEMDBG\|KVDBG_\|KVIO_\|VLLM_KV_IMPORTANCE\|max_num_seqs\|submission_batch_size\|enable_async_loading\|lookup_timeout_ms\|pin_timeout_sec\|local_disk\|max_local_disk_size\|SRIRAM_LMCACHE_DIR\|LMCACHE_P0_CLIENT_LOOKUP_MAX_INFLIGHT\|LMCACHE_P0_CLIENT_LOOKUP_ADMISSION_TIMEOUT_MS\|LMCACHE_P0_LOOKUP_MAX_INFLIGHT\|LMCACHE_P0_DISK_PUT_MAX_PENDING\|P0_CLIENT_LOOKUP_ADMISSION\|P0_LOOKUP_ADMISSION\|P0_PUT_ADMISSION" \
   -n local_repro vllm Hierarchical_KV third_party/LMCache \
   lmcache_hit_hook.py kvcache_monitor.py kvcache_visualize.py lmcache_config.yaml \
   2>/dev/null >> "$OUT" || true
