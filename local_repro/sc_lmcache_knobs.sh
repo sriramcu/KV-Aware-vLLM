@@ -60,6 +60,12 @@ _sc_default SC_LMCACHE_WORKER_LOOKUP_MAX_INFLIGHT 1
 _sc_default SC_LMCACHE_DISK_PUT_ADMISSION_ENABLE "$_sc_profile_gates"
 _sc_default SC_LMCACHE_DISK_PUT_MAX_PENDING 8
 
+# Round-6 single-serializer CPU/disk fairness controls.
+# Ratio=N means: while CPU and disk are both continuously waiting, select at
+# most N CPU backend operations before forcing one disk backend operation.
+_sc_default SC_LMCACHE_SERIALIZER_FAIRNESS_ENABLE 0
+_sc_default SC_LMCACHE_SERIALIZER_CPU_BURST_RATIO 4
+
 # Round-5 experimental controls and their independent residency trace.
 # Functional controls remain disabled unless a grid cell explicitly enables them.
 _sc_default SC_LMCACHE_DISK_RESIDENT_PUT_DEDUP_ENABLE 0
@@ -100,6 +106,7 @@ for _sc_name in \
   SC_LMCACHE_SCHEDULER_LOOKUP_ADMISSION_ENABLE \
   SC_LMCACHE_WORKER_LOOKUP_ADMISSION_ENABLE \
   SC_LMCACHE_DISK_PUT_ADMISSION_ENABLE \
+  SC_LMCACHE_SERIALIZER_FAIRNESS_ENABLE \
   SC_LMCACHE_DISK_RESIDENT_PUT_DEDUP_ENABLE \
   SC_LMCACHE_COLD_WARM_PUT_BARRIER_ENABLE \
   SC_LMCACHE_DISK_PUT_RESIDENCY_TRACE_ENABLE \
@@ -119,6 +126,11 @@ for _sc_name in \
   fi
 done
 
+if ! [[ "$SC_LMCACHE_SERIALIZER_CPU_BURST_RATIO" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Invalid SC_LMCACHE_SERIALIZER_CPU_BURST_RATIO=$SC_LMCACHE_SERIALIZER_CPU_BURST_RATIO; expected integer >= 1" >&2
+  return 2 2>/dev/null || exit 2
+fi
+
 sc_lmcache_print_knobs() {
   local name
   echo "SC_LMCACHE_PROFILE=$SC_LMCACHE_PROFILE"
@@ -130,6 +142,8 @@ sc_lmcache_print_knobs() {
     SC_LMCACHE_WORKER_LOOKUP_MAX_INFLIGHT \
     SC_LMCACHE_DISK_PUT_ADMISSION_ENABLE \
     SC_LMCACHE_DISK_PUT_MAX_PENDING \
+    SC_LMCACHE_SERIALIZER_FAIRNESS_ENABLE \
+    SC_LMCACHE_SERIALIZER_CPU_BURST_RATIO \
     SC_LMCACHE_DISK_RESIDENT_PUT_DEDUP_ENABLE \
     SC_LMCACHE_DISK_PUT_RESIDENCY_TRACE_ENABLE \
     SC_LMCACHE_COLD_WARM_PUT_BARRIER_ENABLE \

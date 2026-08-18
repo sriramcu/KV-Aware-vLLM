@@ -271,29 +271,282 @@ class AsyncMultiSerializer:
 class AsyncSingleSerializer:
     """
     Prevent race conditions in a naive way by forcing each request that
-    is passed through to be serialized
+    is passed through to be serialized.
+
+    When SC_LMCACHE_SERIALIZER_FAIRNESS_ENABLE=1, the serializer still permits
+    exactly one active backend operation, but waiting LocalCPUBackend operations
+    receive deterministic weighted preference over LocalDiskBackend operations.
+    The ratio knob is an integer CPU burst length: e.g. 4 means that while both
+    tiers are continuously waiting, at most four CPU operations are selected
+    before one disk operation is forced to make progress.
     """
 
     def __init__(self, loop: asyncio.AbstractEventLoop):
         self.loop = loop
-        # lazy init in run
+        # Vanilla path: lazy init in run so the lock binds to the calling loop.
         self.lock: Optional[asyncio.Lock] = None
-        # Observability-only counters; they do not gate admission.
+        # Fair path: also lazily initialized on the calling event loop.
+        self._sc_fair_cond: Optional[asyncio.Condition] = None
+        self._sc_fair_active = False
+        self._sc_fair_cpu_waiters = 0
+        self._sc_fair_disk_waiters = 0
+        self._sc_fair_cpu_burst = 0
+
+        raw_enable = _sc_os.environ.get(
+            "SC_LMCACHE_SERIALIZER_FAIRNESS_ENABLE", "0"
+        ).strip().lower()
+        if raw_enable in {"1", "true", "yes", "on"}:
+            self._sc_fair_enabled = True
+        elif raw_enable in {"0", "false", "no", "off", ""}:
+            self._sc_fair_enabled = False
+        else:
+            raise ValueError(
+                "SC_LMCACHE_SERIALIZER_FAIRNESS_ENABLE must be a boolean; "
+                f"got {raw_enable!r}"
+            )
+
+        raw_ratio = _sc_os.environ.get(
+            "SC_LMCACHE_SERIALIZER_CPU_BURST_RATIO", "4"
+        ).strip()
+        try:
+            self._sc_fair_ratio = int(raw_ratio)
+        except ValueError as exc:
+            raise ValueError(
+                "SC_LMCACHE_SERIALIZER_CPU_BURST_RATIO must be an integer >= 1; "
+                f"got {raw_ratio!r}"
+            ) from exc
+        if self._sc_fair_ratio < 1:
+            raise ValueError(
+                "SC_LMCACHE_SERIALIZER_CPU_BURST_RATIO must be >= 1; "
+                f"got {self._sc_fair_ratio}"
+            )
+
+        # Observability counters used by both paths.
         self._sc_io_waiters = 0
         self._sc_io_active_lookup_id: Optional[str] = None
         self._sc_io_active_backend: Optional[str] = None
 
-    async def run(self, coro_fn: Coroutine[Any, Any, Any], *args, **kwargs) -> Any:
-        # we need to lazily initialize the lock to
-        # place it on the calling event loop
-        if self.lock is None:
-            self.lock = asyncio.Lock()
+        logger.info(
+            "SC single-serializer fairness: enabled=%s cpu_burst_ratio=%d",
+            self._sc_fair_enabled,
+            self._sc_fair_ratio,
+        )
 
+    @staticmethod
+    def _sc_fair_tier(backend_name: str) -> str:
+        # These experiments use LocalCPUBackend and LocalDiskBackend. Treat any
+        # future non-CPU backend as the low-priority/disk class so CPU preference
+        # remains conservative rather than accidentally promoting a slow tier.
+        return "cpu" if backend_name == "LocalCPUBackend" else "disk"
+
+    def _sc_fair_can_acquire(self, tier: str) -> bool:
+        if self._sc_fair_active:
+            return False
+        if tier == "cpu":
+            return (
+                self._sc_fair_disk_waiters == 0
+                or self._sc_fair_cpu_burst < self._sc_fair_ratio
+            )
+        return (
+            self._sc_fair_cpu_waiters == 0
+            or self._sc_fair_cpu_burst >= self._sc_fair_ratio
+        )
+
+    async def _sc_run_fair(
+        self,
+        coro_fn: Coroutine[Any, Any, Any],
+        *,
+        lookup_id: str,
+        backend_name: str,
+        num_chunks: int,
+        queued_at: float,
+        trace_enabled: bool,
+    ) -> Any:
+        if self._sc_fair_cond is None:
+            self._sc_fair_cond = asyncio.Condition()
+        cond = self._sc_fair_cond
+        tier = self._sc_fair_tier(backend_name)
+        acquired = False
+
+        if trace_enabled:
+            self._sc_io_waiters += 1
+            logger.warning(
+                "[SC_IO_SERIALIZER_ENQUEUE] lookup_id=%s backend=%s chunks=%d "
+                "waiters=%d active_lookup_id=%s active_backend=%s mono=%.6f",
+                lookup_id,
+                backend_name,
+                num_chunks,
+                self._sc_io_waiters,
+                self._sc_io_active_lookup_id,
+                self._sc_io_active_backend,
+                queued_at,
+            )
+
+        async with cond:
+            if tier == "cpu":
+                self._sc_fair_cpu_waiters += 1
+            else:
+                self._sc_fair_disk_waiters += 1
+            registered = True
+
+            if trace_enabled:
+                logger.warning(
+                    "[SC_IO_FAIR_ENQUEUE] lookup_id=%s backend=%s tier=%s chunks=%d "
+                    "cpu_waiters=%d disk_waiters=%d active=%s cpu_burst=%d "
+                    "ratio=%d",
+                    lookup_id,
+                    backend_name,
+                    tier,
+                    num_chunks,
+                    self._sc_fair_cpu_waiters,
+                    self._sc_fair_disk_waiters,
+                    self._sc_fair_active,
+                    self._sc_fair_cpu_burst,
+                    self._sc_fair_ratio,
+                )
+
+            try:
+                await cond.wait_for(lambda: self._sc_fair_can_acquire(tier))
+            except BaseException:
+                if registered:
+                    if tier == "cpu":
+                        self._sc_fair_cpu_waiters -= 1
+                    else:
+                        self._sc_fair_disk_waiters -= 1
+                    registered = False
+                if trace_enabled:
+                    self._sc_io_waiters -= 1
+                    logger.warning(
+                        "[SC_IO_SERIALIZER_WAIT_ENDED_WITHOUT_ACQUIRE] "
+                        "lookup_id=%s backend=%s chunks=%d waited=%.6f waiters=%d",
+                        lookup_id,
+                        backend_name,
+                        num_chunks,
+                        _sc_time.monotonic() - queued_at,
+                        self._sc_io_waiters,
+                    )
+                    logger.warning(
+                        "[SC_IO_FAIR_WAIT_CANCELLED] lookup_id=%s backend=%s "
+                        "tier=%s cpu_waiters=%d disk_waiters=%d cpu_burst=%d ratio=%d",
+                        lookup_id,
+                        backend_name,
+                        tier,
+                        self._sc_fair_cpu_waiters,
+                        self._sc_fair_disk_waiters,
+                        self._sc_fair_cpu_burst,
+                        self._sc_fair_ratio,
+                    )
+                cond.notify_all()
+                raise
+
+            if tier == "cpu":
+                self._sc_fair_cpu_waiters -= 1
+                disk_was_waiting = self._sc_fair_disk_waiters > 0
+                if disk_was_waiting:
+                    self._sc_fair_cpu_burst += 1
+                    reason = "cpu_preferred"
+                else:
+                    self._sc_fair_cpu_burst = 0
+                    reason = "cpu_only"
+            else:
+                self._sc_fair_disk_waiters -= 1
+                cpu_was_waiting = self._sc_fair_cpu_waiters > 0
+                reason = (
+                    "disk_starvation_guard" if cpu_was_waiting else "disk_only"
+                )
+                self._sc_fair_cpu_burst = 0
+            registered = False
+            self._sc_fair_active = True
+            acquired = True
+            acquired_at = _sc_time.monotonic()
+
+            if trace_enabled:
+                self._sc_io_waiters -= 1
+                previous_lookup_id = self._sc_io_active_lookup_id
+                previous_backend = self._sc_io_active_backend
+                self._sc_io_active_lookup_id = lookup_id
+                self._sc_io_active_backend = backend_name
+                logger.warning(
+                    "[SC_IO_FAIR_SELECT] lookup_id=%s backend=%s tier=%s reason=%s "
+                    "cpu_waiters=%d disk_waiters=%d cpu_burst=%d ratio=%d "
+                    "queue_wait=%.6f",
+                    lookup_id,
+                    backend_name,
+                    tier,
+                    reason,
+                    self._sc_fair_cpu_waiters,
+                    self._sc_fair_disk_waiters,
+                    self._sc_fair_cpu_burst,
+                    self._sc_fair_ratio,
+                    acquired_at - queued_at,
+                )
+                logger.warning(
+                    "[SC_IO_SERIALIZER_ACQUIRE] lookup_id=%s backend=%s "
+                    "chunks=%d queue_wait=%.6f waiters=%d "
+                    "previous_lookup_id=%s previous_backend=%s",
+                    lookup_id,
+                    backend_name,
+                    num_chunks,
+                    acquired_at - queued_at,
+                    self._sc_io_waiters,
+                    previous_lookup_id,
+                    previous_backend,
+                )
+
+        try:
+            return await coro_fn
+        finally:
+            if acquired:
+                now = _sc_time.monotonic()
+                async with cond:
+                    if trace_enabled:
+                        logger.warning(
+                            "[SC_IO_SERIALIZER_RELEASE] lookup_id=%s backend=%s "
+                            "chunks=%d held=%.6f total=%.6f waiters=%d",
+                            lookup_id,
+                            backend_name,
+                            num_chunks,
+                            now - acquired_at,
+                            now - queued_at,
+                            self._sc_io_waiters,
+                        )
+                        logger.warning(
+                            "[SC_IO_FAIR_RELEASE] lookup_id=%s backend=%s tier=%s "
+                            "cpu_waiters=%d disk_waiters=%d cpu_burst=%d ratio=%d",
+                            lookup_id,
+                            backend_name,
+                            tier,
+                            self._sc_fair_cpu_waiters,
+                            self._sc_fair_disk_waiters,
+                            self._sc_fair_cpu_burst,
+                            self._sc_fair_ratio,
+                        )
+                        self._sc_io_active_lookup_id = None
+                        self._sc_io_active_backend = None
+                    self._sc_fair_active = False
+                    cond.notify_all()
+
+    async def run(self, coro_fn: Coroutine[Any, Any, Any], *args, **kwargs) -> Any:
         trace_enabled = io_trace_enabled()
         lookup_id = str(kwargs.get("_sc_io_lookup_id", "unknown"))
         backend_name = str(kwargs.get("_sc_io_backend_name", "unknown"))
         num_chunks = int(kwargs.get("_sc_io_num_chunks", args[0] if args else -1))
         queued_at = _sc_time.monotonic()
+
+        if self._sc_fair_enabled:
+            return await self._sc_run_fair(
+                coro_fn,
+                lookup_id=lookup_id,
+                backend_name=backend_name,
+                num_chunks=num_chunks,
+                queued_at=queued_at,
+                trace_enabled=trace_enabled,
+            )
+
+        # Vanilla path intentionally preserves the pre-fairness implementation.
+        # We lazily initialize the lock to place it on the calling event loop.
+        if self.lock is None:
+            self.lock = asyncio.Lock()
         acquired = False
 
         if trace_enabled:
@@ -311,7 +564,7 @@ class AsyncSingleSerializer:
             )
 
         try:
-            async with self.lock:  # type: ignore
+            async with self.lock:
                 acquired = True
                 acquired_at = _sc_time.monotonic()
                 if trace_enabled:

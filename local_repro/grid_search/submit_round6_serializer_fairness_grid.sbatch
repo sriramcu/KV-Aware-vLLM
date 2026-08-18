@@ -1,0 +1,71 @@
+#!/bin/bash
+#SBATCH --partition=gpu-h100-dchen
+#SBATCH --time=06:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gres=gpu:2
+#SBATCH --cpus-per-task=16
+
+set -euxo pipefail
+
+REPO=/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
+export PYTHONPATH="$REPO:${PYTHONPATH:-}"
+
+if [[ "${SC_LMCACHE_SOURCE_DEFAULT_KNOBS:-1}" == "1" ]]; then
+  source "$REPO/local_repro/sc_lmcache_knobs.sh"
+fi
+
+: "${GRID_RUN_ID:?GRID_RUN_ID is required}"
+: "${GRID_RUN_LABEL:?GRID_RUN_LABEL is required}"
+: "${GRID_CONFIG_SHA256:?GRID_CONFIG_SHA256 is required}"
+: "${MAX_QUESTIONS:?MAX_QUESTIONS is required}"
+: "${SUBMISSION_BATCH_SIZE:?SUBMISSION_BATCH_SIZE is required}"
+: "${DATASET_NAME:?DATASET_NAME is required}"
+: "${VLLM_MAX_NUM_SEQS:?VLLM_MAX_NUM_SEQS is required}"
+: "${SC_LMCACHE_MAX_LOCAL_CPU_SIZE:?SC_LMCACHE_MAX_LOCAL_CPU_SIZE is required}"
+: "${SC_LMCACHE_COLD_WARM_PUT_BARRIER_ENABLE:?barrier enable is required}"
+: "${SC_LMCACHE_DISK_RESIDENT_PUT_DEDUP_ENABLE:?resident PUT dedup enable is required}"
+: "${SC_LMCACHE_SERIALIZER_FAIRNESS_ENABLE:?serializer fairness enable is required}"
+: "${SC_LMCACHE_SERIALIZER_CPU_BURST_RATIO:?serializer CPU burst ratio is required}"
+
+# Round 6 is intentionally NFS-only. Never inherit a stale scratch override.
+unset SC_LMCACHE_DATA_DIR
+
+if [[ "$SC_LMCACHE_SERIALIZER_FAIRNESS_ENABLE" != "1" ]]; then
+  echo "Round 6 requires SC_LMCACHE_SERIALIZER_FAIRNESS_ENABLE=1" >&2
+  exit 2
+fi
+if ! [[ "$SC_LMCACHE_SERIALIZER_CPU_BURST_RATIO" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Invalid SC_LMCACHE_SERIALIZER_CPU_BURST_RATIO=$SC_LMCACHE_SERIALIZER_CPU_BURST_RATIO" >&2
+  exit 2
+fi
+if [[ "$SC_LMCACHE_COLD_WARM_PUT_BARRIER_ENABLE" != "1" ]]; then
+  echo "Round 6 requires cold->warm PUT barrier enabled" >&2
+  exit 2
+fi
+if [[ "$SC_LMCACHE_DISK_RESIDENT_PUT_DEDUP_ENABLE" != "1" ]]; then
+  echo "Round 6 requires resident PUT dedup enabled" >&2
+  exit 2
+fi
+
+export PYTHONFAULTHANDLER=1
+
+printf '%s\n' \
+  "=== SC ROUND6 SERIALIZER FAIRNESS GRID JOB ===" \
+  "GRID_RUN_ID=$GRID_RUN_ID" \
+  "GRID_RUN_LABEL=$GRID_RUN_LABEL" \
+  "GRID_CONFIG_SHA256=$GRID_CONFIG_SHA256" \
+  "SC_ROUND6_NODELIST=${SC_ROUND6_NODELIST:-unknown}" \
+  "MAX_QUESTIONS=$MAX_QUESTIONS" \
+  "DATASET_NAME=$DATASET_NAME" \
+  "SUBMISSION_BATCH_SIZE=$SUBMISSION_BATCH_SIZE" \
+  "VLLM_MAX_NUM_SEQS=$VLLM_MAX_NUM_SEQS" \
+  "SC_LMCACHE_MAX_LOCAL_CPU_SIZE=$SC_LMCACHE_MAX_LOCAL_CPU_SIZE" \
+  "SC_LMCACHE_SCHEDULER_LOOKUP_MAX_INFLIGHT=$SC_LMCACHE_SCHEDULER_LOOKUP_MAX_INFLIGHT" \
+  "SC_LMCACHE_COLD_WARM_PUT_BARRIER_ENABLE=$SC_LMCACHE_COLD_WARM_PUT_BARRIER_ENABLE" \
+  "SC_LMCACHE_DISK_RESIDENT_PUT_DEDUP_ENABLE=$SC_LMCACHE_DISK_RESIDENT_PUT_DEDUP_ENABLE" \
+  "SC_LMCACHE_SERIALIZER_FAIRNESS_ENABLE=$SC_LMCACHE_SERIALIZER_FAIRNESS_ENABLE" \
+  "SC_LMCACHE_SERIALIZER_CPU_BURST_RATIO=$SC_LMCACHE_SERIALIZER_CPU_BURST_RATIO" \
+  "SC_LMCACHE_DATA_DIR=driver-default-shared-NFS"
+
+"$REPO/local_repro/run_driver.sh" wo_gnn 2>&1
