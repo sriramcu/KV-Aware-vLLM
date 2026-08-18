@@ -48,3 +48,20 @@ class LookupCleanupMsg(AsyncLookupMsg):
 
     def describe(self) -> str:
         return f"Cleanup memory for lookup_id={self.lookup_id}"
+
+class LookupPVTSCMsg(AsyncLookupMsg):
+    """
+    Post-vLLM-timeout synthetic-completion request.
+
+    The scheduler sends this only after its poll-based async lookup timeout has
+    returned zero LMCache tokens to vLLM. Workers should stop future disk work
+    for this lookup at safe boundaries and complete the disk tier as an empty
+    result. This is intentionally distinct from LookupCleanupMsg, which runs
+    after prefetch completion and releases returned memory objects.
+    """
+
+    lookup_id: str
+
+    def describe(self) -> str:
+        return f"PVTSC soft-stop for lookup_id={self.lookup_id}"
+

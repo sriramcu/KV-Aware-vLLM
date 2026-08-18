@@ -1446,6 +1446,48 @@ class LMCacheEngine:
 
             sc_io_future.add_done_callback(_sc_io_engine_done)
 
+    def request_pvtsc(self, lookup_id: str) -> None:
+        """Request post-vLLM-timeout synthetic completion for disk retrieval.
+
+        The scheduler calls this only after its poll-based lookup timeout has
+        already returned zero LMCache tokens to vLLM. The storage-manager event
+        remains alive: queued disk work is skipped, active disk work yields at a
+        safe file boundary, and normal all-done/cleanup ownership is preserved.
+        """
+        assert self.storage_manager is not None
+        requested_at = time.monotonic()
+        future = asyncio.run_coroutine_threadsafe(
+            self.storage_manager.request_pvtsc(lookup_id),
+            self.storage_manager.loop,
+        )
+
+        if io_trace_enabled():
+            logger.warning(
+                "[SC_IO_PVTSC_ENGINE_REQUEST] lookup_id=%s mono=%.6f",
+                lookup_id,
+                requested_at,
+            )
+
+            def _sc_pvtsc_done(done_future):
+                try:
+                    applied = done_future.result()
+                except Exception as exc:
+                    logger.exception(
+                        "[SC_IO_PVTSC_ENGINE_FAILED] lookup_id=%s error=%r",
+                        lookup_id,
+                        exc,
+                    )
+                    return
+                logger.warning(
+                    "[SC_IO_PVTSC_ENGINE_DONE] lookup_id=%s applied=%s "
+                    "elapsed=%.6f",
+                    lookup_id,
+                    applied,
+                    time.monotonic() - requested_at,
+                )
+
+            future.add_done_callback(_sc_pvtsc_done)
+
     def cleanup_memory_objs(self, lookup_id: str) -> None:
         """
         Cleanup memory objects allocated during prefetch for an aborted lookup.
@@ -1453,6 +1495,7 @@ class LMCacheEngine:
         Called by the scheduler when it determines that an aborted lookup
         has finished its prefetch tasks.
         """
+        cleanup_completed = False
         try:
             cleanup_started = time.monotonic()
             event_status = self.event_manager.get_event_status(
@@ -1512,6 +1555,7 @@ class LMCacheEngine:
                     memory_obj.ref_count_down()
                 except Exception as e:
                     logger.error(f"Error releasing memory object: {e}")
+            cleanup_completed = True
             if io_trace_enabled():
                 logger.warning(
                     "[SC_IO_ENGINE_CLEANUP_DONE] lookup_id=%s objects=%d "
@@ -1524,6 +1568,20 @@ class LMCacheEngine:
             logger.error(
                 f"Error during cleanup_memory_objs for lookup_id={lookup_id}: {e}"
             )
+        finally:
+            # A rank can finish before the scheduler's poll timeout, receive a
+            # late PVTSC signal while another rank is still outstanding, and
+            # therefore recreate its per-lookup PVTSC event after the normal
+            # all-done callback cleared it. Final scheduler cleanup is the safe
+            # lifecycle boundary for removing that flag. Do not clear on the
+            # EventStatus.ONGOING/deferred path: an active disk worker may still
+            # need to observe the event at its next file boundary.
+            if cleanup_completed and self.storage_manager is not None:
+                self.storage_manager.loop.call_soon_threadsafe(
+                    self.storage_manager.clear_pvtsc_state,
+                    lookup_id,
+                    "scheduler_cleanup",
+                )
 
     # TODO(Jiayi): Need to handle the case where `tokens=None`.
     # In this case, we compress all tokens.

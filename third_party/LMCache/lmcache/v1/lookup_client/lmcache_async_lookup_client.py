@@ -17,6 +17,7 @@ from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
 from lmcache.v1.lookup_client.async_lookup_message import (
     LookupCleanupMsg,
+    LookupPVTSCMsg,
     LookupRequestMsg,
     LookupResponseMsg,
 )
@@ -33,6 +34,15 @@ from lmcache.v1.rpc_utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _sc_env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name, "1" if default else "0").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off", ""}:
+        return False
+    raise ValueError(f"{name} must be a boolean; got {raw!r}")
 
 
 # NOTE(Jiayi): Prefetch could load extra redundant cache if multiple
@@ -65,6 +75,10 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
         self._sc_lookup_start_mono: dict[str, float] = {}
         self._sc_lookup_poll_count: dict[str, int] = {}
         self.config = config
+        # PVTSC (post-vLLM-timeout synthetic completion) is deliberately tied
+        # only to the poll-based timeout path below. Generic request abortion
+        # continues to use the existing cancel_lookup() semantics.
+        self._sc_pvtsc_enabled = _sc_env_bool("SC_LMCACHE_PVTSC_ENABLE", False)
 
         self.ctx = get_zmq_context(use_asyncio=False)
         kv_connector_extra_config = metadata.kv_connector_extra_config or {}
@@ -176,6 +190,7 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
                 self._sc_scheduler_lookup_limit,
                 self._sc_scheduler_lookup_wait_ms,
             )
+        logger.info("SC PVTSC: enabled=%s", self._sc_pvtsc_enabled)
 
         # map from lookup_id (i.e., req_id) to req's status.
         # None indicates ongoing.
@@ -418,6 +433,8 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
                             self.world_size,
                         )
                     self.cancel_lookup(lookup_id)
+                    if self._sc_pvtsc_enabled:
+                        self._send_pvtsc_message(lookup_id, timeout_age=age)
                     self.first_lookup_time.pop(lookup_id, None)
                     return 0
 
@@ -612,6 +629,25 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
             self._send_cleanup_message(lookup_id)
             self.clear_lookup_status(lookup_id)
 
+    def _send_pvtsc_message(self, lookup_id: str, timeout_age: float) -> None:
+        """Ask every lookup worker to synthetically complete future disk work.
+
+        This is sent only after lookup_cache() has made the poll-based timeout
+        decision and is returning zero LMCache tokens to vLLM. It is not a
+        general request-cancellation primitive.
+        """
+        msg = LookupPVTSCMsg(lookup_id=lookup_id)
+        msg_buf = msgspec.msgpack.encode(msg)
+        for i in range(self.world_size):
+            self.push_sockets[i].send(msg_buf, copy=False)
+        if io_trace_enabled():
+            logger.warning(
+                "[SC_IO_PVTSC_SEND] lookup_id=%s workers=%d timeout_age=%.6f",
+                lookup_id,
+                self.world_size,
+                timeout_age,
+            )
+
     def _send_cleanup_message(self, lookup_id: str) -> None:
         """Send cleanup message to workers to release memory objects."""
         msg = LookupCleanupMsg(lookup_id=lookup_id)
@@ -705,11 +741,11 @@ class LMCacheAsyncLookupServer:
         while self.running:
             try:
                 msg_buf = self.pull_socket.recv(copy=False)
-                # rely on msgspec to automatically discriminate
-                # between LookupRequestMsg and LookupCleanupMsg
+                # rely on msgspec to automatically discriminate lookup,
+                # post-timeout soft-stop, and final cleanup messages.
                 msg = msgspec.msgpack.decode(
                     msg_buf,
-                    type=Union[LookupRequestMsg, LookupCleanupMsg],
+                    type=Union[LookupRequestMsg, LookupPVTSCMsg, LookupCleanupMsg],
                 )
 
                 if isinstance(msg, LookupRequestMsg):
@@ -721,6 +757,17 @@ class LMCacheAsyncLookupServer:
                         pin=True,
                         request_configs=msg.request_configs,
                     )
+
+                elif isinstance(msg, LookupPVTSCMsg):
+                    # PVTSC: the scheduler already returned 0 to vLLM for this
+                    # lookup. Ask the worker to suppress remaining disk work at
+                    # safe boundaries; normal completion/cleanup still owns the
+                    # final event and MemoryObj lifecycle.
+                    if io_trace_enabled():
+                        logger.warning(
+                            "[SC_IO_PVTSC_RECV] lookup_id=%s", msg.lookup_id
+                        )
+                    self.lmcache_engine.request_pvtsc(msg.lookup_id)
 
                 elif isinstance(msg, LookupCleanupMsg):
                     # Handle cleanup request - release memory objects for aborted lookup

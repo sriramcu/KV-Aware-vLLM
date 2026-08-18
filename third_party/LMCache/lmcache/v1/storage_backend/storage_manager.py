@@ -279,6 +279,12 @@ class AsyncSingleSerializer:
     The ratio knob is an integer CPU burst length: e.g. 4 means that while both
     tiers are continuously waiting, at most four CPU operations are selected
     before one disk operation is forced to make progress.
+
+    When SC_LMCACHE_PVTSC_ENABLE=1, LocalDiskBackend operations waiting for this
+    serializer can also be synthetically completed after the scheduler has
+    already timed the lookup out for vLLM. Active backend coroutines are never
+    cancelled here; LocalDiskBackend handles those cooperatively at file
+    boundaries so a synchronous read thread is never freed out from under I/O.
     """
 
     def __init__(self, loop: asyncio.AbstractEventLoop):
@@ -321,6 +327,21 @@ class AsyncSingleSerializer:
                 f"got {self._sc_fair_ratio}"
             )
 
+        raw_pvtsc = _sc_os.environ.get("SC_LMCACHE_PVTSC_ENABLE", "0").strip().lower()
+        if raw_pvtsc in {"1", "true", "yes", "on"}:
+            self._sc_pvtsc_enabled = True
+        elif raw_pvtsc in {"0", "false", "no", "off", ""}:
+            self._sc_pvtsc_enabled = False
+        else:
+            raise ValueError(
+                "SC_LMCACHE_PVTSC_ENABLE must be a boolean; "
+                f"got {raw_pvtsc!r}"
+            )
+        # Event-loop-local wakeups for disk operations waiting on the serializer.
+        # A separate threading.Event, owned by StorageManager, is passed to the
+        # disk worker for safe checks inside the synchronous file-read loop.
+        self._sc_pvtsc_wait_events: dict[str, asyncio.Event] = {}
+
         # Observability counters used by both paths.
         self._sc_io_waiters = 0
         self._sc_io_active_lookup_id: Optional[str] = None
@@ -331,6 +352,48 @@ class AsyncSingleSerializer:
             self._sc_fair_enabled,
             self._sc_fair_ratio,
         )
+        logger.info("SC serializer PVTSC: enabled=%s", self._sc_pvtsc_enabled)
+
+    def _sc_pvtsc_event(self, lookup_id: str) -> asyncio.Event:
+        event = self._sc_pvtsc_wait_events.get(lookup_id)
+        if event is None:
+            event = asyncio.Event()
+            self._sc_pvtsc_wait_events[lookup_id] = event
+        return event
+
+    async def request_pvtsc(self, lookup_id: str) -> bool:
+        """Wake queued disk work for one timed-out lookup without cancelling active I/O."""
+        if not self._sc_pvtsc_enabled:
+            return False
+        event = self._sc_pvtsc_event(lookup_id)
+        already_set = event.is_set()
+        event.set()
+        # Fair waiters sleep on a Condition, not directly on the Event.
+        if self._sc_fair_cond is not None:
+            async with self._sc_fair_cond:
+                self._sc_fair_cond.notify_all()
+        if io_trace_enabled():
+            logger.warning(
+                "[SC_IO_PVTSC_SERIALIZER_SIGNAL] lookup_id=%s already_set=%s "
+                "active_lookup_id=%s active_backend=%s",
+                lookup_id,
+                already_set,
+                self._sc_io_active_lookup_id,
+                self._sc_io_active_backend,
+            )
+        return True
+
+    def clear_pvtsc(self, lookup_id: str) -> None:
+        self._sc_pvtsc_wait_events.pop(lookup_id, None)
+
+    @staticmethod
+    def _sc_close_unstarted_coro(coro_fn: Coroutine[Any, Any, Any]) -> None:
+        # backend.batched_get_non_blocking(...) is created before serializer
+        # acquisition. If PVTSC wins while it is still unstarted, close the
+        # coroutine explicitly so Python does not emit an un-awaited warning.
+        close = getattr(coro_fn, "close", None)
+        if callable(close):
+            close()
 
     @staticmethod
     def _sc_fair_tier(backend_name: str) -> str:
@@ -361,6 +424,7 @@ class AsyncSingleSerializer:
         num_chunks: int,
         queued_at: float,
         trace_enabled: bool,
+        pvtsc_event: Optional[asyncio.Event],
     ) -> Any:
         if self._sc_fair_cond is None:
             self._sc_fair_cond = asyncio.Condition()
@@ -406,7 +470,14 @@ class AsyncSingleSerializer:
                 )
 
             try:
-                await cond.wait_for(lambda: self._sc_fair_can_acquire(tier))
+                await cond.wait_for(
+                    lambda: (
+                        tier == "disk"
+                        and pvtsc_event is not None
+                        and pvtsc_event.is_set()
+                    )
+                    or self._sc_fair_can_acquire(tier)
+                )
             except BaseException:
                 if registered:
                     if tier == "cpu":
@@ -438,6 +509,28 @@ class AsyncSingleSerializer:
                     )
                 cond.notify_all()
                 raise
+
+            if (
+                tier == "disk"
+                and pvtsc_event is not None
+                and pvtsc_event.is_set()
+            ):
+                self._sc_fair_disk_waiters -= 1
+                registered = False
+                if trace_enabled:
+                    self._sc_io_waiters -= 1
+                    logger.warning(
+                        "[SC_IO_PVTSC_SERIALIZER_SKIP] lookup_id=%s backend=%s "
+                        "phase=fair_wait waited=%.6f cpu_waiters=%d disk_waiters=%d",
+                        lookup_id,
+                        backend_name,
+                        _sc_time.monotonic() - queued_at,
+                        self._sc_fair_cpu_waiters,
+                        self._sc_fair_disk_waiters,
+                    )
+                self._sc_close_unstarted_coro(coro_fn)
+                cond.notify_all()
+                return []
 
             if tier == "cpu":
                 self._sc_fair_cpu_waiters -= 1
@@ -494,6 +587,24 @@ class AsyncSingleSerializer:
                 )
 
         try:
+            # A timeout can race with selection. Do one final safe check before
+            # starting the backend coroutine; once active, LocalDiskBackend owns
+            # cooperative file-boundary completion.
+            if (
+                tier == "disk"
+                and pvtsc_event is not None
+                and pvtsc_event.is_set()
+            ):
+                if trace_enabled:
+                    logger.warning(
+                        "[SC_IO_PVTSC_SERIALIZER_SKIP] lookup_id=%s backend=%s "
+                        "phase=post_acquire waited=%.6f",
+                        lookup_id,
+                        backend_name,
+                        _sc_time.monotonic() - queued_at,
+                    )
+                self._sc_close_unstarted_coro(coro_fn)
+                return []
             return await coro_fn
         finally:
             if acquired:
@@ -526,12 +637,185 @@ class AsyncSingleSerializer:
                     self._sc_fair_active = False
                     cond.notify_all()
 
+    async def _sc_run_vanilla_pvtsc(
+        self,
+        coro_fn: Coroutine[Any, Any, Any],
+        *,
+        lookup_id: str,
+        backend_name: str,
+        num_chunks: int,
+        queued_at: float,
+        trace_enabled: bool,
+        pvtsc_event: asyncio.Event,
+    ) -> Any:
+        assert self.lock is not None
+        acquired = False
+        waiter_counted = False
+
+        if trace_enabled:
+            self._sc_io_waiters += 1
+            waiter_counted = True
+            logger.warning(
+                "[SC_IO_SERIALIZER_ENQUEUE] lookup_id=%s backend=%s chunks=%d "
+                "waiters=%d active_lookup_id=%s active_backend=%s mono=%.6f",
+                lookup_id,
+                backend_name,
+                num_chunks,
+                self._sc_io_waiters,
+                self._sc_io_active_lookup_id,
+                self._sc_io_active_backend,
+                queued_at,
+            )
+
+        acquire_task = asyncio.create_task(self.lock.acquire())
+        abort_task = asyncio.create_task(pvtsc_event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {acquire_task, abort_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if acquire_task in done and acquire_task.result():
+                acquired = True
+            elif pvtsc_event.is_set():
+                acquire_task.cancel()
+                await asyncio.gather(acquire_task, return_exceptions=True)
+                if trace_enabled and waiter_counted:
+                    self._sc_io_waiters -= 1
+                    waiter_counted = False
+                    logger.warning(
+                        "[SC_IO_PVTSC_SERIALIZER_SKIP] lookup_id=%s backend=%s "
+                        "phase=vanilla_wait waited=%.6f waiters=%d",
+                        lookup_id,
+                        backend_name,
+                        _sc_time.monotonic() - queued_at,
+                        self._sc_io_waiters,
+                    )
+                self._sc_close_unstarted_coro(coro_fn)
+                return []
+            else:
+                # Defensive: FIRST_COMPLETED should be one of the two branches.
+                acquire_task.cancel()
+                await asyncio.gather(acquire_task, return_exceptions=True)
+                raise RuntimeError("serializer wait completed without lock or PVTSC")
+
+            abort_task.cancel()
+            await asyncio.gather(abort_task, return_exceptions=True)
+            acquired_at = _sc_time.monotonic()
+            if trace_enabled and waiter_counted:
+                self._sc_io_waiters -= 1
+                waiter_counted = False
+                previous_lookup_id = self._sc_io_active_lookup_id
+                previous_backend = self._sc_io_active_backend
+                self._sc_io_active_lookup_id = lookup_id
+                self._sc_io_active_backend = backend_name
+                logger.warning(
+                    "[SC_IO_SERIALIZER_ACQUIRE] lookup_id=%s backend=%s "
+                    "chunks=%d queue_wait=%.6f waiters=%d "
+                    "previous_lookup_id=%s previous_backend=%s",
+                    lookup_id,
+                    backend_name,
+                    num_chunks,
+                    acquired_at - queued_at,
+                    self._sc_io_waiters,
+                    previous_lookup_id,
+                    previous_backend,
+                )
+
+            if pvtsc_event.is_set():
+                if trace_enabled:
+                    logger.warning(
+                        "[SC_IO_PVTSC_SERIALIZER_SKIP] lookup_id=%s backend=%s "
+                        "phase=vanilla_post_acquire waited=%.6f",
+                        lookup_id,
+                        backend_name,
+                        acquired_at - queued_at,
+                    )
+                self._sc_close_unstarted_coro(coro_fn)
+                return []
+
+            return await coro_fn
+        finally:
+            if not abort_task.done():
+                abort_task.cancel()
+                await asyncio.gather(abort_task, return_exceptions=True)
+            if not acquire_task.done():
+                acquire_task.cancel()
+                await asyncio.gather(acquire_task, return_exceptions=True)
+
+            # If this outer task was cancelled at exactly the moment the lock
+            # acquisition completed, `acquired` may not have been assigned yet.
+            # Detect that race and release the lock rather than poisoning the
+            # serializer for all later requests.
+            orphan_lock_acquire = False
+            if not acquired and acquire_task.done() and not acquire_task.cancelled():
+                try:
+                    orphan_lock_acquire = bool(acquire_task.result())
+                except BaseException:
+                    orphan_lock_acquire = False
+
+            if acquired:
+                now = _sc_time.monotonic()
+                if trace_enabled:
+                    logger.warning(
+                        "[SC_IO_SERIALIZER_RELEASE] lookup_id=%s backend=%s "
+                        "chunks=%d held=%.6f total=%.6f waiters=%d",
+                        lookup_id,
+                        backend_name,
+                        num_chunks,
+                        now - acquired_at,
+                        now - queued_at,
+                        self._sc_io_waiters,
+                    )
+                    self._sc_io_active_lookup_id = None
+                    self._sc_io_active_backend = None
+                self.lock.release()
+            elif orphan_lock_acquire:
+                self.lock.release()
+                if trace_enabled:
+                    logger.warning(
+                        "[SC_IO_PVTSC_ORPHAN_LOCK_RELEASE] lookup_id=%s "
+                        "backend=%s waited=%.6f",
+                        lookup_id,
+                        backend_name,
+                        _sc_time.monotonic() - queued_at,
+                    )
+            if trace_enabled and waiter_counted:
+                self._sc_io_waiters -= 1
+                logger.warning(
+                    "[SC_IO_SERIALIZER_WAIT_ENDED_WITHOUT_ACQUIRE] "
+                    "lookup_id=%s backend=%s chunks=%d waited=%.6f waiters=%d",
+                    lookup_id,
+                    backend_name,
+                    num_chunks,
+                    _sc_time.monotonic() - queued_at,
+                    self._sc_io_waiters,
+                )
+
     async def run(self, coro_fn: Coroutine[Any, Any, Any], *args, **kwargs) -> Any:
         trace_enabled = io_trace_enabled()
         lookup_id = str(kwargs.get("_sc_io_lookup_id", "unknown"))
         backend_name = str(kwargs.get("_sc_io_backend_name", "unknown"))
         num_chunks = int(kwargs.get("_sc_io_num_chunks", args[0] if args else -1))
         queued_at = _sc_time.monotonic()
+
+        pvtsc_event: Optional[asyncio.Event] = None
+        if (
+            self._sc_pvtsc_enabled
+            and backend_name == "LocalDiskBackend"
+            and lookup_id != "unknown"
+        ):
+            pvtsc_event = self._sc_pvtsc_event(lookup_id)
+            if pvtsc_event.is_set():
+                if trace_enabled:
+                    logger.warning(
+                        "[SC_IO_PVTSC_SERIALIZER_SKIP] lookup_id=%s backend=%s "
+                        "phase=pre_enqueue waited=0.000000",
+                        lookup_id,
+                        backend_name,
+                    )
+                self._sc_close_unstarted_coro(coro_fn)
+                return []
 
         if self._sc_fair_enabled:
             return await self._sc_run_fair(
@@ -541,12 +825,25 @@ class AsyncSingleSerializer:
                 num_chunks=num_chunks,
                 queued_at=queued_at,
                 trace_enabled=trace_enabled,
+                pvtsc_event=pvtsc_event,
             )
 
-        # Vanilla path intentionally preserves the pre-fairness implementation.
-        # We lazily initialize the lock to place it on the calling event loop.
+        # Vanilla path intentionally preserves the pre-fairness implementation
+        # when PVTSC does not apply. PVTSC disk waits use an explicit lock-vs-
+        # abort race so a timed-out lookup can leave the queue immediately.
         if self.lock is None:
             self.lock = asyncio.Lock()
+        if pvtsc_event is not None:
+            return await self._sc_run_vanilla_pvtsc(
+                coro_fn,
+                lookup_id=lookup_id,
+                backend_name=backend_name,
+                num_chunks=num_chunks,
+                queued_at=queued_at,
+                trace_enabled=trace_enabled,
+                pvtsc_event=pvtsc_event,
+            )
+
         acquired = False
 
         if trace_enabled:
@@ -674,6 +971,21 @@ class StorageManager:
         )
         self.async_serializer: Optional[AsyncSerializer] = None
 
+        raw_pvtsc = _sc_os.environ.get("SC_LMCACHE_PVTSC_ENABLE", "0").strip().lower()
+        if raw_pvtsc in {"1", "true", "yes", "on"}:
+            self._sc_pvtsc_enabled = True
+        elif raw_pvtsc in {"0", "false", "no", "off", ""}:
+            self._sc_pvtsc_enabled = False
+        else:
+            raise ValueError(
+                "SC_LMCACHE_PVTSC_ENABLE must be a boolean; "
+                f"got {raw_pvtsc!r}"
+            )
+        # One thread-safe flag per lookup. The storage-manager event loop owns
+        # this dictionary; synchronous LocalDiskWorker threads only receive and
+        # read the Event object itself.
+        self._sc_pvtsc_disk_events: dict[str, threading.Event] = {}
+
         # Optional worker-side admission before any backend pins keys or
         # allocates staging buffers. This gate is independent from scheduler
         # admission and disk-put admission.
@@ -725,6 +1037,7 @@ class StorageManager:
             assert self.allocator_backend is not None
             self.async_serializer = AsyncSingleSerializer(self.loop)
 
+        logger.info("SC storage-manager PVTSC: enabled=%s", self._sc_pvtsc_enabled)
         self._setup_metrics()
 
     def _setup_metrics(self) -> None:
@@ -1072,6 +1385,70 @@ class StorageManager:
                 self._sc_worker_lookup_peak,
             )
 
+    def _sc_get_pvtsc_disk_event(self, lookup_id: str) -> threading.Event:
+        event = self._sc_pvtsc_disk_events.get(lookup_id)
+        if event is None:
+            event = threading.Event()
+            self._sc_pvtsc_disk_events[lookup_id] = event
+        return event
+
+    async def request_pvtsc(self, lookup_id: str) -> bool:
+        """Request synthetic completion of future disk work for one lookup.
+
+        This runs on the storage-manager event loop. It never cancels an active
+        backend coroutine or worker thread: queued serializer work is woken and
+        skipped, while LocalDiskBackend observes the threading.Event at safe
+        file boundaries.
+        """
+        if not self._sc_pvtsc_enabled:
+            return False
+
+        disk_event = self._sc_get_pvtsc_disk_event(lookup_id)
+        already_set = disk_event.is_set()
+        disk_event.set()
+
+        serializer_signalled = False
+        if isinstance(self.async_serializer, AsyncSingleSerializer):
+            serializer_signalled = await self.async_serializer.request_pvtsc(lookup_id)
+
+        if io_trace_enabled():
+            logger.warning(
+                "[SC_IO_PVTSC_STORAGE_REQUEST] pid=%d lookup_id=%s "
+                "already_set=%s serializer_signalled=%s event_status=%s",
+                _sc_os.getpid(),
+                lookup_id,
+                already_set,
+                serializer_signalled,
+                self.event_manager.get_event_status(EventType.LOADING, lookup_id),
+            )
+        return True
+
+    def _sc_clear_pvtsc(self, lookup_id: str, reason: str) -> None:
+        if not self._sc_pvtsc_enabled:
+            return
+        event = self._sc_pvtsc_disk_events.pop(lookup_id, None)
+        was_set = event.is_set() if event is not None else False
+        if isinstance(self.async_serializer, AsyncSingleSerializer):
+            self.async_serializer.clear_pvtsc(lookup_id)
+        if io_trace_enabled():
+            logger.warning(
+                "[SC_IO_PVTSC_CLEAR] pid=%d lookup_id=%s reason=%s "
+                "had_event=%s was_set=%s",
+                _sc_os.getpid(),
+                lookup_id,
+                reason,
+                event is not None,
+                was_set,
+            )
+
+    def clear_pvtsc_state(self, lookup_id: str, reason: str) -> None:
+        """Clear per-lookup PVTSC flags after the lookup lifecycle is finished.
+
+        Call this on the storage-manager event loop. It is deliberately only
+        state cleanup; it does not release disk lookup pins or MemoryObjs.
+        """
+        self._sc_clear_pvtsc(lookup_id, reason)
+
     def prefetch_single_done_callback(
         self,
         future: asyncio.Future,
@@ -1323,6 +1700,12 @@ class StorageManager:
                 sc_io_lookup_started,
             )
 
+        pvtsc_disk_event = (
+            self._sc_get_pvtsc_disk_event(lookup_id)
+            if self._sc_pvtsc_enabled
+            else None
+        )
+
         num_total_chunks = len(keys) // keys_per_chunk
         num_total_hit_chunks = 0
         # cum_chunk_lengths_total: A copy of the original cumulative chunk lengths
@@ -1340,6 +1723,24 @@ class StorageManager:
         for backend_name, backend in self.get_active_storage_backends(
             search_range=search_range
         ):
+            # If the scheduler's poll timeout raced ahead of this worker's
+            # storage-loop execution, do not even begin a new disk lookup. CPU
+            # and any non-disk tiers retain their existing behavior.
+            if (
+                backend_name == "LocalDiskBackend"
+                and pvtsc_disk_event is not None
+                and pvtsc_disk_event.is_set()
+            ):
+                if io_trace_enabled():
+                    logger.warning(
+                        "[SC_IO_PVTSC_DISK_SKIP] pid=%d lookup_id=%s "
+                        "phase=before_contains remaining_keys=%d",
+                        _sc_os.getpid(),
+                        lookup_id,
+                        len(keys),
+                    )
+                continue
+
             contains_started = _sc_time.monotonic()
             num_hit_keys_raw = await backend.batched_async_contains(
                 lookup_id, keys, pin
@@ -1399,11 +1800,20 @@ class StorageManager:
                     pin,
                 )
 
+            transfer_spec: dict[str, Any] = {
+                "cum_chunk_lengths": cum_chunk_lengths[: num_hit_chunks + 1]
+            }
+            if (
+                backend_name == "LocalDiskBackend"
+                and pvtsc_disk_event is not None
+            ):
+                transfer_spec["_sc_pvtsc_event"] = pvtsc_disk_event
+
             get_coro = self.async_serializer.run(
                 backend.batched_get_non_blocking(
                     lookup_id,
                     backend_keys,
-                    {"cum_chunk_lengths": cum_chunk_lengths[: num_hit_chunks + 1]},
+                    transfer_spec,
                 ),
                 num_hit_chunks,
                 _sc_io_lookup_id=lookup_id,
@@ -1441,6 +1851,7 @@ class StorageManager:
                 )
             if self.async_lookup_server is not None:
                 self.async_lookup_server.send_response_to_scheduler(lookup_id, 0)
+            self._sc_clear_pvtsc(lookup_id, reason="no_hit")
             return
 
         # gather_with_keys() here make a pair of (key, memory_obj) for each chunk
@@ -1486,6 +1897,14 @@ class StorageManager:
                 cum_chunk_lengths_total,
                 tier_expected_chunks,
                 keys_per_chunk=keys_per_chunk,
+            )
+        )
+        # Keep the PVTSC flags alive until every backend task has actually
+        # finished. This is essential for an active LocalDiskWorker thread: the
+        # flag must remain valid until it reaches a safe file boundary.
+        all_done.add_done_callback(
+            lambda _future: self._sc_clear_pvtsc(
+                lookup_id, reason="all_prefetch_tasks_done"
             )
         )
 

@@ -1064,6 +1064,60 @@ class LocalDiskBackend(StorageBackendInterface):
 
         return memory_obj
 
+    def _sc_pvtsc_cleanup_staged(
+        self,
+        *,
+        lookup_id: str,
+        keys: list[CacheEngineKey],
+        memory_objs: list[MemoryObj],
+        completed_files: int,
+        reason: str,
+    ) -> None:
+        """Release private disk-read staging state after synthetic completion.
+
+        `completed_files` is the number of staged keys whose extra physical-read
+        disk pin has already been released by the normal read loop. The original
+        lookup-level pins from batched_async_contains(pin=True) are deliberately
+        untouched; they remain owned by the existing lookup lifecycle.
+        """
+        staged_count = len(memory_objs)
+        completed_files = max(0, min(completed_files, staged_count))
+        extra_pins_released = 0
+        with self.disk_lock:
+            for key in keys[completed_files:staged_count]:
+                meta = self.dict.get(key)
+                if meta is None:
+                    logger.warning(
+                        "PVTSC could not release physical-read pin: key disappeared "
+                        "lookup_id=%s key=%s",
+                        lookup_id,
+                        key,
+                    )
+                    continue
+                meta.unpin()
+                extra_pins_released += 1
+
+        released_mem_objs = 0
+        for memory_obj in memory_objs:
+            if memory_obj.is_pinned:
+                memory_obj.unpin()
+            memory_obj.ref_count_down()
+            released_mem_objs += 1
+
+        if io_trace_enabled():
+            logger.warning(
+                "[SC_IO_PVTSC_DISK_CLEANUP] pid=%d lookup_id=%s reason=%s "
+                "staged=%d completed_files=%d extra_disk_pins_released=%d "
+                "memory_objs_released=%d",
+                os.getpid(),
+                lookup_id,
+                reason,
+                staged_count,
+                completed_files,
+                extra_pins_released,
+                released_mem_objs,
+            )
+
     async def batched_get_non_blocking(
         self,
         lookup_id: str,
@@ -1074,6 +1128,22 @@ class LocalDiskBackend(StorageBackendInterface):
         paths: list[str] = []
         started = time.monotonic()
         trace_enabled = load_trace_enabled()
+        pvtsc_event = (
+            transfer_spec.get("_sc_pvtsc_event")
+            if isinstance(transfer_spec, dict)
+            else None
+        )
+
+        if pvtsc_event is not None and pvtsc_event.is_set():
+            if io_trace_enabled():
+                logger.warning(
+                    "[SC_IO_PVTSC_DISK_ABORT] pid=%d lookup_id=%s "
+                    "phase=before_staging completed_files=0 skipped_files=%d",
+                    os.getpid(),
+                    lookup_id,
+                    len(keys),
+                )
+            return []
 
         if trace_enabled:
             logger.warning(
@@ -1092,6 +1162,27 @@ class LocalDiskBackend(StorageBackendInterface):
         )
 
         for key_index, key in enumerate(keys):
+            # The timeout can arrive while staging a multi-file batch. Abort at
+            # the next allocation boundary before taking any more disk pins.
+            if pvtsc_event is not None and pvtsc_event.is_set():
+                self._sc_pvtsc_cleanup_staged(
+                    lookup_id=lookup_id,
+                    keys=keys,
+                    memory_objs=mem_objs,
+                    completed_files=0,
+                    reason="during_staging",
+                )
+                if io_trace_enabled():
+                    logger.warning(
+                        "[SC_IO_PVTSC_DISK_ABORT] pid=%d lookup_id=%s "
+                        "phase=during_staging staged=%d skipped_files=%d",
+                        os.getpid(),
+                        lookup_id,
+                        len(mem_objs),
+                        len(keys) - len(mem_objs),
+                    )
+                return []
+
             # Use a context manager so every exit path releases disk_lock.
             # The previous code returned on allocation failure while still
             # holding this lock, freezing subsequent disk operations.
@@ -1135,6 +1226,18 @@ class LocalDiskBackend(StorageBackendInterface):
                     )
 
                 if memory_obj is None:
+                    if pvtsc_event is not None and pvtsc_event.is_set():
+                        # No new MemoryObj/pin was created for this key. Unwind
+                        # only the already staged prefix and report an empty disk
+                        # result, preserving PVTSC's all-or-nothing tier semantics.
+                        self._sc_pvtsc_cleanup_staged(
+                            lookup_id=lookup_id,
+                            keys=keys,
+                            memory_objs=mem_objs,
+                            completed_files=0,
+                            reason="allocation_failure_after_pvtsc",
+                        )
+                        return []
                     if trace_enabled:
                         logger.error(
                             "[SC_LOAD_DISK_STAGE_FAIL] "
@@ -1177,6 +1280,24 @@ class LocalDiskBackend(StorageBackendInterface):
                 time.monotonic() - started,
             )
 
+        if pvtsc_event is not None and pvtsc_event.is_set():
+            self._sc_pvtsc_cleanup_staged(
+                lookup_id=lookup_id,
+                keys=keys,
+                memory_objs=mem_objs,
+                completed_files=0,
+                reason="after_staging_before_submit",
+            )
+            if io_trace_enabled():
+                logger.warning(
+                    "[SC_IO_PVTSC_DISK_ABORT] pid=%d lookup_id=%s "
+                    "phase=after_staging completed_files=0 skipped_files=%d",
+                    os.getpid(),
+                    lookup_id,
+                    len(mem_objs),
+                )
+            return []
+
         try:
             results = await self.disk_worker.submit_task(
                 "prefetch",
@@ -1185,6 +1306,7 @@ class LocalDiskBackend(StorageBackendInterface):
                 keys=keys,
                 memory_objs=mem_objs,
                 lookup_id=lookup_id,
+                pvtsc_event=pvtsc_event,
                 _sc_io_id=lookup_id,
             )
         except Exception:
@@ -1201,6 +1323,32 @@ class LocalDiskBackend(StorageBackendInterface):
                     threading.current_thread().name,
                 )
             raise
+
+        if (
+            pvtsc_event is not None
+            and pvtsc_event.is_set()
+            and len(results) > 0
+        ):
+            # The worker may have completed the final file just as the timeout
+            # signal arrived. Convert the result to an empty disk contribution
+            # before it becomes EventManager-owned. All physical-read pins have
+            # already been released by the normal loop in this branch.
+            self._sc_pvtsc_cleanup_staged(
+                lookup_id=lookup_id,
+                keys=keys,
+                memory_objs=mem_objs,
+                completed_files=len(mem_objs),
+                reason="post_worker_race",
+            )
+            results = []
+            if io_trace_enabled():
+                logger.warning(
+                    "[SC_IO_PVTSC_DISK_ABORT] pid=%d lookup_id=%s "
+                    "phase=post_worker_race completed_files=%d skipped_files=0",
+                    os.getpid(),
+                    lookup_id,
+                    len(mem_objs),
+                )
 
         if trace_enabled:
             logger.warning(
@@ -1299,6 +1447,7 @@ class LocalDiskBackend(StorageBackendInterface):
         memory_objs: list[MemoryObj],
         write_back: bool = False,
         lookup_id: str = "unknown",
+        pvtsc_event: Optional[threading.Event] = None,
     ) -> list[MemoryObj]:
         """
         Async load bytearray from disk.
@@ -1321,6 +1470,25 @@ class LocalDiskBackend(StorageBackendInterface):
         for file_index, (path, key, mem_obj) in enumerate(
             zip(paths, keys, memory_objs, strict=False)
         ):
+            if pvtsc_event is not None and pvtsc_event.is_set():
+                self._sc_pvtsc_cleanup_staged(
+                    lookup_id=lookup_id,
+                    keys=keys,
+                    memory_objs=memory_objs,
+                    completed_files=file_index,
+                    reason="worker_before_file",
+                )
+                if io_trace_enabled():
+                    logger.warning(
+                        "[SC_IO_PVTSC_DISK_ABORT] pid=%d lookup_id=%s "
+                        "phase=before_file completed_files=%d skipped_files=%d",
+                        os.getpid(),
+                        lookup_id,
+                        file_index,
+                        len(paths) - file_index,
+                    )
+                return []
+
             buffer = mem_obj.byte_array
             self.read_file(
                 key,
@@ -1339,6 +1507,29 @@ class LocalDiskBackend(StorageBackendInterface):
             self.disk_lock.acquire()
             self.dict[key].unpin()
             self.disk_lock.release()
+
+            # A timeout that arrives during the blocking read cannot preempt
+            # that one readinto(). Once it returns, discard the whole disk tier
+            # and stop before the next file.
+            if pvtsc_event is not None and pvtsc_event.is_set():
+                completed_files = file_index + 1
+                self._sc_pvtsc_cleanup_staged(
+                    lookup_id=lookup_id,
+                    keys=keys,
+                    memory_objs=memory_objs,
+                    completed_files=completed_files,
+                    reason="worker_after_file",
+                )
+                if io_trace_enabled():
+                    logger.warning(
+                        "[SC_IO_PVTSC_DISK_ABORT] pid=%d lookup_id=%s "
+                        "phase=after_file completed_files=%d skipped_files=%d",
+                        os.getpid(),
+                        lookup_id,
+                        completed_files,
+                        len(paths) - completed_files,
+                    )
+                return []
 
         if io_trace_enabled():
             logger.warning(

@@ -66,6 +66,12 @@ _sc_default SC_LMCACHE_DISK_PUT_MAX_PENDING 8
 _sc_default SC_LMCACHE_SERIALIZER_FAIRNESS_ENABLE 0
 _sc_default SC_LMCACHE_SERIALIZER_CPU_BURST_RATIO 4
 
+# Post-vLLM-timeout synthetic completion (PVTSC). Once the scheduler's
+# poll-based lookup timeout returns 0 LMCache tokens to vLLM, queued disk work
+# for that lookup is skipped and active disk batches yield after the current
+# file read. The current blocking file read itself is not interrupted.
+_sc_default SC_LMCACHE_PVTSC_ENABLE 0
+
 # Round-5 experimental controls and their independent residency trace.
 # Functional controls remain disabled unless a grid cell explicitly enables them.
 _sc_default SC_LMCACHE_DISK_RESIDENT_PUT_DEDUP_ENABLE 0
@@ -107,6 +113,7 @@ for _sc_name in \
   SC_LMCACHE_WORKER_LOOKUP_ADMISSION_ENABLE \
   SC_LMCACHE_DISK_PUT_ADMISSION_ENABLE \
   SC_LMCACHE_SERIALIZER_FAIRNESS_ENABLE \
+  SC_LMCACHE_PVTSC_ENABLE \
   SC_LMCACHE_DISK_RESIDENT_PUT_DEDUP_ENABLE \
   SC_LMCACHE_COLD_WARM_PUT_BARRIER_ENABLE \
   SC_LMCACHE_DISK_PUT_RESIDENCY_TRACE_ENABLE \
@@ -144,6 +151,7 @@ sc_lmcache_print_knobs() {
     SC_LMCACHE_DISK_PUT_MAX_PENDING \
     SC_LMCACHE_SERIALIZER_FAIRNESS_ENABLE \
     SC_LMCACHE_SERIALIZER_CPU_BURST_RATIO \
+    SC_LMCACHE_PVTSC_ENABLE \
     SC_LMCACHE_DISK_RESIDENT_PUT_DEDUP_ENABLE \
     SC_LMCACHE_DISK_PUT_RESIDENCY_TRACE_ENABLE \
     SC_LMCACHE_COLD_WARM_PUT_BARRIER_ENABLE \
