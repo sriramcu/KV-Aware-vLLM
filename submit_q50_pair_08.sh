@@ -1,0 +1,2 @@
+sbatch --job-name=q50_h_wog_nfs_van --export=ALL,MATRIX_MODE=wo_gnn,DATASET_NAME=hotpotqa,MATRIX_DISK=1,MATRIX_STORAGE=nfs,MATRIX_ALL_KNOBS=0,MATRIX_MAX_INFLIGHT=12 /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM/local_repro/sbatch/18_h100_q50_matrix.sbatch
+sbatch --job-name=q50_h_gnn_nfs_van --export=ALL,MATRIX_MODE=with_gnn,DATASET_NAME=hotpotqa,MATRIX_DISK=1,MATRIX_STORAGE=nfs,MATRIX_ALL_KNOBS=0,MATRIX_MAX_INFLIGHT=12 /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM/local_repro/sbatch/18_h100_q50_matrix.sbatch

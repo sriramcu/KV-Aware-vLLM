@@ -1,0 +1,2 @@
+sbatch --job-name=q50_m_wog_cpu_van --export=ALL,MATRIX_MODE=wo_gnn,DATASET_NAME=medical,MATRIX_DISK=0,MATRIX_STORAGE=none,MATRIX_ALL_KNOBS=0,MATRIX_MAX_INFLIGHT=12 /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM/local_repro/sbatch/18_h100_q50_matrix.sbatch
+sbatch --job-name=q50_m_gnn_cpu_van --export=ALL,MATRIX_MODE=with_gnn,DATASET_NAME=medical,MATRIX_DISK=0,MATRIX_STORAGE=none,MATRIX_ALL_KNOBS=0,MATRIX_MAX_INFLIGHT=12 /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM/local_repro/sbatch/18_h100_q50_matrix.sbatch
