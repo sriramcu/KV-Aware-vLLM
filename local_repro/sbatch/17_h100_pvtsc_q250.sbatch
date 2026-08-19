@@ -16,11 +16,18 @@ export PYTHONPATH="$REPO:${PYTHONPATH:-}"
 export PYTHONFAULTHANDLER=1
 
 # Frozen Q250 / shared-NFS configuration used for the Round-6 R16 boundary run.
-# PVTSC is ON by default here, but the same script is also the OFF control:
-#   sbatch --export=ALL,SC_LMCACHE_PVTSC_ENABLE=0 \
-#     "$REPO/local_repro/sbatch/17_h100_pvtsc_q250.sbatch"
+# PVTSC and within-file cooperative cancellation are ON by default here.
+# Controls:
+#   whole-file PVTSC (single 80-MiB readinto):
+#     sbatch --export=ALL,SC_LMCACHE_PVTSC_WITHIN_FILE_ENABLE=0 \
+#       "$REPO/local_repro/sbatch/17_h100_pvtsc_q250.sbatch"
+#   PVTSC-off read control (other frozen Q250 controls remain enabled):
+#     sbatch --export=ALL,SC_LMCACHE_PVTSC_ENABLE=0,SC_LMCACHE_PVTSC_WITHIN_FILE_ENABLE=0 \
+#       "$REPO/local_repro/sbatch/17_h100_pvtsc_q250.sbatch"
 export SC_LMCACHE_PROFILE=custom
 export SC_LMCACHE_PVTSC_ENABLE="${SC_LMCACHE_PVTSC_ENABLE:-1}"
+export SC_LMCACHE_PVTSC_WITHIN_FILE_ENABLE="${SC_LMCACHE_PVTSC_WITHIN_FILE_ENABLE:-1}"
+export SC_LMCACHE_PVTSC_READ_CHUNK_MIB="${SC_LMCACHE_PVTSC_READ_CHUNK_MIB:-4}"
 
 export SC_LMCACHE_SCHEDULER_LOOKUP_ADMISSION_ENABLE=1
 export SC_LMCACHE_SCHEDULER_LOOKUP_MAX_INFLIGHT="${SC_LMCACHE_SCHEDULER_LOOKUP_MAX_INFLIGHT:-12}"
@@ -63,6 +70,8 @@ source "$REPO/local_repro/sc_lmcache_knobs.sh"
 printf '%s\n' \
   "=== PVTSC Q250 RUN ===" \
   "SC_LMCACHE_PVTSC_ENABLE=$SC_LMCACHE_PVTSC_ENABLE" \
+  "SC_LMCACHE_PVTSC_WITHIN_FILE_ENABLE=$SC_LMCACHE_PVTSC_WITHIN_FILE_ENABLE" \
+  "SC_LMCACHE_PVTSC_READ_CHUNK_MIB=$SC_LMCACHE_PVTSC_READ_CHUNK_MIB" \
   "MAX_QUESTIONS=$MAX_QUESTIONS" \
   "SUBMISSION_BATCH_SIZE=$SUBMISSION_BATCH_SIZE" \
   "VLLM_MAX_NUM_SEQS=$VLLM_MAX_NUM_SEQS" \

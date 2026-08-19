@@ -568,6 +568,26 @@ class LocalDiskBackend(StorageBackendInterface):
             self.use_odirect = config.extra_config.get("use_odirect", False)
         logger.info("Using O_DIRECT for disk I/O: %s", self.use_odirect)
 
+        # Optional within-file PVTSC for buffered disk reads. Disabled by
+        # default so vanilla LMCache keeps one blocking readinto() per file.
+        # When enabled, a PVTSC-aware active read is split into bounded
+        # subreads and checks the existing per-lookup threading.Event between
+        # subreads. We deliberately leave O_DIRECT on the original whole-file
+        # path until alignment of sliced buffers is validated independently.
+        self._sc_pvtsc_within_file_enabled = _sc_env_flag(
+            "SC_LMCACHE_PVTSC_WITHIN_FILE_ENABLE", False
+        )
+        self._sc_pvtsc_read_chunk_mib = env_int(
+            "SC_LMCACHE_PVTSC_READ_CHUNK_MIB", 4, minimum=1
+        )
+        self._sc_pvtsc_read_chunk_bytes = self._sc_pvtsc_read_chunk_mib * 1024**2
+        logger.info(
+            "SC within-file PVTSC: enabled=%s chunk_mib=%d buffered_only=%s",
+            self._sc_pvtsc_within_file_enabled,
+            self._sc_pvtsc_read_chunk_mib,
+            True,
+        )
+
         self.disk_worker = LocalDiskWorker(loop)
 
         self._sc_resident_put_dedup_enabled = _sc_env_flag(
@@ -1490,14 +1510,41 @@ class LocalDiskBackend(StorageBackendInterface):
                 return []
 
             buffer = mem_obj.byte_array
-            self.read_file(
+            file_completed = self.read_file(
                 key,
                 buffer,
                 path,
                 lookup_id=lookup_id,
                 file_index=file_index,
                 total_files=len(paths),
+                pvtsc_event=pvtsc_event,
             )
+
+            # A within-file PVTSC abort leaves the current MemoryObj only
+            # partially populated. It is therefore invalid for this lookup and
+            # must never reach metadata recovery or EventManager ownership. The
+            # current file's extra physical-read disk pin has NOT yet been
+            # released by the normal loop, so completed_files is file_index,
+            # not file_index + 1.
+            if not file_completed:
+                self._sc_pvtsc_cleanup_staged(
+                    lookup_id=lookup_id,
+                    keys=keys,
+                    memory_objs=memory_objs,
+                    completed_files=file_index,
+                    reason="worker_within_file",
+                )
+                if io_trace_enabled():
+                    logger.warning(
+                        "[SC_IO_PVTSC_DISK_ABORT] pid=%d lookup_id=%s "
+                        "phase=within_file completed_files=%d partial_files=1 "
+                        "skipped_files=%d",
+                        os.getpid(),
+                        lookup_id,
+                        file_index,
+                        max(len(paths) - file_index - 1, 0),
+                    )
+                return []
 
             # TODO(Jiayi): Please recover the metadata in a more
             # elegant way in the future.
@@ -1618,6 +1665,52 @@ class LocalDiskBackend(StorageBackendInterface):
                 path,
             )
 
+    def _sc_chunked_readinto_with_pvtsc(
+        self,
+        handle,
+        buffer,
+        pvtsc_event: threading.Event,
+    ) -> tuple[int, int, bool]:
+        """Read a buffered file cooperatively, yielding to PVTSC between subreads.
+
+        Returns ``(bytes_read, subreads, aborted_partial)``. The event is checked
+        before each subread and after each completed subread while bytes remain.
+        An in-progress Python/OS read call is never force-cancelled.
+        """
+        view = memoryview(buffer)
+        bytes_read = 0
+        subreads = 0
+        aborted_partial = False
+        try:
+            while bytes_read < len(view):
+                if pvtsc_event.is_set():
+                    aborted_partial = True
+                    break
+
+                end = min(
+                    bytes_read + self._sc_pvtsc_read_chunk_bytes,
+                    len(view),
+                )
+                nread = handle.readinto(view[bytes_read:end])
+                subreads += 1
+                if nread is None:
+                    nread = 0
+                if nread < 0:
+                    raise RuntimeError(f"readinto returned negative byte count {nread}")
+                bytes_read += nread
+
+                # Preserve normal EOF/short-file behavior. PVTSC is only an
+                # abort when the event is set while unread bytes remain.
+                if nread == 0:
+                    break
+                if bytes_read < len(view) and pvtsc_event.is_set():
+                    aborted_partial = True
+                    break
+        finally:
+            view.release()
+
+        return bytes_read, subreads, aborted_partial
+
     def read_file(
         self,
         key,
@@ -1626,7 +1719,18 @@ class LocalDiskBackend(StorageBackendInterface):
         lookup_id: str = "unknown",
         file_index: int = -1,
         total_files: int = -1,
-    ):
+        pvtsc_event: Optional[threading.Event] = None,
+    ) -> bool:
+        """Read one disk-cache file into ``buffer``.
+
+        Returns ``False`` only when an enabled within-file PVTSC cooperatively
+        abandons a partially/unread buffered file. All other legacy outcomes
+        return ``True`` so existing non-PVTSC callers retain their behavior.
+
+        With ``SC_LMCACHE_PVTSC_WITHIN_FILE_ENABLE=0`` (the default), this is
+        the original single ``readinto(buffer)`` path. O_DIRECT also remains on
+        the original whole-file path even when the knob is enabled.
+        """
         total_started = time.monotonic()
         size = len(buffer)
         fblock_aligned = size % self.os_disk_bs == 0
@@ -1640,7 +1744,37 @@ class LocalDiskBackend(StorageBackendInterface):
         open_elapsed = 0.0
         read_elapsed = 0.0
         bytes_read = 0
+        subreads = 0
+        pvtsc_partial_abort = False
         effective_odirect = fblock_aligned and self.use_odirect
+        within_file_pvtsc = (
+            self._sc_pvtsc_within_file_enabled
+            and pvtsc_event is not None
+            and not effective_odirect
+        )
+
+        # Close the small race between the batch's before-file check and open().
+        # No bytes have been written, and the caller still owns the current
+        # file's extra physical-read pin, so it performs the standard staged
+        # cleanup with completed_files=file_index.
+        if within_file_pvtsc and pvtsc_event.is_set():
+            if io_trace_enabled():
+                logger.warning(
+                    "[SC_IO_PVTSC_FILE_ABORT] pid=%d lookup_id=%s "
+                    "file_index=%d/%d key_hash=%s bytes_expected=%d "
+                    "bytes_read=0 bytes_remaining=%d subreads=0 "
+                    "chunk_bytes=%d phase=before_open path=%s",
+                    os.getpid(),
+                    lookup_id,
+                    file_index,
+                    total_files,
+                    getattr(key, "chunk_hash", "unknown"),
+                    size,
+                    size,
+                    self._sc_pvtsc_read_chunk_bytes,
+                    path,
+                )
+            return False
 
         try:
             if not effective_odirect:
@@ -1648,7 +1782,16 @@ class LocalDiskBackend(StorageBackendInterface):
                 with open(path, "rb") as f:
                     open_elapsed = time.monotonic() - open_started
                     read_started = time.monotonic()
-                    bytes_read = f.readinto(buffer)
+                    if within_file_pvtsc:
+                        bytes_read, subreads, pvtsc_partial_abort = (
+                            self._sc_chunked_readinto_with_pvtsc(
+                                f, buffer, pvtsc_event
+                            )
+                        )
+                    else:
+                        # Exact vanilla behavior: one whole-file readinto().
+                        bytes_read = f.readinto(buffer)
+                        subreads = 1
                     read_elapsed = time.monotonic() - read_started
             else:
                 open_started = time.monotonic()
@@ -1656,7 +1799,11 @@ class LocalDiskBackend(StorageBackendInterface):
                 open_elapsed = time.monotonic() - open_started
                 with os.fdopen(fd, "rb", buffering=0) as fdo:
                     read_started = time.monotonic()
+                    # Intentionally preserve whole-file O_DIRECT. Sliced direct
+                    # buffers have alignment requirements that are not yet
+                    # validated by this experiment.
                     bytes_read = fdo.readinto(buffer)
+                    subreads = 1
                     read_elapsed = time.monotonic() - read_started
         except FileNotFoundError:
             logger.warning(f"File not found on disk: {path}")
@@ -1674,20 +1821,21 @@ class LocalDiskBackend(StorageBackendInterface):
                     time.monotonic() - total_started,
                     path,
                 )
-            return
+            return True
 
         total_elapsed = time.monotonic() - total_started
         io_after = _sc_io_proc_snapshot()
         logger.debug(
             f"Disk read size: {size} bytes, "
-            f"Bandwidth: {size / max(total_elapsed, 1e-9) / 1e6:.2f} MB/s"
+            f"Bandwidth: {bytes_read / max(total_elapsed, 1e-9) / 1e6:.2f} MB/s"
         )
         if io_trace_enabled():
             logger.warning(
                 "[SC_IO_FILE_READ] pid=%d lookup_id=%s file_index=%d/%d "
                 "key_hash=%s bytes_expected=%d bytes_read=%d "
                 "open=%.6f read=%.6f total=%.6f bandwidth_MBps=%.3f "
-                "odirect=%s proc_io_delta=%s thread=%s path=%s",
+                "odirect=%s proc_io_delta=%s thread=%s path=%s "
+                "within_file_pvtsc=%s subreads=%d complete=%s",
                 os.getpid(),
                 lookup_id,
                 file_index,
@@ -1703,7 +1851,34 @@ class LocalDiskBackend(StorageBackendInterface):
                 _sc_io_delta(io_before, io_after),
                 threading.current_thread().name,
                 path,
+                within_file_pvtsc,
+                subreads,
+                not pvtsc_partial_abort,
             )
+
+        if pvtsc_partial_abort:
+            if io_trace_enabled():
+                logger.warning(
+                    "[SC_IO_PVTSC_FILE_ABORT] pid=%d lookup_id=%s "
+                    "file_index=%d/%d key_hash=%s bytes_expected=%d "
+                    "bytes_read=%d bytes_remaining=%d subreads=%d "
+                    "chunk_bytes=%d elapsed=%.6f phase=between_subreads path=%s",
+                    os.getpid(),
+                    lookup_id,
+                    file_index,
+                    total_files,
+                    getattr(key, "chunk_hash", "unknown"),
+                    size,
+                    bytes_read,
+                    max(size - bytes_read, 0),
+                    subreads,
+                    self._sc_pvtsc_read_chunk_bytes,
+                    total_elapsed,
+                    path,
+                )
+            return False
+
+        return True
 
     def get_allocator_backend(self) -> LocalCPUBackend:
         return self.local_cpu_backend

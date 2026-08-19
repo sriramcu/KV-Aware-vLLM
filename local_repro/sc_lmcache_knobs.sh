@@ -68,9 +68,14 @@ _sc_default SC_LMCACHE_SERIALIZER_CPU_BURST_RATIO 4
 
 # Post-vLLM-timeout synthetic completion (PVTSC). Once the scheduler's
 # poll-based lookup timeout returns 0 LMCache tokens to vLLM, queued disk work
-# for that lookup is skipped and active disk batches yield after the current
-# file read. The current blocking file read itself is not interrupted.
+# for that lookup is skipped. Base PVTSC yields active disk batches after the
+# current file. Optional within-file PVTSC makes buffered reads cooperative by
+# splitting an active file into bounded subreads and checking the same PVTSC
+# event between them. Both controls default off so vanilla LMCache preserves
+# one whole-file readinto() per file.
 _sc_default SC_LMCACHE_PVTSC_ENABLE 0
+_sc_default SC_LMCACHE_PVTSC_WITHIN_FILE_ENABLE 0
+_sc_default SC_LMCACHE_PVTSC_READ_CHUNK_MIB 4
 
 # Round-5 experimental controls and their independent residency trace.
 # Functional controls remain disabled unless a grid cell explicitly enables them.
@@ -114,6 +119,7 @@ for _sc_name in \
   SC_LMCACHE_DISK_PUT_ADMISSION_ENABLE \
   SC_LMCACHE_SERIALIZER_FAIRNESS_ENABLE \
   SC_LMCACHE_PVTSC_ENABLE \
+  SC_LMCACHE_PVTSC_WITHIN_FILE_ENABLE \
   SC_LMCACHE_DISK_RESIDENT_PUT_DEDUP_ENABLE \
   SC_LMCACHE_COLD_WARM_PUT_BARRIER_ENABLE \
   SC_LMCACHE_DISK_PUT_RESIDENCY_TRACE_ENABLE \
@@ -138,6 +144,11 @@ if ! [[ "$SC_LMCACHE_SERIALIZER_CPU_BURST_RATIO" =~ ^[1-9][0-9]*$ ]]; then
   return 2 2>/dev/null || exit 2
 fi
 
+if ! [[ "$SC_LMCACHE_PVTSC_READ_CHUNK_MIB" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Invalid SC_LMCACHE_PVTSC_READ_CHUNK_MIB=$SC_LMCACHE_PVTSC_READ_CHUNK_MIB; expected integer >= 1" >&2
+  return 2 2>/dev/null || exit 2
+fi
+
 sc_lmcache_print_knobs() {
   local name
   echo "SC_LMCACHE_PROFILE=$SC_LMCACHE_PROFILE"
@@ -152,6 +163,8 @@ sc_lmcache_print_knobs() {
     SC_LMCACHE_SERIALIZER_FAIRNESS_ENABLE \
     SC_LMCACHE_SERIALIZER_CPU_BURST_RATIO \
     SC_LMCACHE_PVTSC_ENABLE \
+    SC_LMCACHE_PVTSC_WITHIN_FILE_ENABLE \
+    SC_LMCACHE_PVTSC_READ_CHUNK_MIB \
     SC_LMCACHE_DISK_RESIDENT_PUT_DEDUP_ENABLE \
     SC_LMCACHE_DISK_PUT_RESIDENCY_TRACE_ENABLE \
     SC_LMCACHE_COLD_WARM_PUT_BARRIER_ENABLE \

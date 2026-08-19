@@ -2,9 +2,11 @@
 # Standard
 from unittest.mock import MagicMock, patch
 import asyncio
+import io
 import os
 import shutil
 import tempfile
+import threading
 
 # Third Party
 import pytest
@@ -465,4 +467,138 @@ class TestGetBlockingCachePolicyUpdate:
 
         assert result is None
         mock_update.assert_not_called()
+        local_disk_backend.local_cpu_backend.memory_allocator.close()
+
+class TestWithinFilePVTSC:
+    """Regression tests for cooperative within-file PVTSC reads."""
+
+    def test_chunked_helper_aborts_between_subreads(
+        self, local_disk_backend: LocalDiskBackend
+    ) -> None:
+        local_disk_backend._sc_pvtsc_read_chunk_bytes = 4
+        event = threading.Event()
+
+        class SignalAfterFirstRead(io.BytesIO):
+            def __init__(self, payload: bytes):
+                super().__init__(payload)
+                self.calls = 0
+
+            def readinto(self, target):
+                self.calls += 1
+                nread = super().readinto(target)
+                if self.calls == 1:
+                    event.set()
+                return nread
+
+        handle = SignalAfterFirstRead(b"abcdefghijkl")
+        buffer = bytearray(12)
+        bytes_read, subreads, aborted = (
+            local_disk_backend._sc_chunked_readinto_with_pvtsc(
+                handle, buffer, event
+            )
+        )
+
+        assert aborted is True
+        assert bytes_read == 4
+        assert subreads == 1
+        assert buffer[:4] == b"abcd"
+        assert buffer[4:] == b"\x00" * 8
+        local_disk_backend.local_cpu_backend.memory_allocator.close()
+
+    def test_event_during_final_subread_counts_file_complete(
+        self, local_disk_backend: LocalDiskBackend
+    ) -> None:
+        local_disk_backend._sc_pvtsc_read_chunk_bytes = 4
+        event = threading.Event()
+
+        class SignalDuringFinalRead(io.BytesIO):
+            def readinto(self, target):
+                nread = super().readinto(target)
+                event.set()
+                return nread
+
+        handle = SignalDuringFinalRead(b"abcd")
+        buffer = bytearray(4)
+        bytes_read, subreads, aborted = (
+            local_disk_backend._sc_chunked_readinto_with_pvtsc(
+                handle, buffer, event
+            )
+        )
+
+        assert bytes_read == 4
+        assert subreads == 1
+        assert aborted is False
+        assert buffer == b"abcd"
+        local_disk_backend.local_cpu_backend.memory_allocator.close()
+
+    def test_read_file_disabled_preserves_single_readinto(
+        self, local_disk_backend: LocalDiskBackend
+    ) -> None:
+        local_disk_backend._sc_pvtsc_within_file_enabled = False
+        event = threading.Event()
+
+        class CountingReader(io.BytesIO):
+            def __init__(self, payload: bytes):
+                super().__init__(payload)
+                self.calls = 0
+
+            def readinto(self, target):
+                self.calls += 1
+                return super().readinto(target)
+
+        handle = CountingReader(b"abcdefghijkl")
+        buffer = bytearray(12)
+        with patch("builtins.open") as mock_open:
+            mock_open.return_value.__enter__.return_value = handle
+            completed = local_disk_backend.read_file(
+                create_test_key(201),
+                buffer,
+                "/fake/cache.pt",
+                lookup_id="disabled-test",
+                file_index=0,
+                total_files=1,
+                pvtsc_event=event,
+            )
+
+        assert completed is True
+        assert handle.calls == 1
+        assert buffer == b"abcdefghijkl"
+        local_disk_backend.local_cpu_backend.memory_allocator.close()
+
+    def test_mid_file_abort_cleans_current_extra_pin_as_uncompleted(
+        self, local_disk_backend: LocalDiskBackend
+    ) -> None:
+        event = threading.Event()
+        key = create_test_key(202)
+        memory_obj = MagicMock(spec=MemoryObj)
+        memory_obj.byte_array = memoryview(bytearray(16))
+
+        def aborting_read(*args, **kwargs):
+            event.set()
+            return False
+
+        with (
+            patch.object(
+                local_disk_backend, "read_file", side_effect=aborting_read
+            ),
+            patch.object(
+                local_disk_backend, "_sc_pvtsc_cleanup_staged"
+            ) as cleanup,
+        ):
+            result = local_disk_backend.batched_async_load_bytes_from_disk(
+                paths=["/fake/cache.pt"],
+                keys=[key],
+                memory_objs=[memory_obj],
+                lookup_id="mid-file-test",
+                pvtsc_event=event,
+            )
+
+        assert result == []
+        cleanup.assert_called_once_with(
+            lookup_id="mid-file-test",
+            keys=[key],
+            memory_objs=[memory_obj],
+            completed_files=0,
+            reason="worker_within_file",
+        )
         local_disk_backend.local_cpu_backend.memory_allocator.close()
