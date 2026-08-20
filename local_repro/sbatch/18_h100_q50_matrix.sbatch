@@ -16,14 +16,6 @@ set -euxo pipefail
 
 REPO=/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
 
-cleanup() {
-    rm -rf "/tmp/sc_${SLURM_JOB_ID}"
-    if [[ "${MATRIX_STORAGE:-}" == "scratch" ]]; then
-        rm -rf "/scratch/sriramc2/kvaware_q50_${SLURM_JOB_ID}"
-    fi
-}
-trap cleanup EXIT
-
 export PYTHONPATH="$REPO:${PYTHONPATH:-}"
 export PYTHONFAULTHANDLER=1
 

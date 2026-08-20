@@ -71,8 +71,17 @@ if [[ "${CLEAN_OLD_LMCACHE:-1}" == "1" ]]; then
     rm -rf "$RUN_ROOT/lmcache_vllm"/*
     rm -rf "$RUN_ROOT/lmcache_hit_hook"/*
     rm -rf "$RUN_ROOT/prometheus_vllm"/*
+
+    if [[ "${SC_LMCACHE_LOCAL_DISK_ENABLE:-0}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ ]] && \
+       [[ "${SC_LMCACHE_DATA_DIR:-}" == /scratch/sriramc2/* ]]; then
+      SCRATCH_ROOT=/scratch/sriramc2
+      mkdir -p "$SCRATCH_ROOT"
+      echo "Clearing old scratch contents under $SCRATCH_ROOT ..."
+      find "$SCRATCH_ROOT" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+    fi
   fi
 fi
+
 
 # Preserve the existing fresh-per-job behavior.
 rm -rf "$SC_LMCACHE_DATA_DIR" "$LMCACHE_HOOK_LOG_DIR" "$PROMETHEUS_MULTIPROC_DIR"
