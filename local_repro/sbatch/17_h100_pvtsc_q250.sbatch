@@ -58,6 +58,7 @@ export MAX_QUESTIONS=250
 export SUBMISSION_BATCH_SIZE=250
 export VLLM_MAX_NUM_SEQS=16
 export DATASET_NAME=medical
+export CLEAN_OLD_LMCACHE=1
 
 # Empty/unset means the driver's normal shared-NFS cache path; never inherit a
 # scratch override from an interactive shell.

@@ -61,11 +61,14 @@ export SC_LMCACHE_DATA_DIR="${SC_LMCACHE_DATA_DIR:-$RUN_ROOT/lmcache_vllm/${JOB_
 export LMCACHE_HOOK_LOG_DIR="$RUN_ROOT/lmcache_hit_hook/${JOB_TAG}"
 export PROMETHEUS_MULTIPROC_DIR="$RUN_ROOT/prometheus_vllm/${JOB_TAG}"
 
-# Delete old jobs' cache directories only when no other user job is running.
+# Delete old jobs' cache directories only when no other RUNNING user job exists.
+# Pending jobs (PD) are intentionally ignored.
 if [[ "${CLEAN_OLD_LMCACHE:-1}" == "1" ]]; then
-  if squeue -u "$USER" -h | grep -v "${SLURM_JOB_ID:-NO_CURRENT_JOB}" | grep -q .; then
-    echo "Other jobs are running; not deleting old LMCache caches."
-    squeue -u "$USER"
+  if squeue -u "$USER" -h -t R \
+      | grep -v "${SLURM_JOB_ID:-NO_CURRENT_JOB}" \
+      | grep -q .; then
+    echo "Other RUNNING jobs exist; not deleting old LMCache caches."
+    squeue -u "$USER" -t R
   else
     echo "Deleting old LMCache caches..."
     rm -rf "$RUN_ROOT/lmcache_vllm"/*
@@ -126,6 +129,7 @@ echo "GRID_RUN_LABEL=${GRID_RUN_LABEL:-none}"
 echo "GRID_CONFIG_SHA256=${GRID_CONFIG_SHA256:-none}"
 echo "LMCACHE_LOOKUP_TIMEOUT_MS=${LMCACHE_LOOKUP_TIMEOUT_MS}"
 echo "=== SC LMCACHE KNOBS ==="
+echo "CLEAN_OLD_LMCACHE=${CLEAN_OLD_LMCACHE:-1}"
 env | LC_ALL=C sort | grep '^SC_' || true
 
 if [[ ! -f "$QUESTIONS_JSON" ]]; then

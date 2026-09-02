@@ -3,7 +3,8 @@ set -euo pipefail
 
 # Creates a targeted, full-content "gitingest-like" bundle for debugging
 # KV-Aware-vLLM / vendored LMCache / Hierarchical_KV runs in a new chat.
-# Version 5 adds PVTSC/fairness/lifecycle coverage and storage-mount identity.
+# Version 6 adds timeout/gate-sweep, scheduler critical-wait, and GPU-residency coverage.
+# It intentionally excludes patch/diff/pristine-comparison artifacts from the bundle.
 #
 # LMCache is expected to live in:
 #   $REPO/third_party/LMCache
@@ -14,7 +15,7 @@ set -euo pipefail
 #
 # Usage:
 #   cd /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
-#   bash /path/to/make_kvaware_code_bundle_updated_v5.sh
+#   bash /path/to/make_kvaware_code_bundle_updated_v6.sh
 #
 # Optional overrides:
 #   REPO=/path/to/KV-Aware-vLLM
@@ -304,32 +305,13 @@ append_file "lmcache_config.yaml"
 append_existing_files_from_find < <(
   find local_repro -maxdepth 4 -type f \
     \( -name '*.py' -o -name '*.sh' -o -name '*.sbatch' -o -name '*.yaml' -o -name '*.yml' -o -name '*.md' \) \
+    ! -path 'local_repro/lmcache_source_migration/*' \
+    ! -iname '*pristine*' \
+    ! -iname '*attribution*' \
     | sort
 )
 
-# Include local admission-control/P0 historical bundles, tests, summaries, and documentation when
-# present, but not generated logs or archive payloads.
-append_existing_files_from_find < <(
-  find . -maxdepth 4 -type f \
-    \( \
-      -path './p0_first_half_bundle/*' -o \
-      -iname '*gate*c*.patch' -o \
-      -iname '*p0*.patch' -o \
-      -iname '*bounded*prefetch*.md' -o \
-      -iname '*setup*guide*.md' -o \
-      -iname '*pvtsc*' -o \
-      -iname '*serializer*fairness*' -o \
-      -iname '*put*barrier*residen*' -o \
-      -iname '*round4*' -o \
-      -iname '*round5*' -o \
-      -iname '*round6*' \
-    \) \
-    ! -name '*.out' \
-    ! -name '*.err' \
-    ! -name '*.tar.gz' \
-    ! -name '*.zip' \
-    -print | sed 's#^\./##' | sort -u
-)
+# Current source files are preferred over historical patch/diff bundles.
 
 append_existing_files_from_find < <(
   find . -path './.git' -prune -o \
@@ -371,6 +353,12 @@ append_file "vllm/v1/core/sched/request_queue.py"
 append_file "vllm/v1/core/kv_cache_manager.py"
 append_file "vllm/v1/core/single_type_kv_cache_manager.py"
 append_file "vllm/v1/core/kv_cache_utils.py"
+for _sc_gpu_residency_path in \
+  "vllm/v1/core/block_pool.py" \
+  "vllm/v1/core/kv_cache_coordinator.py" \
+  "vllm/v1/core/kv_cache_coordinator/__init__.py"; do
+  [[ -f "$_sc_gpu_residency_path" ]] && append_file "$_sc_gpu_residency_path"
+done
 append_file "vllm/v1/engine/core.py"
 append_file "vllm/v1/engine/core_client.py"
 append_file "vllm/v1/engine/async_llm.py"
@@ -472,7 +460,7 @@ if [[ -f "$SITEDEBUG" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Metadata snapshots and diffs.
+# Metadata snapshots and current-path summaries.
 # ---------------------------------------------------------------------------
 section "CURATED PATH EXISTENCE SNAPSHOT"
 {
@@ -499,28 +487,9 @@ section "CURATED PATH EXISTENCE SNAPSHOT"
   done
 } >> "$OUT"
 
-section "GIT DIFF: relevant tracked source"
-git diff -- \
-  local_repro \
-  Hierarchical_KV \
-  third_party/LMCache \
-  lmcache_hit_hook.py \
-  kvcache_monitor.py \
-  kvcache_visualize.py \
-  vllm/distributed/kv_transfer/kv_connector/v1 \
-  vllm/v1/core/sched/scheduler.py \
-  vllm/v1/importance_registry.py \
-  vllm/v1/metrics/loggers.py \
-  >> "$OUT" 2>&1 || true
-
-# If LMCache is a Git submodule/repository, its own diff may not be expanded by
-# the parent repository's git diff.
-section "GIT DIFF: vendored LMCache working tree"
-git -C "$LMCACHE_ROOT" diff >> "$OUT" 2>&1 || true
-
 section "GREP SUMMARY: lifecycle, debug hooks, admission controls, and settings"
 grep -R \
-  "SC_LMCACHE_\|SC_IO_\|SC_LOAD_\|SC_MEMORY_\|SC_SCHEDULER_\|SC_WORKER_\|SC_DISK_PUT_\|SC_DRIVER_\|SC_LMCACHE_DATA_DIR\|PVTSC\|SERIALIZER_FAIRNESS\|CPU_BURST_RATIO\|RESIDENT_PUT_DEDUP\|COLD_WARM_PUT_BARRIER\|readinto\|AsyncPQThreadPoolExecutor\|proc_io_delta\|GRID_RUN_\|GRID_CONFIG_SHA256\|SRIRAM_REQDBG\|SRIRAM_LOOKUPDBG\|SRIRAM_MONITOR\|SRIRAM_MEMDBG\|KVDBG_\|KVIO_\|VLLM_KV_IMPORTANCE\|max_num_seqs\|submission_batch_size\|enable_async_loading\|lookup_timeout_ms\|pin_timeout_sec\|local_disk\|max_local_disk_size\|SRIRAM_LMCACHE_DIR\|LMCACHE_P0_CLIENT_LOOKUP_MAX_INFLIGHT\|LMCACHE_P0_CLIENT_LOOKUP_ADMISSION_TIMEOUT_MS\|LMCACHE_P0_LOOKUP_MAX_INFLIGHT\|LMCACHE_P0_DISK_PUT_MAX_PENDING\|P0_CLIENT_LOOKUP_ADMISSION\|P0_LOOKUP_ADMISSION\|P0_PUT_ADMISSION" \
+  "SC_LMCACHE_\|SC_IO_\|SC_LOAD_\|SC_MEMORY_\|SC_SCHEDULER_\|SC_WORKER_\|SC_DISK_PUT_\|SC_DRIVER_\|SC_LMCACHE_DATA_DIR\|PVTSC\|SERIALIZER_FAIRNESS\|CPU_BURST_RATIO\|RESIDENT_PUT_DEDUP\|COLD_WARM_PUT_BARRIER\|readinto\|AsyncPQThreadPoolExecutor\|proc_io_delta\|GRID_RUN_\|GRID_CONFIG_SHA256\|SRIRAM_REQDBG\|SRIRAM_LOOKUPDBG\|SRIRAM_MONITOR\|SRIRAM_MEMDBG\|KVDBG_\|KVIO_\|VLLM_KV_IMPORTANCE\|kv_importance_tiers\|set_block_importance\|allocate_new_computed_blocks\|num_external_computed_tokens\|to_gpu\|multi_layer_kv_transfer\|SC_EXT_WAIT_CRITICAL\|critical_wait\|max_num_seqs\|submission_batch_size\|enable_async_loading\|lookup_timeout_ms\|pin_timeout_sec\|local_disk\|max_local_disk_size\|SRIRAM_LMCACHE_DIR\|LMCACHE_P0_CLIENT_LOOKUP_MAX_INFLIGHT\|LMCACHE_P0_CLIENT_LOOKUP_ADMISSION_TIMEOUT_MS\|LMCACHE_P0_LOOKUP_MAX_INFLIGHT\|LMCACHE_P0_DISK_PUT_MAX_PENDING\|P0_CLIENT_LOOKUP_ADMISSION\|P0_LOOKUP_ADMISSION\|P0_PUT_ADMISSION" \
   -n local_repro vllm Hierarchical_KV third_party/LMCache \
   lmcache_hit_hook.py kvcache_monitor.py kvcache_visualize.py lmcache_config.yaml \
   2>/dev/null >> "$OUT" || true
