@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Creates a targeted, full-content "gitingest-like" bundle for debugging
 # KV-Aware-vLLM / vendored LMCache / Hierarchical_KV runs in a new chat.
-# Version 6 adds timeout/gate-sweep, scheduler critical-wait, and GPU-residency coverage.
+# Version 7 adds adapter-dispatch, random/ReqMeta importance routing, per-chunk target-tier, and TP/disk-key coverage.
 # It intentionally excludes patch/diff/pristine-comparison artifacts from the bundle.
 #
 # LMCache is expected to live in:
@@ -363,7 +363,10 @@ append_file "vllm/v1/engine/core.py"
 append_file "vllm/v1/engine/core_client.py"
 append_file "vllm/v1/engine/async_llm.py"
 append_file "vllm/distributed/kv_transfer/kv_connector/v1/base.py"
+append_file "vllm/distributed/kv_transfer/kv_connector/v1/factory.py"
+append_file "vllm/distributed/kv_transfer/kv_connector/v1/lmcache_connector.py"
 append_file "vllm/distributed/kv_transfer/kv_connector/v1/lmcache_integration/vllm_v1_adapter.py"
+append_file "vllm/v1/request.py"
 append_file "vllm/v1/importance_registry.py"
 append_file "vllm/v1/metrics/loggers.py"
 
@@ -382,9 +385,11 @@ section "VENDORED LMCACHE SOURCE ROOT: $LMCACHE_ROOT"
 
 append_file "$LMCACHE_PKG/__init__.py"
 append_file "$LMCACHE_PKG/config.py"
+append_file "$LMCACHE_PKG/utils.py"
 append_file "$LMCACHE_PKG/integration/vllm/vllm_v1_adapter.py"
 
 append_file "$LMCACHE_PKG/v1/config.py"
+append_file "$LMCACHE_PKG/v1/metadata.py"
 append_file "$LMCACHE_PKG/v1/cache_engine.py"
 append_file "$LMCACHE_PKG/v1/event_manager.py"
 append_file "$LMCACHE_PKG/v1/pin_monitor.py"
@@ -487,9 +492,9 @@ section "CURATED PATH EXISTENCE SNAPSHOT"
   done
 } >> "$OUT"
 
-section "GREP SUMMARY: lifecycle, debug hooks, admission controls, and settings"
+section "GREP SUMMARY: lifecycle, adapter dispatch, importance routing, storage placement, and settings"
 grep -R \
-  "SC_LMCACHE_\|SC_IO_\|SC_LOAD_\|SC_MEMORY_\|SC_SCHEDULER_\|SC_WORKER_\|SC_DISK_PUT_\|SC_DRIVER_\|SC_LMCACHE_DATA_DIR\|PVTSC\|SERIALIZER_FAIRNESS\|CPU_BURST_RATIO\|RESIDENT_PUT_DEDUP\|COLD_WARM_PUT_BARRIER\|readinto\|AsyncPQThreadPoolExecutor\|proc_io_delta\|GRID_RUN_\|GRID_CONFIG_SHA256\|SRIRAM_REQDBG\|SRIRAM_LOOKUPDBG\|SRIRAM_MONITOR\|SRIRAM_MEMDBG\|KVDBG_\|KVIO_\|VLLM_KV_IMPORTANCE\|kv_importance_tiers\|set_block_importance\|allocate_new_computed_blocks\|num_external_computed_tokens\|to_gpu\|multi_layer_kv_transfer\|SC_EXT_WAIT_CRITICAL\|critical_wait\|max_num_seqs\|submission_batch_size\|enable_async_loading\|lookup_timeout_ms\|pin_timeout_sec\|local_disk\|max_local_disk_size\|SRIRAM_LMCACHE_DIR\|LMCACHE_P0_CLIENT_LOOKUP_MAX_INFLIGHT\|LMCACHE_P0_CLIENT_LOOKUP_ADMISSION_TIMEOUT_MS\|LMCACHE_P0_LOOKUP_MAX_INFLIGHT\|LMCACHE_P0_DISK_PUT_MAX_PENDING\|P0_CLIENT_LOOKUP_ADMISSION\|P0_LOOKUP_ADMISSION\|P0_PUT_ADMISSION" \
+  "SC_LMCACHE_\|SC_IO_\|SC_LOAD_\|SC_MEMORY_\|SC_SCHEDULER_\|SC_WORKER_\|SC_DISK_PUT_\|SC_DRIVER_\|SC_LMCACHE_DATA_DIR\|PVTSC\|SERIALIZER_FAIRNESS\|CPU_BURST_RATIO\|RESIDENT_PUT_DEDUP\|COLD_WARM_PUT_BARRIER\|readinto\|AsyncPQThreadPoolExecutor\|proc_io_delta\|GRID_RUN_\|GRID_CONFIG_SHA256\|SRIRAM_REQDBG\|SRIRAM_LOOKUPDBG\|SRIRAM_MONITOR\|SRIRAM_MEMDBG\|KVDBG_\|KVIO_\|VLLM_KV_IMPORTANCE\|kv_importance_tiers\|set_block_importance\|allocate_new_computed_blocks\|num_external_computed_tokens\|to_gpu\|multi_layer_kv_transfer\|SC_EXT_WAIT_CRITICAL\|critical_wait\|max_num_seqs\|submission_batch_size\|enable_async_loading\|lookup_timeout_ms\|pin_timeout_sec\|local_disk\|max_local_disk_size\|SRIRAM_LMCACHE_DIR\|LMCACHE_P0_CLIENT_LOOKUP_MAX_INFLIGHT\|LMCACHE_P0_CLIENT_LOOKUP_ADMISSION_TIMEOUT_MS\|LMCACHE_P0_LOOKUP_MAX_INFLIGHT\|LMCACHE_P0_DISK_PUT_MAX_PENDING\|P0_CLIENT_LOOKUP_ADMISSION\|P0_LOOKUP_ADMISSION\|P0_PUT_ADMISSION\|use_native\|Initializing native LMCache connector\|Initializing latest dev LMCache connector\|target_tiers\|_get_target_tiers_for_request\|_put_with_optional_target_tiers\|importance_to_tier\|ReqMeta\|pop_importance\|random.randint\|store_location\|locations=\|location=\|_key_to_path\|CacheEngineKey\|worker_id\|chunk_size\|num_kv_head" \
   -n local_repro vllm Hierarchical_KV third_party/LMCache \
   lmcache_hit_hook.py kvcache_monitor.py kvcache_visualize.py lmcache_config.yaml \
   2>/dev/null >> "$OUT" || true

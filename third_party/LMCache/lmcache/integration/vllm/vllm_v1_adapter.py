@@ -22,6 +22,7 @@ from vllm.distributed.parallel_state import (
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import RequestStatus
+from vllm.v1.importance_registry import pop_importance
 from vllm.version import __version__ as VLLM_VERSION
 import torch
 
@@ -62,6 +63,63 @@ if TYPE_CHECKING:
     from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
 
 logger = init_logger(__name__)
+
+
+def vote_chunk_tier_disk_majority(block_tiers: list[str]) -> str:
+    """Choose one logical tier for an LMCache chunk from GNN block labels.
+
+    Disk wins only with a strict majority (> 50%). Otherwise CPU and GPU
+    compete directly. An exact CPU/GPU tie goes to GPU, preserving the old
+    hot-tier tie-break without changing GPU storage semantics.
+    """
+    if not block_tiers:
+        raise ValueError("Cannot vote a tier for an empty chunk")
+
+    normalized = [str(tier).lower() for tier in block_tiers]
+    invalid = set(normalized) - {"disk", "cpu", "gpu"}
+    if invalid:
+        raise ValueError(f"Unknown KV tier(s): {sorted(invalid)}")
+
+    disk_count = normalized.count("disk")
+    if 2 * disk_count > len(normalized):
+        return "disk"
+
+    cpu_count = normalized.count("cpu")
+    gpu_count = normalized.count("gpu")
+    return "gpu" if gpu_count >= cpu_count else "cpu"
+
+
+def random_importance_to_chunk_tiers(
+    importance: Optional[list[float]],
+    num_tokens: int,
+    store_mask: torch.Tensor,
+    chunk_size: int,
+    cpu_threshold: float = 2.0,
+) -> Optional[list[str]]:
+    """Convert wo-GNN random numeric importance into logical chunk tiers."""
+    if importance is None:
+        return None
+    if len(importance) < num_tokens:
+        raise ValueError(
+            f"Random importance has {len(importance)} values for "
+            f"{num_tokens} request tokens"
+        )
+
+    first_stored_token = int((~store_mask).sum().item())
+    chunk_tiers: list[str] = []
+
+    for chunk_start in range(first_stored_token, num_tokens, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, num_tokens)
+        chunk_importance = importance[chunk_start:chunk_end]
+        if not chunk_importance:
+            continue
+
+        average_importance = sum(chunk_importance) / len(chunk_importance)
+        chunk_tiers.append(
+            "cpu" if average_importance >= cpu_threshold else "disk"
+        )
+
+    return chunk_tiers
 
 # ===== SC REQUEST TRACE START =====
 import os as _sc_os
@@ -323,6 +381,9 @@ class ReqMeta:
     token_ids: list[int]  # torch.Tensor
     # Slot mapping
     slot_mapping: torch.Tensor
+
+    # wo-GNN random per-token importance propagated from the vLLM scheduler.
+    importance: Optional[list[float]] = None
 
     # Whether is last prefill or not
     is_last_prefill: bool = False
@@ -711,43 +772,65 @@ class LMCacheConnectorV1Impl:
         num_tokens: int,
         store_mask: torch.Tensor,
         chunk_size: int,
+        importance: Optional[list[float]] = None,
     ):
         """Choose one LMCache destination for each LMCache chunk."""
-        block_tiers = self._get_request_block_tiers(req_id)
-        if not block_tiers:
-            if tier_trace_enabled():
-                logger.warning("[SC_TIER_TRACE] No block tiers found for request %s", req_id)
-            return None
+        logical_target_tiers: list[str]
 
-        gnn_block_size = int(os.environ.get("GNN_KV_BLOCK_SIZE", "16"))
-        first_stored_token = int((~store_mask).sum().item())
-        target_locations = []
+        if os.environ.get("VLLM_KV_IMPORTANCE_ENABLE", "0") == "1":
+            block_tiers = self._get_request_block_tiers(req_id)
+            if not block_tiers:
+                if tier_trace_enabled():
+                    logger.warning(
+                        "[SC_TIER_TRACE] No GNN block tiers found for request %s",
+                        req_id,
+                    )
+                return None
 
-        for chunk_start in range(first_stored_token, num_tokens, chunk_size):
-            chunk_end = min(chunk_start + chunk_size, num_tokens)
-            first_block = chunk_start // gnn_block_size
-            last_block = (chunk_end - 1) // gnn_block_size
+            gnn_block_size = int(os.environ.get("GNN_KV_BLOCK_SIZE", "16"))
+            first_stored_token = int((~store_mask).sum().item())
+            logical_target_tiers = []
 
-            chunk_block_tiers = [
-                block_tiers.get(block_index, "cpu")
-                for block_index in range(first_block, last_block + 1)
-            ]
+            for chunk_start in range(first_stored_token, num_tokens, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, num_tokens)
+                first_block = chunk_start // gnn_block_size
+                last_block = (chunk_end - 1) // gnn_block_size
 
-            if "gpu" in chunk_block_tiers:
-                target_tier = "gpu"
-            elif "cpu" in chunk_block_tiers:
-                target_tier = "cpu"
-            else:
-                target_tier = "disk"
+                chunk_block_tiers = [
+                    block_tiers.get(block_index, "cpu")
+                    for block_index in range(first_block, last_block + 1)
+                ]
 
-            target_locations.append(
-                self._tier_to_lmcache_location(target_tier)
+                # To try a different chunk-voting policy later, define another
+                # voting function and change only this call.
+                target_tier = vote_chunk_tier_disk_majority(chunk_block_tiers)
+                logical_target_tiers.append(target_tier)
+        else:
+            random_chunk_tiers = random_importance_to_chunk_tiers(
+                importance,
+                num_tokens,
+                store_mask,
+                chunk_size,
             )
+            if random_chunk_tiers is None:
+                raise RuntimeError(
+                    f"Missing random importance for wo-GNN request {req_id}; "
+                    "refusing to fall back to replicated LMCache placement"
+                )
+            logical_target_tiers = random_chunk_tiers
+
+        target_locations = [
+            self._tier_to_lmcache_location(tier)
+            for tier in logical_target_tiers
+        ]
+
         if tier_trace_enabled():
             logger.warning(
-                "[SC_TIER_TRACE] req_id=%s target_tiers_count=%d sample=%s",
+                "[SC_TIER_TRACE] req_id=%s logical_tiers_count=%d "
+                "logical_sample=%s location_sample=%s",
                 req_id,
-                len(target_locations),
+                len(logical_target_tiers),
+                logical_target_tiers[:8],
                 target_locations[:8],
             )
         return target_locations
@@ -1356,6 +1439,7 @@ class LMCacheConnectorV1Impl:
                 len(token_ids),
                 store_mask,
                 self._lmcache_chunk_size,
+                importance=request.importance,
             )
 
             # Probe decoder cache before store
@@ -1785,6 +1869,7 @@ class LMCacheConnectorV1Impl:
                 save_decode_cache=self.config.save_decode_cache,
             )
             if req_meta is not None:
+                req_meta.importance = pop_importance(request.req_id)
                 meta.add_request(req_meta)
 
         cached_reqs = scheduler_output.scheduled_cached_reqs
@@ -1831,6 +1916,7 @@ class LMCacheConnectorV1Impl:
                     save_decode_cache=self.config.save_decode_cache,
                 )
                 if req_meta is not None:
+                    req_meta.importance = pop_importance(req.req_id)
                     meta.add_request(req_meta)
             return meta
 
@@ -1954,6 +2040,7 @@ class LMCacheConnectorV1Impl:
                 save_decode_cache=self.config.save_decode_cache,
             )
             if req_meta is not None:
+                req_meta.importance = pop_importance(req_id)
                 meta.add_request(req_meta)
 
         return meta

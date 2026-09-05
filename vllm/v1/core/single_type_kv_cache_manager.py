@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
+import random
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
@@ -19,6 +21,11 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 from vllm.v1.request import Request
+from vllm.v1.importance_registry import set_importance
+
+_RANDOM_IMPORTANCE_RNG = random.Random(
+    int(os.environ.get("VLLM_KV_RANDOM_SEED", "0"))
+)
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -222,52 +229,46 @@ class SingleTypeKVCacheManager(ABC):
         Returns:
             The new allocated blocks.
         """
-        # req_blocks = self.req_to_blocks[request_id]
-        # num_required_blocks = cdiv(num_tokens, self.block_size)
-        # num_new_blocks = num_required_blocks - len(req_blocks)
-        # if num_new_blocks <= 0:
-        #     return []
-        # else:
-        #     new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
-        #     req_blocks.extend(new_blocks)
-        #     return new_blocks
-        
         req_blocks = self.req_to_blocks[request_id]
         num_required_blocks = cdiv(num_tokens, self.block_size)
-        import random
-        token_importance = []
-        for x in range(num_tokens) : 
-            token_importance.append(random.randint(1, 3))
         num_new_blocks = num_required_blocks - len(req_blocks)
-        if num_new_blocks <= 0:
-            return []
 
-        new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
-        req_blocks.extend(new_blocks)
+        new_blocks: list[KVCacheBlock] = []
+        if num_new_blocks > 0:
+            new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+            req_blocks.extend(new_blocks)
 
-        # Tag each new block with its average importance
-        # if token_importance is not None:
-        already_allocated = len(req_blocks) - num_new_blocks
-        for i, block in enumerate(new_blocks):
-            block_idx = already_allocated + i
-            
-            
-            # [SY] read importance values here later
-            start = block_idx * self.block_size
-            end = min(start + self.block_size, len(token_importance))
-            if start < len(token_importance):
-                block.importance = sum(token_importance[start:end]) / (end - start)
-            else:
-                block.importance = 0.0  # padding/generated tokens
-                
-        # [SY]: expand all req_blocks to token-level and push to shared registry
-        from vllm.v1.importance_registry import set_importance 
-        full_token_importance = []
-        for block in req_blocks:
-            full_token_importance.extend(
-                [getattr(block, "importance", 1.0)] * self.block_size
-            )
-        set_importance(request_id, full_token_importance[:num_tokens])
+        # wo-GNN baseline: assign random numeric importance only to newly
+        # allocated vLLM blocks. Refresh the registry on every allocation call
+        # so chunked-prefill steps that add tokens but no new vLLM block still
+        # carry placement metadata into LMCache.
+        if os.environ.get("VLLM_KV_IMPORTANCE_ENABLE", "0") != "1":
+            already_allocated = len(req_blocks) - len(new_blocks)
+            for i, block in enumerate(new_blocks):
+                block_idx = already_allocated + i
+                # [SY] read importance values here later
+                # [SC] implemented the above
+                start = block_idx * self.block_size
+                end = min(start + self.block_size, num_tokens)
+                token_count = max(end - start, 0)
+
+                if token_count > 0:
+                    block.importance = (
+                        sum(
+                            _RANDOM_IMPORTANCE_RNG.randint(1, 3)
+                            for _ in range(token_count)
+                        )
+                        / token_count
+                    )
+                else:
+                    block.importance = 0.0
+
+            full_token_importance = []
+            for block in req_blocks:
+                full_token_importance.extend(
+                    [getattr(block, "importance", 1.0)] * self.block_size
+                )
+            set_importance(request_id, full_token_importance[:num_tokens])
 
         return new_blocks
 
