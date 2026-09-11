@@ -968,7 +968,6 @@ def get_model_vocab_size(model):
         return model.token_embedding.num_embeddings
     return None
 
-
 def predict_prompt_blocks(
     prompt_text,
     sorted_passage,
@@ -984,11 +983,28 @@ def predict_prompt_blocks(
     block_size,
     device,
 ):
-    token_ids, attn, prompt_tokens = encode_prompt_text(
+    # max_seq_len is now the per-GNN-window size (512), not a whole-prompt cap.
+    if max_seq_len % block_size != 0:
+        raise ValueError(
+            f"max_seq_len={max_seq_len} must be divisible by "
+            f"block_size={block_size}"
+        )
+
+    # Tokenize the FULL prompt once. Do not truncate to 512 here.
+    enc = tokenizer(
         prompt_text,
-        tokenizer,
-        max_seq_len,
+        truncation=False,
+        padding=False,
+        return_attention_mask=True,
+        return_tensors="pt",
     )
+
+    all_token_ids = enc["input_ids"][0].long()
+    all_attn = enc["attention_mask"][0].bool()
+
+    num_valid_tokens = int(all_attn.sum().item())
+    all_token_ids = all_token_ids[:num_valid_tokens]
+    prompt_tokens = tokenizer.convert_ids_to_tokens(all_token_ids.tolist())
 
     passage_hash_ids, r_nodes = derive_retrieved_nodes(
         sorted_passage,
@@ -1001,12 +1017,13 @@ def predict_prompt_blocks(
         raise ValueError(
             f"Invalid retrieved node ids: {r_nodes}, "
             f"num_nodes={node_features.size(0)}. "
-            "This means sorted_passage does not match passage_embedding.parquet text."
+            "This means sorted_passage does not match "
+            "passage_embedding.parquet text."
         )
 
     vocab_size = get_model_vocab_size(model)
-    if vocab_size is not None:
-        max_token_id = int(token_ids.max().item())
+    if vocab_size is not None and num_valid_tokens > 0:
+        max_token_id = int(all_token_ids.max().item())
         if max_token_id >= vocab_size:
             raise ValueError(
                 f"Invalid token id: max_token_id={max_token_id}, "
@@ -1015,21 +1032,58 @@ def predict_prompt_blocks(
 
     retrieved = torch.tensor(r_nodes, dtype=torch.long, device=device)
 
+    window_logits = []
+
     with torch.no_grad():
-        logits = model(
-            token_ids.to(device).unsqueeze(0),
-            attn.to(device).unsqueeze(0),
-            node_features,
-            edge_index,
-            edge_weight,
-            retrieved.unsqueeze(0),
-        ).squeeze(0)
+        for start in range(0, num_valid_tokens, max_seq_len):
+            end = min(start + max_seq_len, num_valid_tokens)
+
+            ids = all_token_ids[start:end]
+            valid_in_window = end - start
+
+            # Pad the last window back to 512 tokens so every GNN invocation
+            # matches the training-time sequence length.
+            attn = torch.ones(valid_in_window, dtype=torch.bool)
+
+            pad_len = max_seq_len - valid_in_window
+            if pad_len > 0:
+                ids = torch.cat([
+                    ids,
+                    torch.full(
+                        (pad_len,),
+                        int(tokenizer.pad_token_id),
+                        dtype=torch.long,
+                    ),
+                ])
+                attn = torch.cat([
+                    attn,
+                    torch.zeros(pad_len, dtype=torch.bool),
+                ])
+
+            logits = model(
+                ids.to(device).unsqueeze(0),
+                attn.to(device).unsqueeze(0),
+                node_features,
+                edge_index,
+                edge_weight,
+                retrieved.unsqueeze(0),
+            ).squeeze(0)
+
+            valid_blocks = (
+                valid_in_window + block_size - 1
+            ) // block_size
+
+            window_logits.append(
+                logits[:valid_blocks].detach().cpu()
+            )
+
+    logits = torch.cat(window_logits, dim=0)
 
     return {
         "passage_hash_ids": passage_hash_ids,
         "retrieved_node_ids": r_nodes,
-        "logits": logits.detach().cpu(),
-        "num_valid_tokens": int(attn.sum().item()),
+        "logits": logits,
+        "num_valid_tokens": num_valid_tokens,
         "tokens": prompt_tokens,
         "block_size": block_size,
     }

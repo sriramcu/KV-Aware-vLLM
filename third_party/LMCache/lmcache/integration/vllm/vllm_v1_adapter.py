@@ -65,6 +65,25 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def vote_chunk_tier_legacy_hot_priority(block_tiers: list[str]) -> str:
+    if not block_tiers:
+        raise ValueError("block_tiers must not be empty")
+
+    normalized = [str(tier).lower() for tier in block_tiers]
+
+    invalid = set(normalized) - {"disk", "cpu", "gpu"}
+    if invalid:
+        raise ValueError(f"Invalid block tiers: {sorted(invalid)}")
+
+    if "gpu" in normalized:
+        return "gpu"
+
+    if "cpu" in normalized:
+        return "cpu"
+
+    return "disk"
+
+
 def vote_chunk_tier_disk_majority(block_tiers: list[str]) -> str:
     """Choose one logical tier for an LMCache chunk from GNN block labels.
 
@@ -775,6 +794,11 @@ class LMCacheConnectorV1Impl:
         importance: Optional[list[float]] = None,
     ):
         """Choose one LMCache destination for each LMCache chunk."""
+        if os.environ.get("VLLM_KV_CPU_ONLY", "0") == "1":
+            first_stored_token = int((~store_mask).sum().item())
+            num_chunks = (num_tokens - first_stored_token + chunk_size - 1) // chunk_size
+            return ["LocalCPUBackend"] * num_chunks
+        
         logical_target_tiers: list[str]
 
         if os.environ.get("VLLM_KV_IMPORTANCE_ENABLE", "0") == "1":
@@ -803,6 +827,8 @@ class LMCacheConnectorV1Impl:
 
                 # To try a different chunk-voting policy later, define another
                 # voting function and change only this call.
+                # To try the legacy hot-priority policy:
+                # target_tier = vote_chunk_tier_legacy_hot_priority(chunk_block_tiers)
                 target_tier = vote_chunk_tier_disk_majority(chunk_block_tiers)
                 logical_target_tiers.append(target_tier)
         else:
