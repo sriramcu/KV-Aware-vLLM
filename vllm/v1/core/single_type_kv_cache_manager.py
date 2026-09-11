@@ -242,7 +242,10 @@ class SingleTypeKVCacheManager(ABC):
         # allocated vLLM blocks. Refresh the registry on every allocation call
         # so chunked-prefill steps that add tokens but no new vLLM block still
         # carry placement metadata into LMCache.
-        if os.environ.get("VLLM_KV_IMPORTANCE_ENABLE", "0") != "1":
+        if (
+            os.environ.get("VLLM_KV_IMPORTANCE_ENABLE", "0") != "1"
+            and os.environ.get("VLLM_KV_RANDOM_PLACEMENT_ENABLE", "0") == "1"
+        ):
             already_allocated = len(req_blocks) - len(new_blocks)
             for i, block in enumerate(new_blocks):
                 block_idx = already_allocated + i

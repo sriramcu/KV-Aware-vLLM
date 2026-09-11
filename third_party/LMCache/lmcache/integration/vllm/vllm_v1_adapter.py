@@ -831,7 +831,7 @@ class LMCacheConnectorV1Impl:
                 # target_tier = vote_chunk_tier_legacy_hot_priority(chunk_block_tiers)
                 target_tier = vote_chunk_tier_disk_majority(chunk_block_tiers)
                 logical_target_tiers.append(target_tier)
-        else:
+        elif os.environ.get("VLLM_KV_RANDOM_PLACEMENT_ENABLE", "0") == "1":
             random_chunk_tiers = random_importance_to_chunk_tiers(
                 importance,
                 num_tokens,
@@ -844,6 +844,15 @@ class LMCacheConnectorV1Impl:
                     "refusing to fall back to replicated LMCache placement"
                 )
             logical_target_tiers = random_chunk_tiers
+        else:
+            # Original/default LMCache placement.
+            if tier_trace_enabled():
+                logger.warning(
+                    "[SC_TIER_TRACE] req_id=%s random placement disabled; "
+                    "using default LMCache placement",
+                    req_id,
+                )
+            return None
 
         target_locations = [
             self._tier_to_lmcache_location(tier)
