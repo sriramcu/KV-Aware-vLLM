@@ -23,6 +23,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import RequestStatus
 from vllm.v1.importance_registry import pop_importance
+from vllm.v1.kv_tier_policy import coarsen_block_tiers_to_chunks
 from vllm.version import __version__ as VLLM_VERSION
 import torch
 
@@ -63,49 +64,6 @@ if TYPE_CHECKING:
     from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
 
 logger = init_logger(__name__)
-
-
-def vote_chunk_tier_legacy_hot_priority(block_tiers: list[str]) -> str:
-    if not block_tiers:
-        raise ValueError("block_tiers must not be empty")
-
-    normalized = [str(tier).lower() for tier in block_tiers]
-
-    invalid = set(normalized) - {"disk", "cpu", "gpu"}
-    if invalid:
-        raise ValueError(f"Invalid block tiers: {sorted(invalid)}")
-
-    if "gpu" in normalized:
-        return "gpu"
-
-    if "cpu" in normalized:
-        return "cpu"
-
-    return "disk"
-
-
-def vote_chunk_tier_disk_majority(block_tiers: list[str]) -> str:
-    """Choose one logical tier for an LMCache chunk from GNN block labels.
-
-    Disk wins only with a strict majority (> 50%). Otherwise CPU and GPU
-    compete directly. An exact CPU/GPU tie goes to GPU, preserving the old
-    hot-tier tie-break without changing GPU storage semantics.
-    """
-    if not block_tiers:
-        raise ValueError("Cannot vote a tier for an empty chunk")
-
-    normalized = [str(tier).lower() for tier in block_tiers]
-    invalid = set(normalized) - {"disk", "cpu", "gpu"}
-    if invalid:
-        raise ValueError(f"Unknown KV tier(s): {sorted(invalid)}")
-
-    disk_count = normalized.count("disk")
-    if 2 * disk_count > len(normalized):
-        return "disk"
-
-    cpu_count = normalized.count("cpu")
-    gpu_count = normalized.count("gpu")
-    return "gpu" if gpu_count >= cpu_count else "cpu"
 
 
 def random_importance_to_chunk_tiers(
@@ -813,24 +771,14 @@ class LMCacheConnectorV1Impl:
 
             gnn_block_size = int(os.environ.get("GNN_KV_BLOCK_SIZE", "16"))
             first_stored_token = int((~store_mask).sum().item())
-            logical_target_tiers = []
-
-            for chunk_start in range(first_stored_token, num_tokens, chunk_size):
-                chunk_end = min(chunk_start + chunk_size, num_tokens)
-                first_block = chunk_start // gnn_block_size
-                last_block = (chunk_end - 1) // gnn_block_size
-
-                chunk_block_tiers = [
-                    block_tiers.get(block_index, "cpu")
-                    for block_index in range(first_block, last_block + 1)
-                ]
-
-                # To try a different chunk-voting policy later, define another
-                # voting function and change only this call.
-                # To try the legacy hot-priority policy:
-                # target_tier = vote_chunk_tier_legacy_hot_priority(chunk_block_tiers)
-                target_tier = vote_chunk_tier_disk_majority(chunk_block_tiers)
-                logical_target_tiers.append(target_tier)
+            logical_target_tiers = coarsen_block_tiers_to_chunks(
+                block_tiers,
+                first_token=first_stored_token,
+                num_tokens=num_tokens,
+                block_size=gnn_block_size,
+                chunk_size=chunk_size,
+                missing_tier="cpu",
+            )
         elif os.environ.get("VLLM_KV_RANDOM_PLACEMENT_ENABLE", "0") == "1":
             random_chunk_tiers = random_importance_to_chunk_tiers(
                 importance,

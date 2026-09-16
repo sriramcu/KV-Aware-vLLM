@@ -13,6 +13,7 @@ from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
+from vllm.v1.kv_tier_policy import coarsen_block_tiers_to_chunks
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
 
@@ -223,19 +224,6 @@ class KVCacheManager:
 
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
 
-    @staticmethod
-    def _vote_chunk_tier_disk_majority(block_tiers: list[str]) -> str:
-        """Mirror the current LMCache 512-token chunk voting policy."""
-        normalized = [str(tier).lower() for tier in block_tiers]
-        invalid = set(normalized) - {"disk", "cpu", "gpu"}
-        if invalid:
-            raise ValueError(f"Unknown KV importance tiers: {sorted(invalid)}")
-        disk_count = normalized.count("disk")
-        if 2 * disk_count > len(normalized):
-            return "disk"
-        cpu_count = normalized.count("cpu")
-        gpu_count = normalized.count("gpu")
-        return "gpu" if gpu_count >= cpu_count else "cpu"
 
     def _set_importance_for_request_blocks(self, request: Request) -> None:
         if not getattr(self.block_pool, "enable_kv_importance", False):
@@ -273,29 +261,29 @@ class KVCacheManager:
             )
 
         blocks_per_chunk = chunk_size // gnn_block_size
-        max_tier_block_idx = max(tiers)
-        voted_tier_by_chunk: dict[int, str] = {}
+        # The sidecar may cover only the predicted prompt while request.num_tokens
+        # can later include generated tokens. Coarsen only the range for which a
+        # prediction exists, and leave later blocks unassigned.
+        predicted_num_tokens = min(
+            request.num_tokens,
+            (max(tiers) + 1) * gnn_block_size,
+        )
+        voted_tiers = coarsen_block_tiers_to_chunks(
+            tiers,
+            first_token=0,
+            num_tokens=predicted_num_tokens,
+            block_size=gnn_block_size,
+            chunk_size=chunk_size,
+            missing_tier="cpu",
+        )
+
         for group_block_ids in block_ids_by_group:
             for logical_block_idx, block_id in enumerate(group_block_ids):
                 chunk_idx = logical_block_idx // blocks_per_chunk
-                if chunk_idx not in voted_tier_by_chunk:
-                    first = chunk_idx * blocks_per_chunk
-                    if first > max_tier_block_idx:
-                        continue
-                    # Do not pad the final partial prompt chunk out to 512
-                    # tokens; LMCache votes only over blocks that belong to the
-                    # actual chunk extent. Missing labels inside that extent use
-                    # the same CPU fallback as the LMCache adapter.
-                    last = min(first + blocks_per_chunk, max_tier_block_idx + 1)
-                    chunk_tiers = [
-                        str(tiers.get(i, "cpu")) for i in range(first, last)
-                    ]
-                    voted_tier_by_chunk[chunk_idx] = (
-                        self._vote_chunk_tier_disk_majority(chunk_tiers)
+                if chunk_idx < len(voted_tiers):
+                    self.block_pool.set_block_importance(
+                        block_id, voted_tiers[chunk_idx]
                     )
-                voted_tier = voted_tier_by_chunk.get(chunk_idx)
-                if voted_tier is not None:
-                    self.block_pool.set_block_importance(block_id, voted_tier)
 
 
     def allocate_slots(

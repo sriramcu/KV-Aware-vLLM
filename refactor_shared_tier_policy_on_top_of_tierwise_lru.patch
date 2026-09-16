@@ -1,0 +1,285 @@
+diff --git a/third_party/LMCache/lmcache/integration/vllm/vllm_v1_adapter.py b/third_party/LMCache/lmcache/integration/vllm/vllm_v1_adapter.py
+index 2449ddc..5e90857 100644
+--- a/third_party/LMCache/lmcache/integration/vllm/vllm_v1_adapter.py
++++ b/third_party/LMCache/lmcache/integration/vllm/vllm_v1_adapter.py
+@@ -23,6 +23,7 @@ from vllm.sampling_params import SamplingParams
+ from vllm.v1.core.sched.output import SchedulerOutput
+ from vllm.v1.request import RequestStatus
+ from vllm.v1.importance_registry import pop_importance
++from vllm.v1.kv_tier_policy import coarsen_block_tiers_to_chunks
+ from vllm.version import __version__ as VLLM_VERSION
+ import torch
+ 
+@@ -65,49 +66,6 @@ if TYPE_CHECKING:
+ logger = init_logger(__name__)
+ 
+ 
+-def vote_chunk_tier_legacy_hot_priority(block_tiers: list[str]) -> str:
+-    if not block_tiers:
+-        raise ValueError("block_tiers must not be empty")
+-
+-    normalized = [str(tier).lower() for tier in block_tiers]
+-
+-    invalid = set(normalized) - {"disk", "cpu", "gpu"}
+-    if invalid:
+-        raise ValueError(f"Invalid block tiers: {sorted(invalid)}")
+-
+-    if "gpu" in normalized:
+-        return "gpu"
+-
+-    if "cpu" in normalized:
+-        return "cpu"
+-
+-    return "disk"
+-
+-
+-def vote_chunk_tier_disk_majority(block_tiers: list[str]) -> str:
+-    """Choose one logical tier for an LMCache chunk from GNN block labels.
+-
+-    Disk wins only with a strict majority (> 50%). Otherwise CPU and GPU
+-    compete directly. An exact CPU/GPU tie goes to GPU, preserving the old
+-    hot-tier tie-break without changing GPU storage semantics.
+-    """
+-    if not block_tiers:
+-        raise ValueError("Cannot vote a tier for an empty chunk")
+-
+-    normalized = [str(tier).lower() for tier in block_tiers]
+-    invalid = set(normalized) - {"disk", "cpu", "gpu"}
+-    if invalid:
+-        raise ValueError(f"Unknown KV tier(s): {sorted(invalid)}")
+-
+-    disk_count = normalized.count("disk")
+-    if 2 * disk_count > len(normalized):
+-        return "disk"
+-
+-    cpu_count = normalized.count("cpu")
+-    gpu_count = normalized.count("gpu")
+-    return "gpu" if gpu_count >= cpu_count else "cpu"
+-
+-
+ def random_importance_to_chunk_tiers(
+     importance: Optional[list[float]],
+     num_tokens: int,
+@@ -813,24 +771,14 @@ class LMCacheConnectorV1Impl:
+ 
+             gnn_block_size = int(os.environ.get("GNN_KV_BLOCK_SIZE", "16"))
+             first_stored_token = int((~store_mask).sum().item())
+-            logical_target_tiers = []
+-
+-            for chunk_start in range(first_stored_token, num_tokens, chunk_size):
+-                chunk_end = min(chunk_start + chunk_size, num_tokens)
+-                first_block = chunk_start // gnn_block_size
+-                last_block = (chunk_end - 1) // gnn_block_size
+-
+-                chunk_block_tiers = [
+-                    block_tiers.get(block_index, "cpu")
+-                    for block_index in range(first_block, last_block + 1)
+-                ]
+-
+-                # To try a different chunk-voting policy later, define another
+-                # voting function and change only this call.
+-                # To try the legacy hot-priority policy:
+-                # target_tier = vote_chunk_tier_legacy_hot_priority(chunk_block_tiers)
+-                target_tier = vote_chunk_tier_disk_majority(chunk_block_tiers)
+-                logical_target_tiers.append(target_tier)
++            logical_target_tiers = coarsen_block_tiers_to_chunks(
++                block_tiers,
++                first_token=first_stored_token,
++                num_tokens=num_tokens,
++                block_size=gnn_block_size,
++                chunk_size=chunk_size,
++                missing_tier="cpu",
++            )
+         elif os.environ.get("VLLM_KV_RANDOM_PLACEMENT_ENABLE", "0") == "1":
+             random_chunk_tiers = random_importance_to_chunk_tiers(
+                 importance,
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index 61ebb2d..131cb70 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -13,6 +13,7 @@ from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
+ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+ from vllm.v1.core.kv_cache_utils import KVCacheBlock
+ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
++from vllm.v1.kv_tier_policy import coarsen_block_tiers_to_chunks
+ from vllm.v1.metrics.stats import PrefixCacheStats
+ from vllm.v1.request import Request
+ 
+@@ -223,19 +224,6 @@ class KVCacheManager:
+ 
+         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
+ 
+-    @staticmethod
+-    def _vote_chunk_tier_disk_majority(block_tiers: list[str]) -> str:
+-        """Mirror the current LMCache 512-token chunk voting policy."""
+-        normalized = [str(tier).lower() for tier in block_tiers]
+-        invalid = set(normalized) - {"disk", "cpu", "gpu"}
+-        if invalid:
+-            raise ValueError(f"Unknown KV importance tiers: {sorted(invalid)}")
+-        disk_count = normalized.count("disk")
+-        if 2 * disk_count > len(normalized):
+-            return "disk"
+-        cpu_count = normalized.count("cpu")
+-        gpu_count = normalized.count("gpu")
+-        return "gpu" if gpu_count >= cpu_count else "cpu"
+ 
+     def _set_importance_for_request_blocks(self, request: Request) -> None:
+         if not getattr(self.block_pool, "enable_kv_importance", False):
+@@ -273,29 +261,29 @@ class KVCacheManager:
+             )
+ 
+         blocks_per_chunk = chunk_size // gnn_block_size
+-        max_tier_block_idx = max(tiers)
+-        voted_tier_by_chunk: dict[int, str] = {}
++        # The sidecar may cover only the predicted prompt while request.num_tokens
++        # can later include generated tokens. Coarsen only the range for which a
++        # prediction exists, and leave later blocks unassigned.
++        predicted_num_tokens = min(
++            request.num_tokens,
++            (max(tiers) + 1) * gnn_block_size,
++        )
++        voted_tiers = coarsen_block_tiers_to_chunks(
++            tiers,
++            first_token=0,
++            num_tokens=predicted_num_tokens,
++            block_size=gnn_block_size,
++            chunk_size=chunk_size,
++            missing_tier="cpu",
++        )
++
+         for group_block_ids in block_ids_by_group:
+             for logical_block_idx, block_id in enumerate(group_block_ids):
+                 chunk_idx = logical_block_idx // blocks_per_chunk
+-                if chunk_idx not in voted_tier_by_chunk:
+-                    first = chunk_idx * blocks_per_chunk
+-                    if first > max_tier_block_idx:
+-                        continue
+-                    # Do not pad the final partial prompt chunk out to 512
+-                    # tokens; LMCache votes only over blocks that belong to the
+-                    # actual chunk extent. Missing labels inside that extent use
+-                    # the same CPU fallback as the LMCache adapter.
+-                    last = min(first + blocks_per_chunk, max_tier_block_idx + 1)
+-                    chunk_tiers = [
+-                        str(tiers.get(i, "cpu")) for i in range(first, last)
+-                    ]
+-                    voted_tier_by_chunk[chunk_idx] = (
+-                        self._vote_chunk_tier_disk_majority(chunk_tiers)
++                if chunk_idx < len(voted_tiers):
++                    self.block_pool.set_block_importance(
++                        block_id, voted_tiers[chunk_idx]
+                     )
+-                voted_tier = voted_tier_by_chunk.get(chunk_idx)
+-                if voted_tier is not None:
+-                    self.block_pool.set_block_importance(block_id, voted_tier)
+ 
+ 
+     def allocate_slots(
+diff --git a/vllm/v1/kv_tier_policy.py b/vllm/v1/kv_tier_policy.py
+new file mode 100644
+index 0000000..fa99f83
+--- /dev/null
++++ b/vllm/v1/kv_tier_policy.py
+@@ -0,0 +1,103 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Shared logical KV-tier voting and block-to-chunk coarsening helpers."""
++
++from collections.abc import Mapping, Sequence
++
++_VALID_TIERS = frozenset({"disk", "cpu", "gpu"})
++
++
++def _normalize_block_tiers(block_tiers: Sequence[str]) -> list[str]:
++    if not block_tiers:
++        raise ValueError("block_tiers must not be empty")
++
++    normalized = [str(tier).lower() for tier in block_tiers]
++    invalid = set(normalized) - _VALID_TIERS
++    if invalid:
++        raise ValueError(f"Unknown KV tier(s): {sorted(invalid)}")
++    return normalized
++
++
++def vote_chunk_tier_legacy_hot_priority(block_tiers: Sequence[str]) -> str:
++    """Legacy policy: any GPU label wins, then any CPU label, else disk."""
++    normalized = _normalize_block_tiers(block_tiers)
++    if "gpu" in normalized:
++        return "gpu"
++    if "cpu" in normalized:
++        return "cpu"
++    return "disk"
++
++
++def vote_chunk_tier_disk_majority(block_tiers: Sequence[str]) -> str:
++    """Current policy used for one LMCache-sized logical chunk.
++
++    Disk wins only with a strict majority (> 50%). Otherwise CPU and GPU
++    compete directly. An exact CPU/GPU tie goes to GPU, preserving the old
++    hot-tier tie-break without changing GPU storage semantics.
++    """
++    normalized = _normalize_block_tiers(block_tiers)
++
++    disk_count = normalized.count("disk")
++    if 2 * disk_count > len(normalized):
++        return "disk"
++
++    cpu_count = normalized.count("cpu")
++    gpu_count = normalized.count("gpu")
++    return "gpu" if gpu_count >= cpu_count else "cpu"
++
++
++def vote_chunk_tier(block_tiers: Sequence[str]) -> str:
++    """Single selection point for the experiment's chunk voting policy.
++
++    To try a different policy, define it above and change only this call. Both
++    LMCache placement and vLLM GPU retention consume this same selection point.
++    """
++    return vote_chunk_tier_disk_majority(block_tiers)
++    # Legacy alternative:
++    # return vote_chunk_tier_legacy_hot_priority(block_tiers)
++
++
++def coarsen_block_tiers_to_chunks(
++    block_tiers: Mapping[int, str],
++    *,
++    first_token: int,
++    num_tokens: int,
++    block_size: int,
++    chunk_size: int,
++    missing_tier: str = "cpu",
++) -> list[str]:
++    """Vote fine-grained block tiers into consecutive chunk tiers.
++
++    Chunk boundaries start at ``first_token`` and advance by ``chunk_size``;
++    this intentionally matches the LMCache placement loop. The final chunk is
++    not padded. If a block index inside a real chunk extent has no label, use
++    ``missing_tier`` (currently CPU, matching the pre-refactor LMCache path).
++    """
++    if first_token < 0:
++        raise ValueError(f"first_token must be non-negative, got {first_token}")
++    if num_tokens < first_token:
++        raise ValueError(
++            f"num_tokens ({num_tokens}) must be >= first_token ({first_token})"
++        )
++    if block_size <= 0 or chunk_size <= 0:
++        raise ValueError(
++            f"block_size and chunk_size must be positive; got "
++            f"block={block_size}, chunk={chunk_size}"
++        )
++
++    missing_tier = str(missing_tier).lower()
++    if missing_tier not in _VALID_TIERS:
++        raise ValueError(f"Unknown missing_tier {missing_tier!r}")
++
++    chunk_tiers: list[str] = []
++    for chunk_start in range(first_token, num_tokens, chunk_size):
++        chunk_end = min(chunk_start + chunk_size, num_tokens)
++        first_block = chunk_start // block_size
++        last_block = (chunk_end - 1) // block_size
++        fine_tiers = [
++            block_tiers.get(block_index, missing_tier)
++            for block_index in range(first_block, last_block + 1)
++        ]
++        chunk_tiers.append(vote_chunk_tier(fine_tiers))
++
++    return chunk_tiers
