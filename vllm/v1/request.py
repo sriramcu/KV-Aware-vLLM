@@ -41,8 +41,29 @@ def _load_kv_importance_tiers(request_id: str) -> dict[int, str]:
     except Exception:
         return {}
 
-    tiers = all_tiers.get(str(request_id), {})
-    return {int(k): str(v) for k, v in tiers.items()}
+    # Runtime vLLM request IDs may append a UUID-like suffix to the numeric
+    # dataset/sidecar ID (for example, ``5-ba9178b0``). Match the full ID
+    # first, then use the same base-ID fallback as the LMCache adapter.
+    full_request_id = str(request_id)
+    tiers = all_tiers.get(full_request_id)
+    if tiers is None:
+        base_request_id = full_request_id.split("-", 1)[0]
+        tiers = all_tiers.get(base_request_id, {})
+
+    if not isinstance(tiers, dict):
+        return {}
+
+    # Current sidecars store rich per-block records such as
+    # {"tier": "gpu", "confidence": ...}; older sidecars may store the tier
+    # string directly. Normalize both representations to logical tier strings.
+    out: dict[int, str] = {}
+    for key, value in tiers.items():
+        if isinstance(value, dict):
+            tier = value.get("tier", "cpu")
+        else:
+            tier = value
+        out[int(key)] = str(tier)
+    return out
 
 
 @dataclass

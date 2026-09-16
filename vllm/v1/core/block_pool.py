@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import atexit
 from collections.abc import Callable, Iterable, Sequence
 import os
 from typing import Any
@@ -315,9 +316,22 @@ class BlockPool:
         self.tierwise_lru_trace_enabled = (
             os.environ.get("VLLM_KV_TIERWISE_LRU_TRACE_ENABLE", "0") == "1"
         )
+        self.tierwise_lru_summary_enabled = (
+            os.environ.get("VLLM_KV_TIERWISE_LRU_SUMMARY_ENABLE", "1") == "1"
+        )
+        self.tierwise_lru_summary_interval = int(
+            os.environ.get("VLLM_KV_TIERWISE_LRU_SUMMARY_INTERVAL", "1000")
+        )
+        if self.tierwise_lru_summary_interval < 0:
+            raise ValueError(
+                "VLLM_KV_TIERWISE_LRU_SUMMARY_INTERVAL must be >= 0"
+            )
         self.tierwise_lru_tiers: tuple[str, ...] = ()
         self._tierwise_lru_warned_unknown_tiers: set[str] = set()
+        self._tierwise_lru_warned_missing_importance = False
         self._tierwise_lru_stats: dict[str, dict[str, int]] = {}
+        self._tierwise_lru_scalar_stats: dict[str, int] = {}
+        self._tierwise_lru_next_summary_release = 0
 
         if tierwise_requested and not self.enable_kv_importance:
             logger.warning(
@@ -346,8 +360,21 @@ class BlockPool:
                 name: {tier: 0 for tier in tiers}
                 for name in ("assignments", "releases", "hits", "victims")
             }
+            self._tierwise_lru_scalar_stats = {
+                "unused_allocations": 0,
+                "missing_tier_releases": 0,
+            }
+            if self.tierwise_lru_summary_interval > 0:
+                self._tierwise_lru_next_summary_release = (
+                    self.tierwise_lru_summary_interval
+                )
             logger.info(
-                "Tierwise GPU KV LRU enabled; tiers_fast_to_slow=%s", tiers
+                "Tierwise GPU KV LRU enabled; tiers_fast_to_slow=%s "
+                "trace=%s summary=%s summary_interval_releases=%d",
+                tiers,
+                self.tierwise_lru_trace_enabled,
+                self.tierwise_lru_summary_enabled,
+                self.tierwise_lru_summary_interval,
             )
 
         self.num_gpu_blocks = num_gpu_blocks
@@ -382,6 +409,11 @@ class BlockPool:
 
         self.metrics_collector = metrics_collector
 
+        # Detailed per-block tracing is intentionally optional. Aggregate
+        # summaries stay available for large experiments even with trace=0.
+        if self.enable_tierwise_lru and self.tierwise_lru_summary_enabled:
+            atexit.register(self._tierwise_lru_log_summary, "shutdown")
+
     def _tierwise_lru_trace(self, event: str, **fields: Any) -> None:
         if not self.tierwise_lru_trace_enabled:
             return
@@ -392,6 +424,44 @@ class BlockPool:
         if not self.enable_tierwise_lru:
             return
         self._tierwise_lru_stats[kind][tier] += 1
+
+    def _tierwise_lru_log_summary(self, reason: str) -> None:
+        if not (self.enable_tierwise_lru and self.tierwise_lru_summary_enabled):
+            return
+        queue_lengths = (
+            self.free_block_queue.queue_lengths()
+            if isinstance(self.free_block_queue, _TieredFreeKVCacheBlockQueue)
+            else {}
+        )
+        logger.info(
+            "[VLLM_KV_TIERWISE_LRU_SUMMARY] reason=%s "
+            "assignments=%s hits=%s releases=%s victims=%s "
+            "unused_allocations=%d missing_tier_releases=%d queues=%s",
+            reason,
+            self._tierwise_lru_stats["assignments"],
+            self._tierwise_lru_stats["hits"],
+            self._tierwise_lru_stats["releases"],
+            self._tierwise_lru_stats["victims"],
+            self._tierwise_lru_scalar_stats["unused_allocations"],
+            self._tierwise_lru_scalar_stats["missing_tier_releases"],
+            queue_lengths,
+        )
+
+    def _tierwise_lru_maybe_log_periodic_summary(self) -> None:
+        if not (
+            self.enable_tierwise_lru
+            and self.tierwise_lru_summary_enabled
+            and self.tierwise_lru_summary_interval > 0
+        ):
+            return
+        releases = sum(self._tierwise_lru_stats["releases"].values())
+        if releases < self._tierwise_lru_next_summary_release:
+            return
+        self._tierwise_lru_log_summary("periodic")
+        while self._tierwise_lru_next_summary_release <= releases:
+            self._tierwise_lru_next_summary_release += (
+                self.tierwise_lru_summary_interval
+            )
 
     def _effective_tier(self, tier: str) -> str:
         normalized = str(tier).strip().lower()
@@ -416,6 +486,14 @@ class BlockPool:
         if tier is None:
             # Missing importance is deliberately fail-open for experimentation:
             # make it maximally evictable rather than crashing the scheduler.
+            if not self._tierwise_lru_warned_missing_importance:
+                logger.warning(
+                    "Tierwise GPU KV LRU encountered cached content without "
+                    "importance metadata; falling back to slowest tier=%s. "
+                    "See missing_tier_releases in aggregate summaries.",
+                    self.tierwise_lru_tiers[-1],
+                )
+                self._tierwise_lru_warned_missing_importance = True
             return self.tierwise_lru_tiers[-1]
         return self._effective_tier(tier)
 
@@ -604,22 +682,25 @@ class BlockPool:
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
             for block in ret:
-                if self.enable_tierwise_lru and block.block_hash is not None:
-                    tier = self._tier_for_free_block(block)
-                    self._tierwise_lru_bump("victims", tier)
-                    queue_lengths = (
-                        self.free_block_queue.queue_lengths()
-                        if isinstance(
-                            self.free_block_queue, _TieredFreeKVCacheBlockQueue
+                if self.enable_tierwise_lru:
+                    if block.block_hash is not None:
+                        tier = self._tier_for_free_block(block)
+                        self._tierwise_lru_bump("victims", tier)
+                        queue_lengths = (
+                            self.free_block_queue.queue_lengths()
+                            if isinstance(
+                                self.free_block_queue, _TieredFreeKVCacheBlockQueue
+                            )
+                            else {}
                         )
-                        else {}
-                    )
-                    self._tierwise_lru_trace(
-                        "victim",
-                        block=block.block_id,
-                        tier=tier,
-                        queues=queue_lengths,
-                    )
+                        self._tierwise_lru_trace(
+                            "victim",
+                            block=block.block_id,
+                            tier=tier,
+                            queues=queue_lengths,
+                        )
+                    else:
+                        self._tierwise_lru_scalar_stats["unused_allocations"] += 1
                 self._maybe_evict_cached_block(block)
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
@@ -724,6 +805,10 @@ class BlockPool:
                         # Partial/unhashed content is not a reusable cache entry.
                         self.kv_importance_by_block_id.pop(block.block_id, None)
                     elif not block.is_null:
+                        if block.block_id not in self.kv_importance_by_block_id:
+                            self._tierwise_lru_scalar_stats[
+                                "missing_tier_releases"
+                            ] += 1
                         tier = self._tier_for_free_block(block)
                         self._tierwise_lru_bump("releases", tier)
                         self._tierwise_lru_trace(
@@ -739,6 +824,7 @@ class BlockPool:
         self.free_block_queue.append_n(
             [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
         )
+        self._tierwise_lru_maybe_log_periodic_summary()
 
 
     def evict_blocks(self, block_ids: set[int]) -> None:
@@ -786,6 +872,7 @@ class BlockPool:
             block.reset_hash()
 
         if self.enable_tierwise_lru:
+            self._tierwise_lru_log_summary("reset")
             self.kv_importance_by_block_id.clear()
             if not isinstance(
                 self.free_block_queue, _TieredFreeKVCacheBlockQueue
