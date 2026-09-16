@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 import os
 from typing import Any
 
@@ -28,6 +28,154 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+class _TieredFreeKVCacheBlockQueue:
+    """[SC] Experimental tier-partitioned replacement for the free-block queue.
+
+    Truly unused/unhashed blocks are consumed before any cached victim. Cached
+    eviction candidates are split into one LRU queue per configured tier. The
+    tier list is configured fastest -> slowest, while allocation/eviction scans
+    it in reverse so the slowest non-empty tier loses first.
+
+    This class deliberately mirrors only the FreeKVCacheBlockQueue interface
+    used by BlockPool in the supported experiment. Gate-off continues to use
+    the vanilla FreeKVCacheBlockQueue directly.
+    """
+
+    _UNUSED = "__unused__"
+
+    def __init__(
+        self,
+        blocks: list[KVCacheBlock],
+        tiers_fast_to_slow: tuple[str, ...],
+        tier_for_block: Callable[[KVCacheBlock], str],
+    ) -> None:
+        if not tiers_fast_to_slow:
+            raise ValueError("Tierwise KV LRU requires at least one active tier")
+        self.tiers_fast_to_slow = tiers_fast_to_slow
+        self._tier_for_block = tier_for_block
+        self._unused_queue = FreeKVCacheBlockQueue(blocks)
+        self._tier_queues = {
+            tier: FreeKVCacheBlockQueue([]) for tier in tiers_fast_to_slow
+        }
+        self._location_by_block_id = {
+            block.block_id: self._UNUSED for block in blocks
+        }
+
+    @property
+    def num_free_blocks(self) -> int:
+        return self._unused_queue.num_free_blocks + sum(
+            queue.num_free_blocks for queue in self._tier_queues.values()
+        )
+
+    def _queue_for_location(self, location: str) -> FreeKVCacheBlockQueue:
+        if location == self._UNUSED:
+            return self._unused_queue
+        return self._tier_queues[location]
+
+    def popleft(self) -> KVCacheBlock:
+        if self._unused_queue.num_free_blocks:
+            location = self._UNUSED
+            queue = self._unused_queue
+        else:
+            location = ""
+            queue = None
+            for tier in reversed(self.tiers_fast_to_slow):
+                candidate = self._tier_queues[tier]
+                if candidate.num_free_blocks:
+                    location = tier
+                    queue = candidate
+                    break
+            if queue is None:
+                if self.num_free_blocks != 0:
+                    raise RuntimeError(
+                        "Tierwise free-block count is inconsistent with its queues"
+                    )
+                raise ValueError("No free blocks available")
+
+        block = queue.popleft()
+        recorded = self._location_by_block_id.pop(block.block_id, None)
+        if recorded != location:
+            raise RuntimeError(
+                "Tierwise free-block membership is inconsistent: "
+                f"block={block.block_id} expected={location} recorded={recorded}"
+            )
+        return block
+
+    def popleft_n(self, n: int) -> list[KVCacheBlock]:
+        if n == 0:
+            return []
+        if n > self.num_free_blocks:
+            raise ValueError(f"Cannot pop {n} blocks from {self.num_free_blocks}")
+        return [self.popleft() for _ in range(n)]
+
+    def remove(self, block: KVCacheBlock) -> None:
+        location = self._location_by_block_id.pop(block.block_id, None)
+        if location is None:
+            raise RuntimeError(
+                f"remove() called on block not in tierwise free queues: {block}"
+            )
+        self._queue_for_location(location).remove(block)
+
+    def append(self, block: KVCacheBlock) -> None:
+        if block.block_id in self._location_by_block_id:
+            raise RuntimeError(
+                f"Block {block.block_id} is already in a tierwise free queue"
+            )
+        if block.block_hash is None:
+            location = self._UNUSED
+        else:
+            location = self._tier_for_block(block)
+            if location not in self._tier_queues:
+                raise RuntimeError(
+                    f"Resolved inactive tier {location!r} for block {block.block_id}"
+                )
+        self._queue_for_location(location).append(block)
+        self._location_by_block_id[block.block_id] = location
+
+    def append_n(self, blocks: list[KVCacheBlock]) -> None:
+        # Preserve the caller-provided (tail-first/LRU) order within each tier.
+        for block in blocks:
+            self.append(block)
+
+    def get_all_free_blocks(self) -> list[KVCacheBlock]:
+        # Return the order allocation would use: truly unused capacity first,
+        # then cached victims from slowest tier to fastest tier.
+        ret = self._unused_queue.get_all_free_blocks()
+        for tier in reversed(self.tiers_fast_to_slow):
+            ret.extend(self._tier_queues[tier].get_all_free_blocks())
+        return ret
+
+    def queue_lengths(self) -> dict[str, int]:
+        lengths = {
+            tier: self._tier_queues[tier].num_free_blocks
+            for tier in self.tiers_fast_to_slow
+        }
+        lengths[self._UNUSED] = self._unused_queue.num_free_blocks
+        return lengths
+
+    def reclassify_as_unused_if_queued(self, block: KVCacheBlock) -> None:
+        """Move an explicitly evicted free block back to unused capacity."""
+        location = self._location_by_block_id.get(block.block_id)
+        if location is None or location == self._UNUSED:
+            return
+        self._tier_queues[location].remove(block)
+        self._unused_queue.append(block)
+        self._location_by_block_id[block.block_id] = self._UNUSED
+
+    def reset_as_unused(self, blocks: list[KVCacheBlock]) -> None:
+        # reset_prefix_cache() is only allowed when every non-null block is free.
+        # Rebuild the queue topology after hashes/tier metadata are cleared.
+        for block in blocks:
+            block.prev_free_block = None
+            block.next_free_block = None
+        self._unused_queue = FreeKVCacheBlockQueue(blocks)
+        self._tier_queues = {
+            tier: FreeKVCacheBlockQueue([]) for tier in self.tiers_fast_to_slow
+        }
+        self._location_by_block_id = {
+            block.block_id: self._UNUSED for block in blocks
+        }
 
 
 class BlockHashToBlockMap:
@@ -160,6 +308,48 @@ class BlockPool:
         )
         self.kv_importance_by_block_id = {} # [SY]
 
+        tierwise_requested = (
+            os.environ.get("VLLM_KV_TIERWISE_LRU_ENABLE", "0") == "1"
+        )
+        self.enable_tierwise_lru = tierwise_requested and self.enable_kv_importance
+        self.tierwise_lru_trace_enabled = (
+            os.environ.get("VLLM_KV_TIERWISE_LRU_TRACE_ENABLE", "0") == "1"
+        )
+        self.tierwise_lru_tiers: tuple[str, ...] = ()
+        self._tierwise_lru_warned_unknown_tiers: set[str] = set()
+        self._tierwise_lru_stats: dict[str, dict[str, int]] = {}
+
+        if tierwise_requested and not self.enable_kv_importance:
+            logger.warning(
+                "VLLM_KV_TIERWISE_LRU_ENABLE=1 requires "
+                "VLLM_KV_IMPORTANCE_ENABLE=1; using vanilla free-block LRU"
+            )
+
+        if self.enable_tierwise_lru:
+            raw_tiers = os.environ.get(
+                "VLLM_KV_TIERWISE_LRU_TIERS", "gpu,cpu,disk"
+            )
+            tiers = tuple(
+                tier.strip().lower() for tier in raw_tiers.split(",") if tier.strip()
+            )
+            if not tiers:
+                raise ValueError(
+                    "VLLM_KV_TIERWISE_LRU_TIERS must contain at least one tier"
+                )
+            if len(set(tiers)) != len(tiers):
+                raise ValueError(
+                    "VLLM_KV_TIERWISE_LRU_TIERS contains duplicate tiers: "
+                    f"{tiers}"
+                )
+            self.tierwise_lru_tiers = tiers
+            self._tierwise_lru_stats = {
+                name: {tier: 0 for tier in tiers}
+                for name in ("assignments", "releases", "hits", "victims")
+            }
+            logger.info(
+                "Tierwise GPU KV LRU enabled; tiers_fast_to_slow=%s", tiers
+            )
+
         self.num_gpu_blocks = num_gpu_blocks
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
@@ -167,10 +357,16 @@ class BlockPool:
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
         ]
-        # Free block queue that constructs and manipulates a doubly linked
-        # list of free blocks (including eviction candidates when caching is
-        # enabled).
-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        # Gate-off is intentionally the existing vanilla queue. Gate-on keeps
+        # truly unused blocks separate and partitions cached victims by tier.
+        if self.enable_tierwise_lru:
+            self.free_block_queue = _TieredFreeKVCacheBlockQueue(
+                self.blocks,
+                self.tierwise_lru_tiers,
+                self._tier_for_free_block,
+            )
+        else:
+            self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
@@ -185,6 +381,43 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+
+    def _tierwise_lru_trace(self, event: str, **fields: Any) -> None:
+        if not self.tierwise_lru_trace_enabled:
+            return
+        payload = " ".join(f"{key}={value}" for key, value in fields.items())
+        logger.warning("[VLLM_KV_TIERWISE_LRU] event=%s %s", event, payload)
+
+    def _tierwise_lru_bump(self, kind: str, tier: str) -> None:
+        if not self.enable_tierwise_lru:
+            return
+        self._tierwise_lru_stats[kind][tier] += 1
+
+    def _effective_tier(self, tier: str) -> str:
+        normalized = str(tier).strip().lower()
+        if normalized in self.tierwise_lru_tiers:
+            return normalized
+
+        # Full-sacrifice behavior: an unavailable/unknown predicted tier maps to
+        # the slowest enabled tier instead of failing (e.g. disk-disabled runs).
+        fallback = self.tierwise_lru_tiers[-1]
+        if normalized not in self._tierwise_lru_warned_unknown_tiers:
+            logger.warning(
+                "KV importance tier %r is not active in %s; mapping it to %r",
+                normalized,
+                self.tierwise_lru_tiers,
+                fallback,
+            )
+            self._tierwise_lru_warned_unknown_tiers.add(normalized)
+        return fallback
+
+    def _tier_for_free_block(self, block: KVCacheBlock) -> str:
+        tier = self.kv_importance_by_block_id.get(block.block_id)
+        if tier is None:
+            # Missing importance is deliberately fail-open for experimentation:
+            # make it maximally evictable rather than crashing the scheduler.
+            return self.tierwise_lru_tiers[-1]
+        return self._effective_tier(tier)
 
     def set_block_importance(self, block_id, tier: str) -> None:
         if not self.enable_kv_importance:
@@ -201,8 +434,29 @@ class BlockPool:
         if hasattr(block_id, "block_id"):
             block_id = block_id.block_id
 
-        self.kv_importance_by_block_id[int(block_id)] = str(tier)
+        block_id = int(block_id)
+        if not self.enable_tierwise_lru:
+            # The new gate is a true vanilla control: no vLLM importance
+            # metadata or release-order modification when tierwise LRU is off.
+            return
 
+        effective_tier = self._effective_tier(tier)
+        existing = self.kv_importance_by_block_id.get(block_id)
+        if existing is None:
+            self.kv_importance_by_block_id[block_id] = effective_tier
+            self._tierwise_lru_bump("assignments", effective_tier)
+            self._tierwise_lru_trace(
+                "assign", block=block_id, tier=effective_tier
+            )
+        elif existing != effective_tier:
+            # Full-sacrifice policy: cached-content tier is immutable. A later
+            # request reusing the same physical cached content cannot migrate it.
+            self._tierwise_lru_trace(
+                "ignore_reassign",
+                block=block_id,
+                existing=existing,
+                requested=effective_tier,
+            )
 
     def get_block_importance_rank(self, block) -> int:
         if not self.enable_kv_importance:
@@ -350,6 +604,22 @@ class BlockPool:
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
             for block in ret:
+                if self.enable_tierwise_lru and block.block_hash is not None:
+                    tier = self._tier_for_free_block(block)
+                    self._tierwise_lru_bump("victims", tier)
+                    queue_lengths = (
+                        self.free_block_queue.queue_lengths()
+                        if isinstance(
+                            self.free_block_queue, _TieredFreeKVCacheBlockQueue
+                        )
+                        else {}
+                    )
+                    self._tierwise_lru_trace(
+                        "victim",
+                        block=block.block_id,
+                        tier=tier,
+                        queues=queue_lengths,
+                    )
                 self._maybe_evict_cached_block(block)
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
@@ -380,7 +650,9 @@ class BlockPool:
 
         block_hash = block.block_hash
         if block_hash is None:
-            # The block doesn't have hash, eviction is not needed
+            # Uncached content does not own persistent tier metadata.
+            if self.enable_tierwise_lru:
+                self.kv_importance_by_block_id.pop(block.block_id, None)
             return False
 
         if self.cached_block_hash_to_block.pop(block_hash, block.block_id) is None:
@@ -389,6 +661,13 @@ class BlockPool:
             return False
 
         block.reset_hash()
+        if self.enable_tierwise_lru:
+            old_tier = self.kv_importance_by_block_id.pop(block.block_id, None)
+            if isinstance(self.free_block_queue, _TieredFreeKVCacheBlockQueue):
+                self.free_block_queue.reclassify_as_unused_if_queued(block)
+            self._tierwise_lru_trace(
+                "evict", block=block.block_id, old_tier=old_tier
+            )
 
         if self.enable_kv_cache_events:
             # FIXME (Chen): Not sure whether we should return `hash_value`
@@ -412,6 +691,12 @@ class BlockPool:
             blocks: A list of blocks to touch.
         """
         for block in blocks:
+            if self.enable_tierwise_lru and block.block_hash is not None:
+                tier = self._tier_for_free_block(block)
+                self._tierwise_lru_bump("hits", tier)
+                self._tierwise_lru_trace(
+                    "hit", block=block.block_id, tier=tier, ref_cnt=block.ref_cnt
+                )
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
@@ -430,15 +715,27 @@ class BlockPool:
         """
         # Materialize the iterable to allow multiple passes.
         blocks_list = list(ordered_blocks)
-        if self.enable_kv_importance:
-            blocks_list = sorted(
-                blocks_list,
-                key=lambda b: self.get_block_importance_rank(b),
-            )
 
         for block in blocks_list:
             block.ref_cnt -= 1
-            self.kv_importance_by_block_id.pop(block.block_id, None)
+            if self.enable_tierwise_lru:
+                if block.ref_cnt == 0:
+                    if block.block_hash is None:
+                        # Partial/unhashed content is not a reusable cache entry.
+                        self.kv_importance_by_block_id.pop(block.block_id, None)
+                    elif not block.is_null:
+                        tier = self._tier_for_free_block(block)
+                        self._tierwise_lru_bump("releases", tier)
+                        self._tierwise_lru_trace(
+                            "release",
+                            block=block.block_id,
+                            tier=tier,
+                            ref_cnt=block.ref_cnt,
+                        )
+            else:
+                # Gate-off is the vanilla single-LRU control.
+                self.kv_importance_by_block_id.pop(block.block_id, None)
+
         self.free_block_queue.append_n(
             [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
         )
@@ -487,6 +784,19 @@ class BlockPool:
         # Remove all hashes from all blocks.
         for block in self.blocks:
             block.reset_hash()
+
+        if self.enable_tierwise_lru:
+            self.kv_importance_by_block_id.clear()
+            if not isinstance(
+                self.free_block_queue, _TieredFreeKVCacheBlockQueue
+            ):
+                raise RuntimeError("Tierwise LRU enabled with vanilla free queue")
+            self.free_block_queue.reset_as_unused(
+                [block for block in self.blocks if not block.is_null]
+            )
+            self._tierwise_lru_trace(
+                "reset", stats=self._tierwise_lru_stats
+            )
 
         if self.metrics_collector:
             self.metrics_collector.reset()

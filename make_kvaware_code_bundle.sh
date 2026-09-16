@@ -3,7 +3,8 @@ set -euo pipefail
 
 # Creates a targeted, full-content "gitingest-like" bundle for debugging
 # KV-Aware-vLLM / vendored LMCache / Hierarchical_KV runs in a new chat.
-# Version 7 adds adapter-dispatch, random/ReqMeta importance routing, per-chunk target-tier, and TP/disk-key coverage.
+# Version 8 retains Version-7 coverage and adds explicit vLLM BlockPool importance-lifecycle,
+# free-queue/global-priority, touch/reuse, prefix-cache, and chunk-to-block mapping coverage.
 # It intentionally excludes patch/diff/pristine-comparison artifacts from the bundle.
 #
 # LMCache is expected to live in:
@@ -377,6 +378,18 @@ if [[ -d "vllm/distributed/kv_transfer/kv_connector/v1" ]]; then
   )
 fi
 
+# vLLM tests that help reason about BlockPool/free-queue/prefix-cache behavior.
+if [[ -d "tests/v1/core" ]]; then
+  append_existing_files_from_find < <(
+    find tests/v1/core -maxdepth 3 -type f -name '*.py' \
+      \( \
+        -iname '*block*' -o \
+        -iname '*kv_cache*' -o \
+        -iname '*prefix*' \
+      \) | sort
+  )
+fi
+
 # ---------------------------------------------------------------------------
 # Vendored LMCache source. This is authoritative even when Python import
 # metadata is stale or the editable installation is temporarily broken.
@@ -494,7 +507,7 @@ section "CURATED PATH EXISTENCE SNAPSHOT"
 
 section "GREP SUMMARY: lifecycle, adapter dispatch, importance routing, storage placement, and settings"
 grep -R \
-  "SC_LMCACHE_\|SC_IO_\|SC_LOAD_\|SC_MEMORY_\|SC_SCHEDULER_\|SC_WORKER_\|SC_DISK_PUT_\|SC_DRIVER_\|SC_LMCACHE_DATA_DIR\|PVTSC\|SERIALIZER_FAIRNESS\|CPU_BURST_RATIO\|RESIDENT_PUT_DEDUP\|COLD_WARM_PUT_BARRIER\|readinto\|AsyncPQThreadPoolExecutor\|proc_io_delta\|GRID_RUN_\|GRID_CONFIG_SHA256\|SRIRAM_REQDBG\|SRIRAM_LOOKUPDBG\|SRIRAM_MONITOR\|SRIRAM_MEMDBG\|KVDBG_\|KVIO_\|VLLM_KV_IMPORTANCE\|kv_importance_tiers\|set_block_importance\|allocate_new_computed_blocks\|num_external_computed_tokens\|to_gpu\|multi_layer_kv_transfer\|SC_EXT_WAIT_CRITICAL\|critical_wait\|max_num_seqs\|submission_batch_size\|enable_async_loading\|lookup_timeout_ms\|pin_timeout_sec\|local_disk\|max_local_disk_size\|SRIRAM_LMCACHE_DIR\|LMCACHE_P0_CLIENT_LOOKUP_MAX_INFLIGHT\|LMCACHE_P0_CLIENT_LOOKUP_ADMISSION_TIMEOUT_MS\|LMCACHE_P0_LOOKUP_MAX_INFLIGHT\|LMCACHE_P0_DISK_PUT_MAX_PENDING\|P0_CLIENT_LOOKUP_ADMISSION\|P0_LOOKUP_ADMISSION\|P0_PUT_ADMISSION\|use_native\|Initializing native LMCache connector\|Initializing latest dev LMCache connector\|target_tiers\|_get_target_tiers_for_request\|_put_with_optional_target_tiers\|importance_to_tier\|ReqMeta\|pop_importance\|random.randint\|store_location\|locations=\|location=\|_key_to_path\|CacheEngineKey\|worker_id\|chunk_size\|num_kv_head" \
+  "SC_LMCACHE_\|SC_IO_\|SC_LOAD_\|SC_MEMORY_\|SC_SCHEDULER_\|SC_WORKER_\|SC_DISK_PUT_\|SC_DRIVER_\|SC_LMCACHE_DATA_DIR\|PVTSC\|SERIALIZER_FAIRNESS\|CPU_BURST_RATIO\|RESIDENT_PUT_DEDUP\|COLD_WARM_PUT_BARRIER\|readinto\|AsyncPQThreadPoolExecutor\|proc_io_delta\|GRID_RUN_\|GRID_CONFIG_SHA256\|SRIRAM_REQDBG\|SRIRAM_LOOKUPDBG\|SRIRAM_MONITOR\|SRIRAM_MEMDBG\|KVDBG_\|KVIO_\|VLLM_KV_IMPORTANCE\|kv_importance_tiers\|kv_importance_by_block_id\|set_block_importance\|get_block_importance_rank\|free_blocks\|free_block_queue\|FreeKVCacheBlockQueue\|append_n\|popleft_n\|_maybe_evict_cached_block\|reset_hash\|block_hash\|def touch\|ref_cnt\|allocate_new_computed_blocks\|num_external_computed_tokens\|to_gpu\|multi_layer_kv_transfer\|SC_EXT_WAIT_CRITICAL\|critical_wait\|max_num_seqs\|submission_batch_size\|enable_async_loading\|lookup_timeout_ms\|pin_timeout_sec\|local_disk\|max_local_disk_size\|SRIRAM_LMCACHE_DIR\|LMCACHE_P0_CLIENT_LOOKUP_MAX_INFLIGHT\|LMCACHE_P0_CLIENT_LOOKUP_ADMISSION_TIMEOUT_MS\|LMCACHE_P0_LOOKUP_MAX_INFLIGHT\|LMCACHE_P0_DISK_PUT_MAX_PENDING\|P0_CLIENT_LOOKUP_ADMISSION\|P0_LOOKUP_ADMISSION\|P0_PUT_ADMISSION\|use_native\|Initializing native LMCache connector\|Initializing latest dev LMCache connector\|target_tiers\|_get_target_tiers_for_request\|_put_with_optional_target_tiers\|GNN_KV_BLOCK_SIZE\|vllm_block_size\|chunk_start\|chunk_end\|importance_to_tier\|ReqMeta\|pop_importance\|random.randint\|store_location\|locations=\|location=\|_key_to_path\|CacheEngineKey\|worker_id\|chunk_size\|num_kv_head" \
   -n local_repro vllm Hierarchical_KV third_party/LMCache \
   lmcache_hit_hook.py kvcache_monitor.py kvcache_visualize.py lmcache_config.yaml \
   2>/dev/null >> "$OUT" || true

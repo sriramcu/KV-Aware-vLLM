@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
@@ -11,7 +12,7 @@ from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
 
@@ -106,6 +107,7 @@ class KVCacheManager:
         metrics_collector: KVCacheMetricsCollector | None = None,
     ) -> None:
         self.max_model_len = max_model_len
+        self.hash_block_size = hash_block_size
 
         self.enable_caching = enable_caching
         self.use_eagle = use_eagle
@@ -130,6 +132,19 @@ class KVCacheManager:
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
+
+        if getattr(self.block_pool, "enable_tierwise_lru", False):
+            if self.use_eagle:
+                raise ValueError(
+                    "Tierwise LRU experimental mode does not support EAGLE"
+                )
+            if self.num_kv_cache_groups != 1 or not isinstance(
+                kv_cache_config.kv_cache_groups[0].kv_cache_spec, FullAttentionSpec
+            ):
+                raise ValueError(
+                    "Tierwise LRU experimental mode currently supports only "
+                    "one FullAttention KV-cache group"
+                )
 
         # Pre-constructed KVCacheBlocks with no blocks, callers should use this
         # via create_kv_cache_blocks instead of creating new ones to avoid GC
@@ -208,6 +223,20 @@ class KVCacheManager:
 
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
 
+    @staticmethod
+    def _vote_chunk_tier_disk_majority(block_tiers: list[str]) -> str:
+        """Mirror the current LMCache 512-token chunk voting policy."""
+        normalized = [str(tier).lower() for tier in block_tiers]
+        invalid = set(normalized) - {"disk", "cpu", "gpu"}
+        if invalid:
+            raise ValueError(f"Unknown KV importance tiers: {sorted(invalid)}")
+        disk_count = normalized.count("disk")
+        if 2 * disk_count > len(normalized):
+            return "disk"
+        cpu_count = normalized.count("cpu")
+        gpu_count = normalized.count("gpu")
+        return "gpu" if gpu_count >= cpu_count else "cpu"
+
     def _set_importance_for_request_blocks(self, request: Request) -> None:
         if not getattr(self.block_pool, "enable_kv_importance", False):
             return
@@ -218,11 +247,55 @@ class KVCacheManager:
 
         block_ids_by_group = self.get_block_ids(request.request_id)
 
+        if not getattr(self.block_pool, "enable_tierwise_lru", False):
+            # Gate-off is a true vanilla vLLM prefix-cache control. The sidecar
+            # may still be consumed by LMCache, but it does not alter GPU LRU.
+            return
+
+        # Full-sacrifice experiment: use the same logical tier for every vLLM
+        # block inside one LMCache chunk. Current supported scope uses 16-token
+        # GNN/vLLM blocks and 512-token LMCache chunks (32 blocks per chunk).
+        gnn_block_size = int(os.environ.get("GNN_KV_BLOCK_SIZE", "16"))
+        chunk_size = int(
+            os.environ.get("VLLM_KV_TIERWISE_LRU_CHUNK_SIZE", "512")
+        )
+        if self.hash_block_size != gnn_block_size:
+            raise ValueError(
+                "Tierwise LRU experimental mode requires hash/vLLM block size "
+                f"to match GNN block size; got hash={self.hash_block_size}, "
+                f"gnn={gnn_block_size}"
+            )
+        if chunk_size <= 0 or chunk_size % gnn_block_size != 0:
+            raise ValueError(
+                "VLLM_KV_TIERWISE_LRU_CHUNK_SIZE must be a positive multiple "
+                f"of GNN_KV_BLOCK_SIZE; got chunk={chunk_size}, "
+                f"gnn={gnn_block_size}"
+            )
+
+        blocks_per_chunk = chunk_size // gnn_block_size
+        max_tier_block_idx = max(tiers)
+        voted_tier_by_chunk: dict[int, str] = {}
         for group_block_ids in block_ids_by_group:
             for logical_block_idx, block_id in enumerate(group_block_ids):
-                tier = tiers.get(logical_block_idx)
-                if tier is not None:
-                    self.block_pool.set_block_importance(block_id, tier)
+                chunk_idx = logical_block_idx // blocks_per_chunk
+                if chunk_idx not in voted_tier_by_chunk:
+                    first = chunk_idx * blocks_per_chunk
+                    if first > max_tier_block_idx:
+                        continue
+                    # Do not pad the final partial prompt chunk out to 512
+                    # tokens; LMCache votes only over blocks that belong to the
+                    # actual chunk extent. Missing labels inside that extent use
+                    # the same CPU fallback as the LMCache adapter.
+                    last = min(first + blocks_per_chunk, max_tier_block_idx + 1)
+                    chunk_tiers = [
+                        str(tiers.get(i, "cpu")) for i in range(first, last)
+                    ]
+                    voted_tier_by_chunk[chunk_idx] = (
+                        self._vote_chunk_tier_disk_majority(chunk_tiers)
+                    )
+                voted_tier = voted_tier_by_chunk.get(chunk_idx)
+                if voted_tier is not None:
+                    self.block_pool.set_block_importance(block_id, voted_tier)
 
 
     def allocate_slots(
