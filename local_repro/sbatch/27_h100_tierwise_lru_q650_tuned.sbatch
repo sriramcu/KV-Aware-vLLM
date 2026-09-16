@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=tier_lru
+#SBATCH --job-name=tier_lru_q650_tuned
 #SBATCH --partition=gpu-h100-dchen
 #SBATCH --time=06:00:00
 #SBATCH --nodes=1
@@ -23,13 +23,12 @@ export PYTHONPATH="$REPO:${PYTHONPATH:-}"
 export PYTHONFAULTHANDLER=1
 
 # ------------------------------------------------------------
-# Workload
+# Workload — match historical Q650 configuration
 # ------------------------------------------------------------
 export DATASET_NAME=medical
-# change for larger runs
-export MAX_QUESTIONS=50
-export SUBMISSION_BATCH_SIZE=50
-export VLLM_MAX_NUM_SEQS=4
+export MAX_QUESTIONS=650
+export SUBMISSION_BATCH_SIZE=650
+export VLLM_MAX_NUM_SEQS=16
 
 # ------------------------------------------------------------
 # GNN placement / importance
@@ -46,61 +45,105 @@ export VLLM_KV_TIERWISE_LRU_ENABLE=1
 export VLLM_KV_TIERWISE_LRU_TIERS=gpu,cpu,disk
 export VLLM_KV_TIERWISE_LRU_CHUNK_SIZE=512
 
-# Detailed per-block trace.
-# Keep =1 for this post-fix 8-question validation run.
-# Set =0 for larger runs.
+# No per-block logging for Q650.
 export VLLM_KV_TIERWISE_LRU_TRACE_ENABLE=0
 
-# Aggregate statistics.
-# Keep enabled even for large runs.
+# Keep aggregate eviction statistics.
 export VLLM_KV_TIERWISE_LRU_SUMMARY_ENABLE=1
 export VLLM_KV_TIERWISE_LRU_SUMMARY_INTERVAL=1000
 
 # ------------------------------------------------------------
-# LMCache
+# LMCache base configuration
 # ------------------------------------------------------------
 export SC_LMCACHE_PROFILE=vanilla
 export SC_LMCACHE_MAX_LOCAL_CPU_SIZE=20
+
 export SC_LMCACHE_LOCAL_DISK_ENABLE=1
-export SC_LMCACHE_MAX_LOCAL_DISK_SIZE=100
-export SC_LMCACHE_DATA_DIR="$SCRATCH2_ROOT/kvaware_tierlru_${SLURM_JOB_ID}"
+export SC_LMCACHE_MAX_LOCAL_DISK_SIZE=450
+export SC_LMCACHE_DATA_DIR="$SCRATCH2_ROOT/kvaware_tierlru_q650_tuned_${SLURM_JOB_ID}"
 
 export LMCACHE_LOOKUP_TIMEOUT_MS=3000
-export CLEAN_OLD_LMCACHE=0
+export CLEAN_OLD_LMCACHE=1
 
-# Keep LMCache tier trace ON for this small validation run so we can
-# compare its gpu/cpu/disk chunk votes against vLLM assignments.
-# Set =0 for larger runs.
+# ------------------------------------------------------------
+# Historical tuned bundle
+#
+# K4 scheduler admission
+# R16 serializer fairness
+# cold -> warm PUT barrier
+# PVTSC
+# 4 MiB within-file PVTSC
+# ------------------------------------------------------------
+
+# K4
+export SC_LMCACHE_SCHEDULER_LOOKUP_ADMISSION_ENABLE=1
+export SC_LMCACHE_SCHEDULER_LOOKUP_MAX_INFLIGHT=4
+export SC_LMCACHE_SCHEDULER_LOOKUP_ADMISSION_WAIT_MS=0
+
+# R16
+export SC_LMCACHE_SERIALIZER_FAIRNESS_ENABLE=1
+export SC_LMCACHE_SERIALIZER_CPU_BURST_RATIO=16
+
+# Cold -> warm disk PUT drain
+export SC_LMCACHE_COLD_WARM_PUT_BARRIER_ENABLE=1
+
+# PVTSC
+export SC_LMCACHE_PVTSC_ENABLE=1
+export SC_LMCACHE_PVTSC_WITHIN_FILE_ENABLE=1
+export SC_LMCACHE_PVTSC_READ_CHUNK_MIB=4
+
+# Keep these at historical tuned behavior.
+export SC_LMCACHE_WORKER_LOOKUP_ADMISSION_ENABLE=0
+export SC_LMCACHE_DISK_PUT_ADMISSION_ENABLE=0
+export SC_LMCACHE_DISK_RESIDENT_PUT_DEDUP_ENABLE=0
+
+# ------------------------------------------------------------
+# Disable verbose LMCache diagnostics for timed Q650 run
+# ------------------------------------------------------------
 export SC_LMCACHE_TIER_TRACE_ENABLE=0
-
 export SC_LMCACHE_IO_TRACE_ENABLE=0
 export SC_LMCACHE_LOAD_TRACE_ENABLE=0
 export SC_LMCACHE_MEMORY_TRACE_ENABLE=0
 export SC_LMCACHE_LIFECYCLE_TRACE_ENABLE=0
+export SC_LMCACHE_DISK_PUT_RESIDENCY_TRACE_ENABLE=0
 
-# Fill in remaining defaults without overriding explicit values above.
+# Validate explicit values and fill unrelated defaults.
 source "$REPO/local_repro/sc_lmcache_knobs.sh"
 
 echo "============================================================"
-echo "TIERWISE LRU TEST"
+echo "Q650 TIERWISE LRU + TUNED LMCACHE"
 echo "job                     = ${SLURM_JOB_ID}"
 echo "host                    = $(hostname)"
+echo "dataset                 = $DATASET_NAME"
 echo "questions               = $MAX_QUESTIONS"
 echo "submission batch        = $SUBMISSION_BATCH_SIZE"
 echo "max_num_seqs            = $VLLM_MAX_NUM_SEQS"
+echo "CPU LMCache/rank        = $SC_LMCACHE_MAX_LOCAL_CPU_SIZE GiB"
+echo "disk limit              = $SC_LMCACHE_MAX_LOCAL_DISK_SIZE GiB"
+echo "LMCache data dir        = $SC_LMCACHE_DATA_DIR"
+echo
 echo "tierwise LRU            = $VLLM_KV_TIERWISE_LRU_ENABLE"
 echo "tiers                   = $VLLM_KV_TIERWISE_LRU_TIERS"
 echo "tier chunk size         = $VLLM_KV_TIERWISE_LRU_CHUNK_SIZE"
 echo "tierwise trace          = $VLLM_KV_TIERWISE_LRU_TRACE_ENABLE"
 echo "tierwise summary        = $VLLM_KV_TIERWISE_LRU_SUMMARY_ENABLE"
-echo "summary interval        = $VLLM_KV_TIERWISE_LRU_SUMMARY_INTERVAL"
-echo "LMCache tier trace      = $SC_LMCACHE_TIER_TRACE_ENABLE"
-echo "LMCache data dir        = $SC_LMCACHE_DATA_DIR"
+echo
+echo "scheduler admission     = $SC_LMCACHE_SCHEDULER_LOOKUP_ADMISSION_ENABLE"
+echo "scheduler max inflight  = $SC_LMCACHE_SCHEDULER_LOOKUP_MAX_INFLIGHT"
+echo "serializer fairness     = $SC_LMCACHE_SERIALIZER_FAIRNESS_ENABLE"
+echo "CPU burst ratio         = $SC_LMCACHE_SERIALIZER_CPU_BURST_RATIO"
+echo "cold-warm PUT barrier   = $SC_LMCACHE_COLD_WARM_PUT_BARRIER_ENABLE"
+echo "PVTSC                   = $SC_LMCACHE_PVTSC_ENABLE"
+echo "within-file PVTSC       = $SC_LMCACHE_PVTSC_WITHIN_FILE_ENABLE"
+echo "PVTSC chunk MiB         = $SC_LMCACHE_PVTSC_READ_CHUNK_MIB"
 echo "============================================================"
+
+echo "=== SCRATCH2 FILESYSTEM ==="
+df -h "$SCRATCH2_ROOT"
 
 nvidia-smi
 
 "$REPO/local_repro/run_driver.sh" with_gnn 2>&1
 
-echo "=== TIERWISE LRU TEST DONE ==="
+echo "=== Q650 TIERWISE LRU + TUNED LMCACHE DONE ==="
 date
