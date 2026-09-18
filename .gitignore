@@ -247,3 +247,5 @@ import/
 *.safetensors
 *.parquet
 outputs/
+
+cuda*.run

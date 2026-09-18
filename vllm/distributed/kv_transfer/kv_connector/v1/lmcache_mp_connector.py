@@ -103,7 +103,7 @@ def create_scheduler_adapter(
         vllm_config,
     )
     return LMCacheMPSchedulerAdapter(
-        server_url,
+        [server_url],
         zmq_context,
         vllm_config.model_config.model,
         world_size,
@@ -282,15 +282,18 @@ class LMCacheMPRequestMetadata:
         if num_chunks >= 1:
             start = tracker.num_stored_blocks
             end = start + num_chunks * blocks_in_chunk
-            block_hashes = convert_block_hashes_to_bytes(
-                tracker.block_hashes[start:end]
-            )
             block_ids = tracker.allocated_block_ids[start:end]
+            token_ids = list(tracker.all_token_ids)
 
             ret = LMCacheMPRequestMetadata(
                 request_id=tracker.request_id,
                 direction="STORE",
-                op=LoadStoreOp(block_hashes=block_hashes, block_ids=block_ids),
+                op=LoadStoreOp(
+                    token_ids=token_ids,
+                    block_ids=[block_ids],
+                    start=start * vllm_block_size,
+                    end=end * vllm_block_size,
+                ),
             )
 
             # Update the request tracker
@@ -303,6 +306,7 @@ class LMCacheMPRequestMetadata:
     def GetRetrieveMetadata(
         tracker: LMCacheMPRequestTracker,
         blocks_in_chunk: int,
+        vllm_block_size: int,
     ) -> "LMCacheMPRequestMetadata | None":
         """
         Generate the retrieve metadata for the current request tracker.
@@ -330,15 +334,23 @@ class LMCacheMPRequestMetadata:
             "number of LMCache hit blocks. "
         )
         if end > start:
-            block_hashes = convert_block_hashes_to_bytes(
-                tracker.block_hashes[start:end]
-            )
             block_ids = tracker.allocated_block_ids[start:end]
+            token_ids = list(tracker.all_token_ids)
+
+            skip_first_n_tokens = (
+                tracker.num_vllm_hit_blocks - start
+            ) * vllm_block_size
 
             ret = LMCacheMPRequestMetadata(
                 request_id=tracker.request_id,
                 direction="RETRIEVE",
-                op=LoadStoreOp(block_hashes=block_hashes, block_ids=block_ids),
+                op=LoadStoreOp(
+                    token_ids=token_ids,
+                    block_ids=[block_ids],
+                    start=start * vllm_block_size,
+                    end=end * vllm_block_size,
+                    skip_first_n_tokens=skip_first_n_tokens,
+                ),
             )
             return ret
 
@@ -643,7 +655,8 @@ class LMCacheMPConnector(KVConnectorBase_V1):
             return 0, False
 
         self.scheduler_adapter.maybe_submit_lookup_request(
-            request.request_id, convert_block_hashes_to_bytes(request.block_hashes)
+            request.request_id,
+            list(request.all_token_ids),
         )
 
         ret = self.scheduler_adapter.check_lookup_result(request.request_id)
@@ -846,7 +859,9 @@ class LMCacheMPConnector(KVConnectorBase_V1):
             if request_tracker.state != LMCacheMPRequestState.WAITING_FOR_LOAD:
                 continue
             r_metadata = LMCacheMPRequestMetadata.GetRetrieveMetadata(
-                request_tracker, blocks_per_chunk
+                request_tracker,
+                blocks_per_chunk,
+                self.vllm_block_size,
             )
             if r_metadata is not None:
                 metadata.add_request_metadata(r_metadata)
