@@ -249,3 +249,12 @@ import/
 outputs/
 
 cuda*.run
+
+# BEGIN vendored LinearRAG large files
+/Hierarchical_KV/LinearRAG/import/2wikimultihop/entity_embedding.parquet
+/Hierarchical_KV/LinearRAG/import/hotpotqa/entity_embedding.parquet
+/Hierarchical_KV/LinearRAG/import/hotpotqa/sentence_embedding.parquet
+/Hierarchical_KV/LinearRAG/import/musique/entity_embedding.parquet
+/Hierarchical_KV/LinearRAG/import/musique/sentence_embedding.parquet
+/Hierarchical_KV/LinearRAG/model/all-mpnet-base-v2/model.safetensors
+# END vendored LinearRAG large files

@@ -1,0 +1,6 @@
+source_repo=https://github.com/sriramcu/KV-Aware-vLLM
+source_branch=sriram/repro-codenimbus
+source_commit=ef176877360276ec10882516d583777f13f63d70
+source_path=Hierarchical_KV/LinearRAG
+large_file_cutoff_mib=95
+large_file_manifest=Hierarchical_KV/LinearRAG.VENDORED_LARGE_FILES.txt
