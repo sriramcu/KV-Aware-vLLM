@@ -1,0 +1,515 @@
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/third_party/LMCache/lmcache/integration/vllm/vllm_multi_process_adapter.py b/third_party/LMCache/lmcache/integration/vllm/vllm_multi_process_adapter.py
+--- a/third_party/LMCache/lmcache/integration/vllm/vllm_multi_process_adapter.py	2026-09-18 22:06:58.000000000 +0000
++++ b/third_party/LMCache/lmcache/integration/vllm/vllm_multi_process_adapter.py	2026-09-19 22:52:19.251404655 +0000
+@@ -76,6 +76,11 @@
+     heartbeat_interval = 10.0
+     # Poll status replies without blocking the scheduler by default.
+     nonblocking_lookup_status = True
++    # End-to-end Stage-1 lookup/prefetch timeout in seconds. A value <= 0
++    # disables the timeout. This is intentionally separate from mq_timeout:
++    # mq_timeout bounds one control-plane RPC, while lookup_timeout bounds the
++    # total age of a healthy-but-still-pending LOOKUP/prefetch.
++    lookup_timeout = 0.0
+     # Routing mode for ``create_transfer_context``: ``auto`` keeps the
+     # historical CUDA -> lmcache_driven / others -> engine_driven dispatch;
+     # ``lmcache_driven`` forces the IPC / SHM zero-copy path where the
+@@ -203,6 +208,27 @@
+     """``time.monotonic()`` timestamp taken when the LOOKUPs were sent."""
+ 
+ 
++@dataclass
++class _TimedOutLookupCleanup:
++    """Background cleanup state for a logically abandoned Stage-1 lookup.
++
++    A lookup timeout returns a logical cache miss to vLLM immediately, but the
++    already-issued prefetch is allowed to finish in the LMCache daemon. Once it
++    finishes, the scheduler adapter consumes the prefetch result and releases
++    the read locks that would otherwise have been consumed by RETRIEVE.
++
++    This cleanup is deliberately Stage-1-only: no vLLM GPU destination blocks
++    have been handed to LMCache yet, so recomputation is safe while this stale
++    L2->L1 work drains in the background.
++    """
++
++    request_id: str
++    next_poll_at: float = 0.0
++    free_futures: dict[str, MessagingFuture[Any]] | None = None
++    reaped: bool = False
++    end_session_requested: bool = False
++
++
+ def get_lmcache_chunk_size(
+     req_client: RequestClient,
+     timeout: float = DEFAULT_MQ_TIMEOUT,
+@@ -649,6 +675,7 @@
+         self._nonblocking_lookup_status = (
+             ExtraConfigDefault.nonblocking_lookup_status.default
+         )
++        self._lookup_timeout = ExtraConfigDefault.lookup_timeout.default
+         if extra_config is not None:
+             cfg = _resolve_extra_config(extra_config)
+             mq_timeout = cfg[ExtraConfigDefault.mq_timeout.name]
+@@ -656,6 +683,7 @@
+             self._nonblocking_lookup_status = cfg[
+                 ExtraConfigDefault.nonblocking_lookup_status.name
+             ]
++            self._lookup_timeout = cfg[ExtraConfigDefault.lookup_timeout.name]
+         self._mq_timeout = mq_timeout
+ 
+         # Lookup state tracking:
+@@ -679,6 +707,23 @@
+         self._lookup_params: dict[
+             str, tuple[list[int], str, dict[str, Any] | None]
+         ] = {}
++        # Monotonic submission timestamp for the end-to-end Stage-1 timeout.
++        self._lookup_started_at: dict[str, float] = {}
++
++        # A Stage-1 timeout is a *logical* cancellation only: vLLM is allowed
++        # to recompute immediately, while the already-issued prefetch drains in
++        # the background. The reaper consumes that stale result and releases
++        # its retained L1 read locks. It never touches Stage-2 GPU transfers.
++        self._timed_out_lookup_lock = threading.Lock()
++        self._timed_out_lookups: dict[str, _TimedOutLookupCleanup] = {}
++        self._timed_out_lookup_wakeup = threading.Event()
++        self._timed_out_lookup_stop = threading.Event()
++        self._timed_out_lookup_reaper = threading.Thread(
++            target=self._timed_out_lookup_reaper_loop,
++            daemon=True,
++            name="lmcache-mp-stage1-timeout-reaper",
++        )
++        self._timed_out_lookup_reaper.start()
+ 
+         self.model_name = model_name
+         self.parallel_strategy = parallel_strategy
+@@ -765,6 +810,190 @@
+                 hb.start()
+                 self._heartbeats[url] = hb
+ 
++    def _lookup_was_logically_timed_out(self, request_id: str) -> bool:
++        with self._timed_out_lookup_lock:
++            return request_id in self._timed_out_lookups
++
++    def _mark_stage1_lookup_timed_out(self, request_id: str) -> None:
++        """Turn a slow Stage-1 lookup into a logical cache miss.
++
++        The daemon-side prefetch is *not* cancelled.  It is moved to the
++        background reaper, which consumes the eventual result and releases
++        the retained L1 read locks.  This mirrors the legacy vLLM-facing
++        semantic ("return 0 so vLLM recomputes") without pretending the
++        underlying asynchronous storage work was cancelled.
++        """
++        with self._timed_out_lookup_lock:
++            if request_id in self._timed_out_lookups:
++                return
++            self._timed_out_lookups[request_id] = _TimedOutLookupCleanup(
++                request_id=request_id
++            )
++
++        # Cache the logical miss so repeated scheduler calls remain stable.
++        self._finished_lookup_results[request_id] = 0
++        self._timed_out_lookup_wakeup.set()
++
++        started_at = self._lookup_started_at.get(request_id)
++        age = (
++            time.monotonic() - started_at if started_at is not None else float("nan")
++        )
++        logger.warning(
++            "[MP_STAGE1_LOOKUP_TIMEOUT] request %s still pending after %.3fs; "
++            "returning 0 LMCache tokens so vLLM recomputes. The stale "
++            "prefetch will drain and be reaped in the background.",
++            request_id,
++            age,
++        )
++
++    def _send_end_session_async(self, request_id: str) -> None:
++        if not self.is_healthy:
++            return
++        for client in self.req_clients.values():
++            client.end_session(request_id)
++
++    def _maybe_finalize_timed_out_lookup_session(self, request_id: str) -> None:
++        """End a timed-out request session once its stale prefetch is reaped."""
++        should_end = False
++        with self._timed_out_lookup_lock:
++            state = self._timed_out_lookups.get(request_id)
++            if state is not None and state.reaped and state.end_session_requested:
++                self._timed_out_lookups.pop(request_id, None)
++                should_end = True
++        if should_end:
++            self._finished_lookup_results.pop(request_id, None)
++            self._send_end_session_async(request_id)
++
++    def _reap_timed_out_lookup_once(
++        self, state: _TimedOutLookupCleanup, now: float
++    ) -> None:
++        """Make one nonblocking cleanup step for an abandoned Stage-1 lookup."""
++        request_id = state.request_id
++
++        # LOOKUP must be acknowledged before QUERY_PREFETCH_STATUS, exactly as
++        # in check_lookup_result(), otherwise a reordered status query can look
++        # like a spurious miss and leave locks behind.
++        ack = self._unacked_lookups.get(request_id)
++        if ack is not None:
++            for url, fut in list(ack.futures.items()):
++                if not fut.query():
++                    continue
++                # Surface protocol errors, but never block the reaper thread.
++                fut.result(timeout=0)
++                del ack.futures[url]
++            if ack.futures:
++                state.next_poll_at = now + 1.0
++                return
++            self._unacked_lookups.pop(request_id, None)
++
++        per_server = self._per_server_hits.setdefault(request_id, {})
++        futures = self._lookup_status.setdefault(request_id, {})
++
++        # Submit at most one status RPC per unresolved server.  A completed
++        # status reply of None means "healthy but still in progress"; wait one
++        # second before sending the next poll so hundreds of timed-out lookups
++        # do not create a status-RPC storm.
++        if now >= state.next_poll_at:
++            for url in self._server_urls:
++                if url not in per_server and url not in futures:
++                    futures[url] = (
++                        self.req_clients[url].query_prefetch_status(request_id),
++                        now,
++                    )
++
++        for url, (fut, _submitted_at) in list(futures.items()):
++            if not fut.query():
++                continue
++            del futures[url]
++            r = fut.result(timeout=0)
++            if r is not None:
++                per_server[url] = int(r)
++
++        if len(per_server) < len(self._server_urls):
++            state.next_poll_at = now + 1.0
++            return
++
++        # Once QUERY_PREFETCH_STATUS returns a result, the server session knows
++        # the exact retained hit range.  Release that whole range because this
++        # request will recompute and will never issue RETRIEVE for these locks.
++        if state.free_futures is None:
++            state.free_futures = {}
++            params = self._lookup_params.get(request_id)
++            if params is not None:
++                token_ids, cache_salt, request_configs = params
++                for url, hit_chunks in per_server.items():
++                    if hit_chunks <= 0:
++                        continue
++                    end = min(
++                        hit_chunks * self.lmcache_tokens_per_chunk,
++                        len(token_ids),
++                    )
++                    if end <= 0:
++                        continue
++                    key = self._create_key(
++                        token_ids,
++                        start=0,
++                        end=end,
++                        request_id=request_id,
++                        cache_salt=cache_salt,
++                        request_configs=request_configs,
++                    ).no_worker_id_version()
++                    state.free_futures[url] = self.req_clients[
++                        url
++                    ].free_lookup_locks(key, self.tp_size)
++
++        assert state.free_futures is not None
++        for url, fut in list(state.free_futures.items()):
++            if not fut.query():
++                state.next_poll_at = now + 0.1
++                continue
++            fut.result(timeout=0)
++            del state.free_futures[url]
++
++        if state.free_futures:
++            return
++
++        # The stale prefetch result has been consumed and all lookup locks have
++        # been released.  Keep only the logical-timeout marker until the vLLM
++        # request itself finishes, so the same request_id cannot resubmit the
++        # lookup while it is recomputing.
++        self._pending_lookups.discard(request_id)
++        self._unacked_lookups.pop(request_id, None)
++        self._lookup_status.pop(request_id, None)
++        self._per_server_hits.pop(request_id, None)
++        self._lookup_params.pop(request_id, None)
++        self._lookup_started_at.pop(request_id, None)
++        state.reaped = True
++        logger.info(
++            "[MP_STAGE1_LOOKUP_TIMEOUT_REAPED] request %s stale prefetch "
++            "completed and lookup locks were released",
++            request_id,
++        )
++        self._maybe_finalize_timed_out_lookup_session(request_id)
++
++    def _timed_out_lookup_reaper_loop(self) -> None:
++        """Drain stale prefetches created by Stage-1 logical timeouts."""
++        while not self._timed_out_lookup_stop.is_set():
++            self._timed_out_lookup_wakeup.wait(timeout=1.0)
++            self._timed_out_lookup_wakeup.clear()
++            now = time.monotonic()
++            with self._timed_out_lookup_lock:
++                states = list(self._timed_out_lookups.values())
++            for state in states:
++                if state.reaped or now < state.next_poll_at:
++                    continue
++                try:
++                    self._reap_timed_out_lookup_once(state, now)
++                except Exception:
++                    # Cleanup is deliberately off the scheduler critical path.
++                    # Keep the state around and retry rather than letting a
++                    # cleanup error kill inference.
++                    logger.exception(
++                        "Failed to reap timed-out Stage-1 lookup %s; will retry",
++                        state.request_id,
++                    )
++                    state.next_poll_at = now + 1.0
++
+     @_lmcache_nvtx_annotate
+     def maybe_submit_lookup_request(
+         self,
+@@ -804,6 +1033,12 @@
+         if not self.is_healthy:
+             return
+ 
++        if self._lookup_was_logically_timed_out(request_id):
++            # vLLM is recomputing this request after the Stage-1 timeout.
++            # Never resubmit the same external lookup while that request is
++            # still alive.
++            return
++
+         if request_id in self._pending_lookups:
+             # Skip if there is already a lookup request
+             return
+@@ -834,6 +1069,7 @@
+         )
+         self._pending_lookups.add(request_id)
+         self._lookup_params[request_id] = (token_ids, cache_salt, request_configs)
++        self._lookup_started_at[request_id] = time.monotonic()
+ 
+     def _free_inconsistent_lookup_locks(
+         self,
+@@ -900,6 +1136,9 @@
+             in LMCache (prefix matching), or
+             None if the lookup request is not finished yet.
+         """
++        if self._lookup_was_logically_timed_out(request_id):
++            return 0
++
+         if request_id not in self._pending_lookups:
+             # No job — either unhealthy at submit time or already cleaned up.
+             # Return the cached aggregate if any, otherwise 0.
+@@ -913,6 +1152,15 @@
+             # Aggregation already done; return the cached value.
+             return self._finished_lookup_results[request_id]
+ 
++        started_at = self._lookup_started_at.get(request_id)
++        if (
++            self._lookup_timeout > 0
++            and started_at is not None
++            and time.monotonic() - started_at >= self._lookup_timeout
++        ):
++            self._mark_stage1_lookup_timed_out(request_id)
++            return 0
++
+         ack = self._unacked_lookups.get(request_id)
+         if ack is not None:
+             # The server registers the prefetch job while handling LOOKUP.
+@@ -1002,15 +1250,25 @@
+         Args:
+             request_id: The ID of the finished request.
+         """
++        if self._lookup_was_logically_timed_out(request_id):
++            # The reaper still needs the LOOKUP/status futures and key params
++            # to consume the stale prefetch result and release its locks.
++            # Keep that state until reaping completes; the logical miss remains
++            # cached as 0 for the lifetime of the vLLM request.
++            return
+         self._pending_lookups.discard(request_id)
+         self._unacked_lookups.pop(request_id, None)
+         self._lookup_status.pop(request_id, None)
+         self._finished_lookup_results.pop(request_id, None)
+         self._per_server_hits.pop(request_id, None)
+         self._lookup_params.pop(request_id, None)
++        self._lookup_started_at.pop(request_id, None)
+ 
+     def shutdown(self) -> None:
+         """Shutdown the scheduler adapter and its resources."""
++        self._timed_out_lookup_stop.set()
++        self._timed_out_lookup_wakeup.set()
++        self._timed_out_lookup_reaper.join(timeout=2.0)
+         for client in self.req_clients.values():
+             client.close()
+         with self._heartbeat_lock:
+@@ -1074,6 +1332,25 @@
+         Args:
+             request_id: The ID of the finished request.
+         """
++        if self._lookup_was_logically_timed_out(request_id):
++            # Do not remove the server session until the abandoned prefetch has
++            # published its result and the reaper has released its read locks.
++            # This path is intentionally nonblocking for the vLLM scheduler.
++            should_end_now = False
++            with self._timed_out_lookup_lock:
++                state = self._timed_out_lookups.get(request_id)
++                if state is not None:
++                    state.end_session_requested = True
++                    if state.reaped:
++                        self._timed_out_lookups.pop(request_id, None)
++                        should_end_now = True
++            if should_end_now:
++                self._finished_lookup_results.pop(request_id, None)
++                self._send_end_session_async(request_id)
++            else:
++                self._timed_out_lookup_wakeup.set()
++            return
++
+         if not self.is_healthy:
+             return
+ 
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/third_party/LMCache/tests/v1/test_mp_nonblocking_lookup.py b/third_party/LMCache/tests/v1/test_mp_nonblocking_lookup.py
+--- a/third_party/LMCache/tests/v1/test_mp_nonblocking_lookup.py	2026-09-18 22:06:58.000000000 +0000
++++ b/third_party/LMCache/tests/v1/test_mp_nonblocking_lookup.py	2026-09-19 22:52:19.251990120 +0000
+@@ -6,6 +6,7 @@
+ from collections.abc import Callable, Iterator
+ from typing import Any
+ import threading
++import time
+ 
+ # Third Party
+ import pytest
+@@ -326,6 +327,49 @@
+     assert client.queries == ["r"]
+ 
+ 
++def test_stage1_lookup_timeout_returns_miss_and_reaps_locks(
++    make_adapter: AdapterFactory,
++) -> None:
++    """A healthy-but-slow prefetch becomes a logical miss after the
++    end-to-end lookup timeout, while its eventual retained locks are released
++    in the background.
++    """
++    adapter, (client,) = make_adapter(
++        extra_config={
++            "lmcache.mp.lookup_timeout": 0.01,
++            "lmcache.mp.mq_timeout": 5.0,
++        }
++    )
++    submit(adapter, [client])
++
++    # First scheduler pass launches QUERY_PREFETCH_STATUS and observes the
++    # healthy prefetch as still pending.
++    assert adapter.check_lookup_result("r") is None
++    assert client.queries == ["r"]
++
++    # The total Stage-1 age, not the age of one status RPC, triggers fallback.
++    time.sleep(0.02)
++    assert adapter.check_lookup_result("r") == 0
++    assert adapter.is_healthy
++
++    # The stale prefetch may finish later.  Its result is consumed by the
++    # background reaper and the full retained prefix is unlocked because vLLM
++    # will recompute rather than RETRIEVE it.
++    client.status.set_result(2)
++    deadline = time.time() + 3.0
++    while time.time() < deadline and not client.frees:
++        time.sleep(0.01)
++    assert [(key.start, key.end) for key in client.frees] == [(0, 128)]
++
++    # Request completion can now end the LMCache session without blocking on
++    # the abandoned lookup.
++    adapter.end_session("r")
++    deadline = time.time() + 1.0
++    while time.time() < deadline and not client.ends:
++        time.sleep(0.01)
++    assert client.ends == ["r"]
++
++
+ def test_status_exception_allows_a_fresh_poll(make_adapter: AdapterFactory) -> None:
+     adapter, (client,) = make_adapter()
+     submit(adapter, [client])
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/vllm/distributed/kv_transfer/kv_connector/v1/lmcache_mp_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/lmcache_mp_connector.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/lmcache_mp_connector.py	2026-09-18 22:06:58.000000000 +0000
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/lmcache_mp_connector.py	2026-09-19 22:52:19.903593429 +0000
+@@ -95,7 +95,10 @@
+ 
+ 
+ def create_scheduler_adapter(
+-    server_url: str, zmq_context: zmq.Context, vllm_config: VllmConfig
++    server_url: str,
++    zmq_context: zmq.Context,
++    vllm_config: VllmConfig,
++    extra_config: dict[str, Any] | None = None,
+ ) -> LMCacheMPSchedulerAdapter:
+     world_size, kv_rank = extract_world_size_and_kv_rank(
+         vllm_config.parallel_config.world_size,
+@@ -109,6 +112,7 @@
+         world_size,
+         kv_rank,
+         vllm_config.cache_config.block_size,
++        extra_config=extra_config,
+     )
+ 
+ 
+@@ -391,6 +395,9 @@
+     Extra configs (kv_transfer_config.extra_config):
+     - lmcache.mp.host: the host of the LMCache server.
+     - lmcache.mp.port: the port of the LMCache server.
++    - lmcache.mp.lookup_timeout: Stage-1 LOOKUP/prefetch deadline in seconds.
++      This branch defaults it to 3.0 to reproduce the legacy behavior where a
++      slow external lookup becomes a cache miss and vLLM recomputes.
+     """
+ 
+     def __init__(
+@@ -408,12 +415,19 @@
+         server_port = vllm_config.kv_transfer_config.get_from_extra_config(
+             "lmcache.mp.port", 5555
+         )
++        extra_config = dict(
++            vllm_config.kv_transfer_config.kv_connector_extra_config or {}
++        )
++        # Legacy analogue for this research branch.  The generic vendored
++        # adapter keeps the feature disabled by default; callers can override
++        # this value explicitly (set <= 0 to disable).
++        extra_config.setdefault("lmcache.mp.lookup_timeout", 3.0)
+ 
+         server_url = f"{server_host}:{server_port}"
+         zmq_context = zmq.Context.instance()
+         if self.role == KVConnectorRole.SCHEDULER:
+             self.scheduler_adapter = create_scheduler_adapter(
+-                server_url, zmq_context, vllm_config
++                server_url, zmq_context, vllm_config, extra_config
+             )
+             self.request_trackers: dict[str, LMCacheMPRequestTracker] = {}
+         elif self.role == KVConnectorRole.WORKER:
+@@ -594,8 +608,11 @@
+             - Sync loading: failed blocks should be reported in the forward
+               pass in which they are detected.
+         """
+-        # TODO: add error tracking
+-        return set()
++        # Propagate worker-side retrieve failures to vLLM so the configured
++        # kv_load_failure_policy (e.g. "recompute") can invalidate the affected
++        # blocks and reschedule their tokens instead of silently treating failed
++        # loads as successful. This matches the current LMCache-shipped connector.
++        return self.worker_adapter.get_block_ids_with_load_errors()
+ 
+     def shutdown(self):
+         """
+@@ -779,6 +796,12 @@
+         """
+         # Clean up request tracker to prevent memory leak
+         self._cleanup_request_tracker(request.request_id)
++        # Notify the scheduler-side adapter that the vLLM request is truly
++        # finished. For a Stage-1 timed-out lookup this is nonblocking: the
++        # adapter defers END_SESSION until the stale prefetch has been reaped
++        # and its lookup locks are released.
++        if hasattr(self, "scheduler_adapter"):
++            self.scheduler_adapter.end_session(request.request_id)
+         return True, None
+ 
+     def take_events(self) -> Iterable["KVCacheEvent"]:
