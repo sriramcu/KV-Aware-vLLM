@@ -6,6 +6,7 @@ from collections import deque
 from collections.abc import Callable, Iterator
 from typing import Any
 import threading
+import time
 
 # Third Party
 import pytest
@@ -324,6 +325,49 @@ def test_status_deadline_does_not_restart_on_poll(
     assert adapter.check_lookup_result("r") == 0
     assert not adapter.is_healthy
     assert client.queries == ["r"]
+
+
+def test_stage1_lookup_timeout_returns_miss_and_reaps_locks(
+    make_adapter: AdapterFactory,
+) -> None:
+    """A healthy-but-slow prefetch becomes a logical miss after the
+    end-to-end lookup timeout, while its eventual retained locks are released
+    in the background.
+    """
+    adapter, (client,) = make_adapter(
+        extra_config={
+            "lmcache.mp.lookup_timeout": 0.01,
+            "lmcache.mp.mq_timeout": 5.0,
+        }
+    )
+    submit(adapter, [client])
+
+    # First scheduler pass launches QUERY_PREFETCH_STATUS and observes the
+    # healthy prefetch as still pending.
+    assert adapter.check_lookup_result("r") is None
+    assert client.queries == ["r"]
+
+    # The total Stage-1 age, not the age of one status RPC, triggers fallback.
+    time.sleep(0.02)
+    assert adapter.check_lookup_result("r") == 0
+    assert adapter.is_healthy
+
+    # The stale prefetch may finish later.  Its result is consumed by the
+    # background reaper and the full retained prefix is unlocked because vLLM
+    # will recompute rather than RETRIEVE it.
+    client.status.set_result(2)
+    deadline = time.time() + 3.0
+    while time.time() < deadline and not client.frees:
+        time.sleep(0.01)
+    assert [(key.start, key.end) for key in client.frees] == [(0, 128)]
+
+    # Request completion can now end the LMCache session without blocking on
+    # the abandoned lookup.
+    adapter.end_session("r")
+    deadline = time.time() + 1.0
+    while time.time() < deadline and not client.ends:
+        time.sleep(0.01)
+    assert client.ends == ["r"]
 
 
 def test_status_exception_allows_a_fresh_poll(make_adapter: AdapterFactory) -> None:

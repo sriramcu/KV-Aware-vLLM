@@ -95,7 +95,10 @@ def extract_world_size_and_kv_rank(
 
 
 def create_scheduler_adapter(
-    server_url: str, zmq_context: zmq.Context, vllm_config: VllmConfig
+    server_url: str,
+    zmq_context: zmq.Context,
+    vllm_config: VllmConfig,
+    extra_config: dict[str, Any] | None = None,
 ) -> LMCacheMPSchedulerAdapter:
     world_size, kv_rank = extract_world_size_and_kv_rank(
         vllm_config.parallel_config.world_size,
@@ -109,6 +112,7 @@ def create_scheduler_adapter(
         world_size,
         kv_rank,
         vllm_config.cache_config.block_size,
+        extra_config=extra_config,
     )
 
 
@@ -391,6 +395,9 @@ class LMCacheMPConnector(KVConnectorBase_V1):
     Extra configs (kv_transfer_config.extra_config):
     - lmcache.mp.host: the host of the LMCache server.
     - lmcache.mp.port: the port of the LMCache server.
+    - lmcache.mp.lookup_timeout: Stage-1 LOOKUP/prefetch deadline in seconds.
+      This branch defaults it to 3.0 to reproduce the legacy behavior where a
+      slow external lookup becomes a cache miss and vLLM recomputes.
     """
 
     def __init__(
@@ -408,12 +415,19 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         server_port = vllm_config.kv_transfer_config.get_from_extra_config(
             "lmcache.mp.port", 5555
         )
+        extra_config = dict(
+            vllm_config.kv_transfer_config.kv_connector_extra_config or {}
+        )
+        # Legacy analogue for this research branch.  The generic vendored
+        # adapter keeps the feature disabled by default; callers can override
+        # this value explicitly (set <= 0 to disable).
+        extra_config.setdefault("lmcache.mp.lookup_timeout", 3.0)
 
         server_url = f"{server_host}:{server_port}"
         zmq_context = zmq.Context.instance()
         if self.role == KVConnectorRole.SCHEDULER:
             self.scheduler_adapter = create_scheduler_adapter(
-                server_url, zmq_context, vllm_config
+                server_url, zmq_context, vllm_config, extra_config
             )
             self.request_trackers: dict[str, LMCacheMPRequestTracker] = {}
         elif self.role == KVConnectorRole.WORKER:
@@ -594,8 +608,11 @@ class LMCacheMPConnector(KVConnectorBase_V1):
             - Sync loading: failed blocks should be reported in the forward
               pass in which they are detected.
         """
-        # TODO: add error tracking
-        return set()
+        # Propagate worker-side retrieve failures to vLLM so the configured
+        # kv_load_failure_policy (e.g. "recompute") can invalidate the affected
+        # blocks and reschedule their tokens instead of silently treating failed
+        # loads as successful. This matches the current LMCache-shipped connector.
+        return self.worker_adapter.get_block_ids_with_load_errors()
 
     def shutdown(self):
         """
@@ -779,6 +796,12 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         """
         # Clean up request tracker to prevent memory leak
         self._cleanup_request_tracker(request.request_id)
+        # Notify the scheduler-side adapter that the vLLM request is truly
+        # finished. For a Stage-1 timed-out lookup this is nonblocking: the
+        # adapter defers END_SESSION until the stale prefetch has been reaped
+        # and its lookup locks are released.
+        if hasattr(self, "scheduler_adapter"):
+            self.scheduler_adapter.end_session(request.request_id)
         return True, None
 
     def take_events(self) -> Iterable["KVCacheEvent"]:
