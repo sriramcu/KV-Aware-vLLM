@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import enum
+import json
+import os
 import time
 from collections import deque
 from collections.abc import Callable, Mapping
@@ -27,6 +29,33 @@ from vllm.v1.utils import ConstantList
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.v1.core.kv_cache_utils import BlockHash
+
+
+def _load_kv_importance_tiers(request_id: str) -> dict[int, str]:
+    """Load project KV-importance tiers for one request, if configured.
+
+    Historical sidecars store either a direct tier string or a record such as
+    {"tier": "gpu", ...}. Accept both so the v0.29 port preserves the
+    intended project semantics without depending on one sidecar encoding.
+    """
+    path = os.environ.get("VLLM_KV_IMPORTANCE_TIERS")
+    if not path:
+        return {}
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            all_tiers = json.load(f)
+    except Exception:
+        return {}
+
+    raw_tiers = all_tiers.get(str(request_id), {})
+    tiers: dict[int, str] = {}
+    for key, value in raw_tiers.items():
+        if isinstance(value, dict):
+            value = value.get("tier")
+        if value in ("disk", "cpu", "gpu"):
+            tiers[int(key)] = str(value)
+    return tiers
 
 
 @dataclass
@@ -80,6 +109,9 @@ class Request:
         abort_immediately: bool = False,
     ) -> None:
         self.request_id = request_id
+        # Project hook: optional per-vLLM-block importance tiers. The feature
+        # remains inert unless VLLM_KV_IMPORTANCE_TIERS points at a sidecar.
+        self.kv_importance_tiers = _load_kv_importance_tiers(request_id)
         self.client_index = client_index
         self.priority = priority
         self.sampling_params = sampling_params

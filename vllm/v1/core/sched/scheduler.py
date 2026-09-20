@@ -383,6 +383,12 @@ class Scheduler(SchedulerInterface):
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
 
+        # Project Stage-1 starvation fallback. A single no-progress sweep is
+        # treated as transient; fallback is eligible only after two consecutive
+        # full WAITING sweeps with empty execution slots and no model work
+        # scheduled.
+        self._stage1_starvation_scan_streak = 0
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -772,6 +778,7 @@ class Scheduler(SchedulerInterface):
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         # Next, schedule the WAITING requests.
+        stage1_kv_pending_requests: list[Request] = []
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
 
@@ -860,9 +867,11 @@ class Scheduler(SchedulerInterface):
                         )
 
                         if ext_tokens is None:
-                            # The request cannot be scheduled because
-                            # the KVConnector couldn't determine
-                            # the number of matched tokens.
+                            # Stage 1: the connector has not yet committed GPU
+                            # destination blocks for this request, so it is safe
+                            # for the project starvation fallback to convert this
+                            # lookup into a logical miss later.
+                            stage1_kv_pending_requests.append(request)
                             request_queue.pop_request()
                             step_skipped_waiting.prepend_request(request)
                             continue
@@ -1205,6 +1214,68 @@ class Scheduler(SchedulerInterface):
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
 
+            # A full no-progress sweep means every persistent waiting queue
+            # entry was examined (anything skipped now lives in the temporary
+            # step_skipped_waiting queue). Count two consecutive sweeps before
+            # acting so a single transient empty iteration does not trigger
+            # recomputation. Stage 2 (WAITING_FOR_REMOTE_KVS) is never a
+            # candidate here.
+            waiting_scan_exhausted = not self.waiting and not self.skipped_waiting
+            num_running_for_slots = (
+                len(self.running) + self.num_waiting_for_streaming_input
+            )
+            available_slots = max(
+                0, self.max_num_running_reqs - num_running_for_slots
+            )
+            stage1_starved = (
+                waiting_scan_exhausted
+                and available_slots > 0
+                and not num_scheduled_tokens
+                and bool(stage1_kv_pending_requests)
+                and self.connector is not None
+            )
+
+            if stage1_starved:
+                self._stage1_starvation_scan_streak += 1
+            else:
+                self._stage1_starvation_scan_streak = 0
+
+            if stage1_starved and self._stage1_starvation_scan_streak >= 2:
+                abandon_stage1 = getattr(
+                    self.connector, "abandon_stage1_lookup", None
+                )
+                if callable(abandon_stage1):
+                    # Oldest first. Keep going if a candidate completed between
+                    # the scan and this final nonblocking recheck; only actual
+                    # abandonments consume an execution slot.
+                    unique_candidates = {
+                        req.request_id: req for req in stage1_kv_pending_requests
+                    }
+                    candidates = sorted(
+                        unique_candidates.values(), key=lambda req: req.arrival_time
+                    )
+                    abandoned_ids: list[str] = []
+                    for candidate in candidates:
+                        if len(abandoned_ids) >= available_slots:
+                            break
+                        if abandon_stage1(candidate.request_id):
+                            abandoned_ids.append(candidate.request_id)
+
+                    if abandoned_ids:
+                        logger.warning(
+                            "[KV_STAGE1_STARVATION_FALLBACK] two consecutive "
+                            "full WAITING scans made no scheduling progress; "
+                            "logically abandoning %d Stage-1 KV lookup(s) to "
+                            "fill %d available execution slot(s). "
+                            "stage1_pending_seen=%d request_ids=%s",
+                            len(abandoned_ids),
+                            available_slots,
+                            len(unique_candidates),
+                            abandoned_ids,
+                        )
+                # Require two new no-progress scans before another release wave.
+                self._stage1_starvation_scan_streak = 0
+
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
@@ -1213,6 +1284,9 @@ class Scheduler(SchedulerInterface):
             # record whether it was capacity-bound.
             if not defer_prefills:
                 self.prefill_capacity_bound = bool(self.waiting)
+
+        if preempted_reqs or self._pause_state != PauseState.UNPAUSED:
+            self._stage1_starvation_scan_streak = 0
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())

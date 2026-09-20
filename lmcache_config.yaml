@@ -1,0 +1,7 @@
+chunk_size: 512
+local_cpu: true
+max_local_cpu_size: 100.0
+local_disk: "file:///scratch/seliny2_cache/vllm/"
+max_local_disk_size: 500.0
+enable_kv_events: true
+pre_caching_hash_algorithm: builtin

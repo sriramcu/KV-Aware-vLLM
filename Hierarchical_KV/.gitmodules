@@ -1,0 +1,3 @@
+[submodule "LinearRAG"]
+	path = LinearRAG
+	url = https://github.com/DEEP-PolyU/LinearRAG.git

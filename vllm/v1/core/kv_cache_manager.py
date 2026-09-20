@@ -210,6 +210,21 @@ class KVCacheManager:
         self.prefix_cache_stats = PrefixCacheStats()
         return stats
 
+    def _set_importance_for_request_blocks(self, request: Request) -> None:
+        if not getattr(self.block_pool, "enable_kv_importance", False):
+            return
+
+        tiers = getattr(request, "kv_importance_tiers", None)
+        if not tiers:
+            return
+
+        block_ids_by_group = self.get_block_ids(request.request_id)
+        for group_block_ids in block_ids_by_group:
+            for logical_block_idx, block_id in enumerate(group_block_ids):
+                tier = tiers.get(logical_block_idx)
+                if tier is not None:
+                    self.block_pool.set_block_importance(block_id, tier)
+
     def prefix_cache_lookup_enabled(self, request: Request) -> bool:
         """Whether a local prefix cache lookup may be run for this request."""
         return self.enable_caching and not request.skip_reading_prefix_cache
@@ -560,6 +575,7 @@ class KVCacheManager:
             request.num_tokens,
         )
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
+        self._set_importance_for_request_blocks(request)
 
         return self.create_kv_cache_blocks(new_blocks)
 

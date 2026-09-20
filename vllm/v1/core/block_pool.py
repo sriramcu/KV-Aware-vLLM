@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -168,6 +169,8 @@ class BlockPool:
         metrics_collector: KVCacheMetricsCollector | None = None,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
+        self.enable_kv_importance = os.environ.get("VLLM_KV_IMPORTANCE_ENABLE") == "1"
+        self.kv_importance_by_block_id: dict[int, str] = {}
         self.num_gpu_blocks = num_gpu_blocks
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
@@ -194,6 +197,20 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+
+    def set_block_importance(self, block_id: int, tier: str) -> None:
+        """Attach the project's weak disk/cpu/gpu priority label to a block."""
+        if not self.enable_kv_importance:
+            return
+        if tier not in ("disk", "cpu", "gpu"):
+            return
+        self.kv_importance_by_block_id[int(block_id)] = tier
+
+    def get_block_importance_rank(self, block: KVCacheBlock) -> int:
+        if not self.enable_kv_importance:
+            return 1
+        tier = self.kv_importance_by_block_id.get(block.block_id, "cpu")
+        return {"disk": 0, "cpu": 1, "gpu": 2}.get(tier, 1)
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -728,11 +745,22 @@ class BlockPool:
             ordered_blocks: A list of blocks to free ordered by their eviction
                 priority.
         """
+        # Preserve v0.29's cached-vs-uncached queue semantics, while using
+        # project importance as a stable ordering within a request release.
+        blocks_list = list(ordered_blocks)
+        if self.enable_kv_importance:
+            blocks_list.sort(key=self.get_block_importance_rank)
+
         # Identify blocks with hash (LRU cache) and without it (never match APC)
         blocks_to_evict_last = []
         blocks_to_evict_first = []
-        for block in ordered_blocks:
+        for block in blocks_list:
             block.ref_cnt -= 1
+            if self.enable_kv_importance:
+                # Preserve the historical weak/request-local behavior: the label
+                # only influences this release ordering; it is not a global
+                # tiered-LRU policy.
+                self.kv_importance_by_block_id.pop(block.block_id, None)
             if block.ref_cnt == 0 and not block.is_null:
                 if block.block_hash is None or not self.enable_caching:
                     # LIFO reuse of non-cached blocks for better GPU locality.
