@@ -253,6 +253,99 @@ nvidia-smi \
     --format=csv,noheader || nvidia-smi
 
 echo
+echo "===== PREFLIGHT: GPU EXCLUSIVITY ====="
+
+check_gpu_exclusivity() {
+    local current_job="${SLURM_JOB_ID:-}"
+    local current_user
+    current_user="$(id -un)"
+
+    if [[ -z "$current_job" ]]; then
+        echo "ERROR: SLURM_JOB_ID is not set"
+        return 1
+    fi
+
+    echo "current Slurm job: $current_job"
+    echo "current user:      $current_user"
+    echo
+
+    local bad=0
+    local found=0
+
+    while IFS=',' read -r pid process gpu_uuid used_mem; do
+        # Trim whitespace emitted by nvidia-smi CSV.
+        pid="$(echo "$pid" | xargs)"
+        process="$(echo "$process" | xargs)"
+        gpu_uuid="$(echo "$gpu_uuid" | xargs)"
+        used_mem="$(echo "$used_mem" | xargs)"
+
+        [[ -z "$pid" ]] && continue
+        [[ "$pid" == "No running processes found" ]] && continue
+
+        found=1
+
+        local owner cgroup
+        owner="$(ps -o user= -p "$pid" 2>/dev/null | xargs || true)"
+        cgroup="$(cat "/proc/$pid/cgroup" 2>/dev/null || true)"
+
+        echo "GPU compute process detected:"
+        echo "  pid:       $pid"
+        echo "  owner:     ${owner:-UNKNOWN}"
+        echo "  process:   $process"
+        echo "  gpu:       $gpu_uuid"
+        echo "  memory:    ${used_mem} MiB"
+        echo "  cgroup:    ${cgroup:-UNREADABLE}"
+
+        # Allow a GPU process only if it belongs to THIS Slurm job.
+        if grep -q "/job_${current_job}/" <<<"$cgroup"; then
+            echo "  verdict:   OK -- belongs to current job"
+        elif [[ "$owner" == "root" ]]; then
+            # Root-owned CUDA utilities/monitoring are not automatically fatal.
+            echo "  verdict:   WARNING -- root-owned foreign GPU process"
+        else
+            echo "  verdict:   FAIL -- foreign GPU process"
+            bad=1
+        fi
+
+        echo
+    done < <(
+        nvidia-smi \
+          --query-compute-apps=pid,process_name,gpu_uuid,used_memory \
+          --format=csv,noheader,nounits 2>/dev/null || true
+    )
+
+    if [[ "$found" -eq 0 ]]; then
+        echo "No CUDA compute processes detected before experiment startup."
+    fi
+
+    if [[ "$bad" -ne 0 ]]; then
+        echo
+        echo "============================================================"
+        echo "ERROR: GPU EXCLUSIVITY CHECK FAILED"
+        echo
+        echo "One or more non-root CUDA processes are already using the"
+        echo "GPU node but do not belong to Slurm job ${current_job}."
+        echo
+        echo "Refusing to run a reproducibility/performance experiment on"
+        echo "a contaminated GPU allocation."
+        echo "============================================================"
+        echo "===== NVIDIA-SMI AT REJECTION ====="
+        nvidia-smi || true
+
+        echo
+        echo "===== CURRENT NODE SLURM VIEW ====="
+        squeue -w "$(hostname -s)" \
+        -o "%.18i %.12u %.9P %.10T %.10M %.6D %R" || true
+        return 42
+    fi
+
+    echo "GPU exclusivity preflight passed."
+    return 0
+}
+
+check_gpu_exclusivity || exit $?
+
+echo
 echo "===== PREFLIGHT: REPOSITORY ====="
 git branch --show-current
 git rev-parse HEAD
