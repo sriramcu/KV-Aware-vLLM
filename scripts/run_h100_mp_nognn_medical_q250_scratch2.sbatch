@@ -281,7 +281,7 @@ python - <<'PY'
 import inspect
 import torch
 import vllm
-import vllm._C
+import vllm._C_stable_libtorch as vllm_C
 import lmcache
 from lmcache.integration.vllm.vllm_multi_process_adapter import (
     LMCacheMPSchedulerAdapter,
@@ -298,7 +298,7 @@ if torch.cuda.is_available():
     print("capability:", torch.cuda.get_device_capability(0))
 
 print("vllm:", vllm.__file__)
-print("vllm._C:", vllm._C.__file__)
+print("vllm native:", vllm_C.__file__)
 print("lmcache:", lmcache.__file__)
 print("LoadStoreOp:", inspect.signature(LoadStoreOp))
 print("scheduler_adapter:", inspect.signature(LMCacheMPSchedulerAdapter))
