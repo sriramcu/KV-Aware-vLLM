@@ -395,9 +395,13 @@ class LMCacheMPConnector(KVConnectorBase_V1):
     Extra configs (kv_transfer_config.extra_config):
     - lmcache.mp.host: the host of the LMCache server.
     - lmcache.mp.port: the port of the LMCache server.
-    - lmcache.mp.lookup_timeout: Stage-1 LOOKUP/prefetch deadline in seconds.
-      This branch defaults it to 3.0 to reproduce the legacy behavior where a
-      slow external lookup becomes a cache miss and vLLM recomputes.
+    - lmcache.mp.lookup_timeout: optional Stage-1 LOOKUP/prefetch deadline in
+      seconds. Disabled by default in this branch; set it to 3.0 to reproduce
+      the earlier legacy-timeout experiment.
+    - lmcache.mp.starvation_fallback: when true (default), a scheduler pass that
+      fully scans WAITING, has zero RUNNING requests, schedules no work, and
+      finds Stage-1 LMCache-pending requests may abandon one oldest pending
+      lookup so vLLM can recompute it.
     """
 
     def __init__(
@@ -418,10 +422,17 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         extra_config = dict(
             vllm_config.kv_transfer_config.kv_connector_extra_config or {}
         )
-        # Legacy analogue for this research branch.  The generic vendored
-        # adapter keeps the feature disabled by default; callers can override
-        # this value explicitly (set <= 0 to disable).
-        extra_config.setdefault("lmcache.mp.lookup_timeout", 3.0)
+        # Keep the legacy-style fixed Stage-1 timeout available as an
+        # experimental knob, but disable it by default. The starvation-based
+        # fallback below is the default policy for this branch.
+        extra_config.setdefault("lmcache.mp.lookup_timeout", 0.0)
+        self._stage1_starvation_fallback_enabled = bool(
+            extra_config.pop("lmcache.mp.starvation_fallback", True)
+        )
+        logger.info(
+            "LMCache MP Stage-1 starvation fallback enabled=%s",
+            self._stage1_starvation_fallback_enabled,
+        )
 
         server_url = f"{server_host}:{server_port}"
         zmq_context = zmq.Context.instance()
@@ -633,6 +644,22 @@ class LMCacheMPConnector(KVConnectorBase_V1):
     # ==============================
     # Scheduler-side methods
     # ==============================
+
+    def abandon_stage1_lookup(self, request_id: str) -> bool:
+        """Logically abandon one Stage-1 LMCache lookup.
+
+        This is called by the vLLM scheduler only after an exposed-starvation
+        pass (zero RUNNING work and a full WAITING scan that found no runnable
+        request). It never acts on Stage-2 ``WAITING_FOR_REMOTE_KVS`` loads.
+
+        Returns True only if a still-pending Stage-1 lookup was converted into
+        a logical miss. The underlying LMCache prefetch is deliberately not
+        cancelled; the adapter's background reaper drains it and releases any
+        retained lookup locks.
+        """
+        if not self._stage1_starvation_fallback_enabled:
+            return False
+        return self.scheduler_adapter.abandon_stage1_lookup(request_id)
 
     def get_num_new_matched_tokens(
         self,

@@ -370,6 +370,41 @@ def test_stage1_lookup_timeout_returns_miss_and_reaps_locks(
     assert client.ends == ["r"]
 
 
+def test_stage1_starvation_fallback_abandons_one_pending_lookup_and_reaps(
+    make_adapter: AdapterFactory,
+) -> None:
+    """Starvation fallback works with the fixed-age timeout disabled."""
+    adapter, (client,) = make_adapter(
+        extra_config={
+            "lmcache.mp.lookup_timeout": 0.0,
+            "lmcache.mp.mq_timeout": 5.0,
+        }
+    )
+    submit(adapter, [client])
+
+    # Stage 1 is healthy but still pending.
+    assert adapter.check_lookup_result("r") is None
+    assert adapter.abandon_stage1_lookup("r")
+    assert adapter.check_lookup_result("r") == 0
+
+    # A repeated starvation signal is idempotent.
+    assert not adapter.abandon_stage1_lookup("r")
+
+    # Underlying prefetch is not cancelled. Once it finishes, the reaper
+    # consumes the stale hit and releases the retained lookup locks.
+    client.status.set_result(2)
+    deadline = time.time() + 3.0
+    while time.time() < deadline and not client.frees:
+        time.sleep(0.01)
+    assert [(key.start, key.end) for key in client.frees] == [(0, 128)]
+
+    adapter.end_session("r")
+    deadline = time.time() + 1.0
+    while time.time() < deadline and not client.ends:
+        time.sleep(0.01)
+    assert client.ends == ["r"]
+
+
 def test_status_exception_allows_a_fresh_poll(make_adapter: AdapterFactory) -> None:
     adapter, (client,) = make_adapter()
     submit(adapter, [client])

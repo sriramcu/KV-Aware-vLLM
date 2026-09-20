@@ -212,7 +212,8 @@ class _LookupAck:
 class _TimedOutLookupCleanup:
     """Background cleanup state for a logically abandoned Stage-1 lookup.
 
-    A lookup timeout returns a logical cache miss to vLLM immediately, but the
+    A fixed timeout or scheduler-starvation fallback can return a logical cache
+    miss to vLLM immediately, but the
     already-issued prefetch is allowed to finish in the LMCache daemon. Once it
     finishes, the scheduler adapter consumes the prefetch result and releases
     the read locks that would otherwise have been consumed by RETRIEVE.
@@ -227,6 +228,7 @@ class _TimedOutLookupCleanup:
     free_futures: dict[str, MessagingFuture[Any]] | None = None
     reaped: bool = False
     end_session_requested: bool = False
+    reason: str = "timeout"
 
 
 def get_lmcache_chunk_size(
@@ -814,20 +816,21 @@ class LMCacheMPSchedulerAdapter:
         with self._timed_out_lookup_lock:
             return request_id in self._timed_out_lookups
 
-    def _mark_stage1_lookup_timed_out(self, request_id: str) -> None:
-        """Turn a slow Stage-1 lookup into a logical cache miss.
+    def _mark_stage1_lookup_abandoned(
+        self, request_id: str, *, reason: str
+    ) -> bool:
+        """Turn a pending Stage-1 lookup into a logical cache miss.
 
-        The daemon-side prefetch is *not* cancelled.  It is moved to the
+        The daemon-side prefetch is *not* cancelled. It is moved to the
         background reaper, which consumes the eventual result and releases
-        the retained L1 read locks.  This mirrors the legacy vLLM-facing
-        semantic ("return 0 so vLLM recomputes") without pretending the
-        underlying asynchronous storage work was cancelled.
+        retained L1 read locks. This is safe only for Stage 1, before vLLM GPU
+        destination blocks have been handed to LMCache.
         """
         with self._timed_out_lookup_lock:
             if request_id in self._timed_out_lookups:
-                return
+                return False
             self._timed_out_lookups[request_id] = _TimedOutLookupCleanup(
-                request_id=request_id
+                request_id=request_id, reason=reason
             )
 
         # Cache the logical miss so repeated scheduler calls remain stable.
@@ -838,13 +841,47 @@ class LMCacheMPSchedulerAdapter:
         age = (
             time.monotonic() - started_at if started_at is not None else float("nan")
         )
-        logger.warning(
-            "[MP_STAGE1_LOOKUP_TIMEOUT] request %s still pending after %.3fs; "
-            "returning 0 LMCache tokens so vLLM recomputes. The stale "
-            "prefetch will drain and be reaped in the background.",
-            request_id,
-            age,
-        )
+        if reason == "timeout":
+            logger.warning(
+                "[MP_STAGE1_LOOKUP_TIMEOUT] request %s still pending after %.3fs; "
+                "returning 0 LMCache tokens so vLLM recomputes. The stale "
+                "prefetch will drain and be reaped in the background.",
+                request_id,
+                age,
+            )
+        else:
+            logger.warning(
+                "[MP_STAGE1_STARVATION_FALLBACK] abandoning pending request %s "
+                "after %.3fs of Stage-1 age because vLLM reported exposed "
+                "scheduler starvation; returning 0 LMCache tokens so vLLM "
+                "recomputes one request.",
+                request_id,
+                age,
+            )
+        return True
+
+    def _mark_stage1_lookup_timed_out(self, request_id: str) -> None:
+        """Apply the optional fixed-age Stage-1 timeout policy."""
+        self._mark_stage1_lookup_abandoned(request_id, reason="timeout")
+
+    def abandon_stage1_lookup(self, request_id: str) -> bool:
+        """Abandon one still-pending Stage-1 lookup due to GPU starvation.
+
+        Recheck the lookup once nonblockingly before abandoning it. If its
+        result became ready since the scheduler's earlier scan, preserve that
+        cache hit and let the next scheduler pass consume it instead.
+        """
+        if self._lookup_was_logically_timed_out(request_id):
+            return False
+        if request_id not in self._pending_lookups:
+            return False
+        if request_id in self._finished_lookup_results:
+            return False
+
+        result = self.check_lookup_result(request_id)
+        if result is not None:
+            return False
+        return self._mark_stage1_lookup_abandoned(request_id, reason="starvation")
 
     def _send_end_session_async(self, request_id: str) -> None:
         if not self.is_healthy:
@@ -965,9 +1002,10 @@ class LMCacheMPSchedulerAdapter:
         self._lookup_started_at.pop(request_id, None)
         state.reaped = True
         logger.info(
-            "[MP_STAGE1_LOOKUP_TIMEOUT_REAPED] request %s stale prefetch "
-            "completed and lookup locks were released",
+            "[MP_STAGE1_LOOKUP_REAPED] request %s stale prefetch completed "
+            "and lookup locks were released (reason=%s)",
             request_id,
+            state.reason,
         )
         self._maybe_finalize_timed_out_lookup_session(request_id)
 

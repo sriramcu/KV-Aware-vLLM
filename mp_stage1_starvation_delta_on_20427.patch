@@ -1,0 +1,291 @@
+--- a/third_party/LMCache/lmcache/integration/vllm/vllm_multi_process_adapter.py
++++ b/third_party/LMCache/lmcache/integration/vllm/vllm_multi_process_adapter.py
+@@ -212,7 +212,8 @@
+ class _TimedOutLookupCleanup:
+     """Background cleanup state for a logically abandoned Stage-1 lookup.
+ 
+-    A lookup timeout returns a logical cache miss to vLLM immediately, but the
++    A fixed timeout or scheduler-starvation fallback can return a logical cache
++    miss to vLLM immediately, but the
+     already-issued prefetch is allowed to finish in the LMCache daemon. Once it
+     finishes, the scheduler adapter consumes the prefetch result and releases
+     the read locks that would otherwise have been consumed by RETRIEVE.
+@@ -227,6 +228,7 @@
+     free_futures: dict[str, MessagingFuture[Any]] | None = None
+     reaped: bool = False
+     end_session_requested: bool = False
++    reason: str = "timeout"
+ 
+ 
+ def get_lmcache_chunk_size(
+@@ -814,20 +816,21 @@
+         with self._timed_out_lookup_lock:
+             return request_id in self._timed_out_lookups
+ 
+-    def _mark_stage1_lookup_timed_out(self, request_id: str) -> None:
+-        """Turn a slow Stage-1 lookup into a logical cache miss.
+-
+-        The daemon-side prefetch is *not* cancelled.  It is moved to the
++    def _mark_stage1_lookup_abandoned(
++        self, request_id: str, *, reason: str
++    ) -> bool:
++        """Turn a pending Stage-1 lookup into a logical cache miss.
++
++        The daemon-side prefetch is *not* cancelled. It is moved to the
+         background reaper, which consumes the eventual result and releases
+-        the retained L1 read locks.  This mirrors the legacy vLLM-facing
+-        semantic ("return 0 so vLLM recomputes") without pretending the
+-        underlying asynchronous storage work was cancelled.
++        retained L1 read locks. This is safe only for Stage 1, before vLLM GPU
++        destination blocks have been handed to LMCache.
+         """
+         with self._timed_out_lookup_lock:
+             if request_id in self._timed_out_lookups:
+-                return
++                return False
+             self._timed_out_lookups[request_id] = _TimedOutLookupCleanup(
+-                request_id=request_id
++                request_id=request_id, reason=reason
+             )
+ 
+         # Cache the logical miss so repeated scheduler calls remain stable.
+@@ -838,13 +841,47 @@
+         age = (
+             time.monotonic() - started_at if started_at is not None else float("nan")
+         )
+-        logger.warning(
+-            "[MP_STAGE1_LOOKUP_TIMEOUT] request %s still pending after %.3fs; "
+-            "returning 0 LMCache tokens so vLLM recomputes. The stale "
+-            "prefetch will drain and be reaped in the background.",
+-            request_id,
+-            age,
+-        )
++        if reason == "timeout":
++            logger.warning(
++                "[MP_STAGE1_LOOKUP_TIMEOUT] request %s still pending after %.3fs; "
++                "returning 0 LMCache tokens so vLLM recomputes. The stale "
++                "prefetch will drain and be reaped in the background.",
++                request_id,
++                age,
++            )
++        else:
++            logger.warning(
++                "[MP_STAGE1_STARVATION_FALLBACK] abandoning pending request %s "
++                "after %.3fs of Stage-1 age because vLLM reported exposed "
++                "scheduler starvation; returning 0 LMCache tokens so vLLM "
++                "recomputes one request.",
++                request_id,
++                age,
++            )
++        return True
++
++    def _mark_stage1_lookup_timed_out(self, request_id: str) -> None:
++        """Apply the optional fixed-age Stage-1 timeout policy."""
++        self._mark_stage1_lookup_abandoned(request_id, reason="timeout")
++
++    def abandon_stage1_lookup(self, request_id: str) -> bool:
++        """Abandon one still-pending Stage-1 lookup due to GPU starvation.
++
++        Recheck the lookup once nonblockingly before abandoning it. If its
++        result became ready since the scheduler's earlier scan, preserve that
++        cache hit and let the next scheduler pass consume it instead.
++        """
++        if self._lookup_was_logically_timed_out(request_id):
++            return False
++        if request_id not in self._pending_lookups:
++            return False
++        if request_id in self._finished_lookup_results:
++            return False
++
++        result = self.check_lookup_result(request_id)
++        if result is not None:
++            return False
++        return self._mark_stage1_lookup_abandoned(request_id, reason="starvation")
+ 
+     def _send_end_session_async(self, request_id: str) -> None:
+         if not self.is_healthy:
+@@ -965,9 +1002,10 @@
+         self._lookup_started_at.pop(request_id, None)
+         state.reaped = True
+         logger.info(
+-            "[MP_STAGE1_LOOKUP_TIMEOUT_REAPED] request %s stale prefetch "
+-            "completed and lookup locks were released",
++            "[MP_STAGE1_LOOKUP_REAPED] request %s stale prefetch completed "
++            "and lookup locks were released (reason=%s)",
+             request_id,
++            state.reason,
+         )
+         self._maybe_finalize_timed_out_lookup_session(request_id)
+ 
+--- a/third_party/LMCache/tests/v1/test_mp_nonblocking_lookup.py
++++ b/third_party/LMCache/tests/v1/test_mp_nonblocking_lookup.py
+@@ -370,6 +370,41 @@
+     assert client.ends == ["r"]
+ 
+ 
++def test_stage1_starvation_fallback_abandons_one_pending_lookup_and_reaps(
++    make_adapter: AdapterFactory,
++) -> None:
++    """Starvation fallback works with the fixed-age timeout disabled."""
++    adapter, (client,) = make_adapter(
++        extra_config={
++            "lmcache.mp.lookup_timeout": 0.0,
++            "lmcache.mp.mq_timeout": 5.0,
++        }
++    )
++    submit(adapter, [client])
++
++    # Stage 1 is healthy but still pending.
++    assert adapter.check_lookup_result("r") is None
++    assert adapter.abandon_stage1_lookup("r")
++    assert adapter.check_lookup_result("r") == 0
++
++    # A repeated starvation signal is idempotent.
++    assert not adapter.abandon_stage1_lookup("r")
++
++    # Underlying prefetch is not cancelled. Once it finishes, the reaper
++    # consumes the stale hit and releases the retained lookup locks.
++    client.status.set_result(2)
++    deadline = time.time() + 3.0
++    while time.time() < deadline and not client.frees:
++        time.sleep(0.01)
++    assert [(key.start, key.end) for key in client.frees] == [(0, 128)]
++
++    adapter.end_session("r")
++    deadline = time.time() + 1.0
++    while time.time() < deadline and not client.ends:
++        time.sleep(0.01)
++    assert client.ends == ["r"]
++
++
+ def test_status_exception_allows_a_fresh_poll(make_adapter: AdapterFactory) -> None:
+     adapter, (client,) = make_adapter()
+     submit(adapter, [client])
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/lmcache_mp_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/lmcache_mp_connector.py
+@@ -395,9 +395,13 @@
+     Extra configs (kv_transfer_config.extra_config):
+     - lmcache.mp.host: the host of the LMCache server.
+     - lmcache.mp.port: the port of the LMCache server.
+-    - lmcache.mp.lookup_timeout: Stage-1 LOOKUP/prefetch deadline in seconds.
+-      This branch defaults it to 3.0 to reproduce the legacy behavior where a
+-      slow external lookup becomes a cache miss and vLLM recomputes.
++    - lmcache.mp.lookup_timeout: optional Stage-1 LOOKUP/prefetch deadline in
++      seconds. Disabled by default in this branch; set it to 3.0 to reproduce
++      the earlier legacy-timeout experiment.
++    - lmcache.mp.starvation_fallback: when true (default), a scheduler pass that
++      fully scans WAITING, has zero RUNNING requests, schedules no work, and
++      finds Stage-1 LMCache-pending requests may abandon one oldest pending
++      lookup so vLLM can recompute it.
+     """
+ 
+     def __init__(
+@@ -418,10 +422,17 @@
+         extra_config = dict(
+             vllm_config.kv_transfer_config.kv_connector_extra_config or {}
+         )
+-        # Legacy analogue for this research branch.  The generic vendored
+-        # adapter keeps the feature disabled by default; callers can override
+-        # this value explicitly (set <= 0 to disable).
+-        extra_config.setdefault("lmcache.mp.lookup_timeout", 3.0)
++        # Keep the legacy-style fixed Stage-1 timeout available as an
++        # experimental knob, but disable it by default. The starvation-based
++        # fallback below is the default policy for this branch.
++        extra_config.setdefault("lmcache.mp.lookup_timeout", 0.0)
++        self._stage1_starvation_fallback_enabled = bool(
++            extra_config.pop("lmcache.mp.starvation_fallback", True)
++        )
++        logger.info(
++            "LMCache MP Stage-1 starvation fallback enabled=%s",
++            self._stage1_starvation_fallback_enabled,
++        )
+ 
+         server_url = f"{server_host}:{server_port}"
+         zmq_context = zmq.Context.instance()
+@@ -634,6 +645,22 @@
+     # Scheduler-side methods
+     # ==============================
+ 
++    def abandon_stage1_lookup(self, request_id: str) -> bool:
++        """Logically abandon one Stage-1 LMCache lookup.
++
++        This is called by the vLLM scheduler only after an exposed-starvation
++        pass (zero RUNNING work and a full WAITING scan that found no runnable
++        request). It never acts on Stage-2 ``WAITING_FOR_REMOTE_KVS`` loads.
++
++        Returns True only if a still-pending Stage-1 lookup was converted into
++        a logical miss. The underlying LMCache prefetch is deliberately not
++        cancelled; the adapter's background reaper drains it and releases any
++        retained lookup locks.
++        """
++        if not self._stage1_starvation_fallback_enabled:
++            return False
++        return self.scheduler_adapter.abandon_stage1_lookup(request_id)
++
+     def get_num_new_matched_tokens(
+         self,
+         request: "Request",
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -528,6 +528,10 @@
+         # Use a temporary RequestQueue to collect requests that need to be
+         # skipped and put back at the head of the waiting queue later
+         skipped_waiting_requests = create_request_queue(self.policy)
++        # Stage-1 connector-pending requests seen during this WAITING scan.
++        # Keep the Request objects so starvation fallback can choose the oldest
++        # by arrival time after (and only after) a complete no-progress scan.
++        stage1_kv_pending_requests: list[Request] = []
+ 
+         # Next, schedule the WAITING requests.
+         if not preempted_reqs:
+@@ -612,7 +616,11 @@
+                         if ext_tokens is None:
+                             # The request cannot be scheduled because
+                             # the KVConnector couldn't determine
+-                            # the number of matched tokens.
++                            # the number of matched tokens. This is Stage 1:
++                            # no remote KV has been assigned GPU destination
++                            # blocks yet, so it is eligible for the narrow
++                            # starvation fallback below.
++                            stage1_kv_pending_requests.append(request)
+                             self.waiting.pop_request()
+                             skipped_waiting_requests.prepend_request(request)
+                             continue
+@@ -797,6 +805,37 @@
+                         self.encoder_cache_manager.allocate(request, i)
+                         if self.ec_connector is not None:
+                             self.ec_connector.update_state_after_alloc(request, i)
++        # If we exhausted the entire WAITING queue, have no RUNNING work,
++        # scheduled nothing, and at least one request was blocked specifically
++        # on a Stage-1 KV lookup, external KV is causing exposed GPU starvation.
++        # Abandon exactly one oldest Stage-1 lookup. The connector converts it
++        # to a logical cache miss; the next scheduler pass can recompute it.
++        #
++        # Deliberately do NOT apply this to WAITING_FOR_REMOTE_KVS (Stage 2):
++        # LMCache may already be writing into allocated GPU blocks there.
++        waiting_scan_exhausted = not self.waiting
++        if (
++            waiting_scan_exhausted
++            and not self.running
++            and not num_scheduled_tokens
++            and stage1_kv_pending_requests
++            and self.connector is not None
++        ):
++            abandon_stage1 = getattr(self.connector, "abandon_stage1_lookup", None)
++            if abandon_stage1 is not None:
++                oldest = min(
++                    stage1_kv_pending_requests, key=lambda req: req.arrival_time
++                )
++                if abandon_stage1(oldest.request_id):
++                    logger.warning(
++                        "[KV_STAGE1_STARVATION_FALLBACK] full WAITING scan made "
++                        "no scheduling progress with Running=0; abandoning one "
++                        "oldest Stage-1 KV lookup request_id=%s "
++                        "stage1_pending_seen=%d",
++                        oldest.request_id,
++                        len(stage1_kv_pending_requests),
++                    )
++
+         # Put back any skipped requests at the head of the waiting queue
+         if skipped_waiting_requests:
+             self.waiting.prepend_requests(skipped_waiting_requests)

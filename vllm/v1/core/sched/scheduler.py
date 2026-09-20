@@ -528,6 +528,10 @@ class Scheduler(SchedulerInterface):
         # Use a temporary RequestQueue to collect requests that need to be
         # skipped and put back at the head of the waiting queue later
         skipped_waiting_requests = create_request_queue(self.policy)
+        # Stage-1 connector-pending requests seen during this WAITING scan.
+        # Keep the Request objects so starvation fallback can choose the oldest
+        # by arrival time after (and only after) a complete no-progress scan.
+        stage1_kv_pending_requests: list[Request] = []
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs:
@@ -612,7 +616,11 @@ class Scheduler(SchedulerInterface):
                         if ext_tokens is None:
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
-                            # the number of matched tokens.
+                            # the number of matched tokens. This is Stage 1:
+                            # no remote KV has been assigned GPU destination
+                            # blocks yet, so it is eligible for the narrow
+                            # starvation fallback below.
+                            stage1_kv_pending_requests.append(request)
                             self.waiting.pop_request()
                             skipped_waiting_requests.prepend_request(request)
                             continue
@@ -797,6 +805,37 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.allocate(request, i)
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
+        # If we exhausted the entire WAITING queue, have no RUNNING work,
+        # scheduled nothing, and at least one request was blocked specifically
+        # on a Stage-1 KV lookup, external KV is causing exposed GPU starvation.
+        # Abandon exactly one oldest Stage-1 lookup. The connector converts it
+        # to a logical cache miss; the next scheduler pass can recompute it.
+        #
+        # Deliberately do NOT apply this to WAITING_FOR_REMOTE_KVS (Stage 2):
+        # LMCache may already be writing into allocated GPU blocks there.
+        waiting_scan_exhausted = not self.waiting
+        if (
+            waiting_scan_exhausted
+            and not self.running
+            and not num_scheduled_tokens
+            and stage1_kv_pending_requests
+            and self.connector is not None
+        ):
+            abandon_stage1 = getattr(self.connector, "abandon_stage1_lookup", None)
+            if abandon_stage1 is not None:
+                oldest = min(
+                    stage1_kv_pending_requests, key=lambda req: req.arrival_time
+                )
+                if abandon_stage1(oldest.request_id):
+                    logger.warning(
+                        "[KV_STAGE1_STARVATION_FALLBACK] full WAITING scan made "
+                        "no scheduling progress with Running=0; abandoning one "
+                        "oldest Stage-1 KV lookup request_id=%s "
+                        "stage1_pending_seen=%d",
+                        oldest.request_id,
+                        len(stage1_kv_pending_requests),
+                    )
+
         # Put back any skipped requests at the head of the waiting queue
         if skipped_waiting_requests:
             self.waiting.prepend_requests(skipped_waiting_requests)
