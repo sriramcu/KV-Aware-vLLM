@@ -17,7 +17,7 @@ set -Eeuo pipefail
 
 REPO=/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
 VENV=/mnt/shared/gpfs/home/sriramc2/venvs/kvaware-vllm029
-CUDA_HOME=/usr/local/cuda-13.0
+CUDA_HOME=/usr/local/cuda-13.1
 
 LINEARRAG_ROOT="${REPO}/Hierarchical_KV/LinearRAG"
 
@@ -92,6 +92,13 @@ source "${VENV}/bin/activate"
 export CUDA_HOME
 export PATH="${CUDA_HOME}/bin:${PATH}"
 export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
+
+# This project does not intentionally use NVIDIA MPS.  Point CUDA at a unique,
+# deliberately nonexistent MPS pipe directory so CUDA initialization falls
+# back to ordinary direct CUDA rather than connecting to the node-wide MPS
+# control daemon.  Do NOT create this directory.
+export CUDA_MPS_PIPE_DIRECTORY="/tmp/kvaware-no-mps-${USER}-${SLURM_JOB_ID}-DO-NOT-CREATE"
+
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 export HF_HOME="${HF_HOME:-/mnt/shared/gpfs/home/sriramc2/.cache/huggingface}"
@@ -255,12 +262,12 @@ nvidia-smi \
 echo
 echo "===== PREFLIGHT: GPU EXCLUSIVITY ====="
 
-# A stale/idle foreign MPS server can remain after another user's Slurm job and
-# normally accounts for only ~60 MiB/GPU.  That alone should not invalidate a
-# benchmark.  Foreign CUDA clients still invalidate the allocation.
+# KV-Aware explicitly bypasses MPS via CUDA_MPS_PIPE_DIRECTORY above.
 #
-# For extra safety, an MPS server is tolerated only while each nvidia-smi entry
-# stays below this small-memory ceiling.  Override only deliberately.
+# A tiny foreign MPS server can therefore be tolerated as idle daemon residue,
+# but a large MPS footprint may represent active hidden MPS clients and would
+# still contaminate a performance run.  Any foreign non-MPS CUDA process is
+# always fatal.
 FOREIGN_MPS_MAX_MIB="${FOREIGN_MPS_MAX_MIB:-256}"
 
 check_gpu_exclusivity() {
@@ -275,8 +282,15 @@ check_gpu_exclusivity() {
 
     echo "current Slurm job: $current_job"
     echo "current user:      $current_user"
+    echo "MPS bypass path:   ${CUDA_MPS_PIPE_DIRECTORY}"
     echo "idle MPS ceiling:  ${FOREIGN_MPS_MAX_MIB} MiB per GPU entry"
     echo
+
+    if [[ -e "${CUDA_MPS_PIPE_DIRECTORY}" ]]; then
+        echo "ERROR: MPS bypass path unexpectedly exists:"
+        echo "       ${CUDA_MPS_PIPE_DIRECTORY}"
+        return 44
+    fi
 
     local bad=0
     local found=0
@@ -308,16 +322,12 @@ check_gpu_exclusivity() {
             echo "  verdict:   OK -- belongs to current job"
 
         elif [[ "$process" == *"nvidia-cuda-mps-server"* ]]; then
-            # nvidia-smi reports the same MPS server once per GPU it serves.
-            # Permit a tiny residual server, but reject one carrying a larger
-            # footprint because it may still be servicing hidden/active work.
+            foreign_mps=$((foreign_mps + 1))
             if [[ "$used_mem" =~ ^[0-9]+$ ]] && \
                (( used_mem <= FOREIGN_MPS_MAX_MIB )); then
-                echo "  verdict:   WARNING -- small foreign MPS server; tolerated"
-                foreign_mps=$((foreign_mps + 1))
+                echo "  verdict:   WARNING -- small foreign MPS server; bypassed"
             else
-                echo "  verdict:   FAIL -- foreign MPS server exceeds idle ceiling"
-                foreign_mps=$((foreign_mps + 1))
+                echo "  verdict:   FAIL -- foreign MPS footprint exceeds idle ceiling"
                 bad=1
             fi
 
@@ -341,20 +351,25 @@ check_gpu_exclusivity() {
         echo "No CUDA compute processes detected before experiment startup."
     fi
 
-    echo "foreign tolerated MPS entries: $foreign_mps"
-    echo "foreign CUDA clients:          $foreign_clients"
+    echo "foreign MPS entries:     $foreign_mps"
+    echo "foreign CUDA clients:    $foreign_clients"
 
     if [[ "$bad" -ne 0 ]]; then
         echo
         echo "============================================================"
         echo "ERROR: GPU EXCLUSIVITY CHECK FAILED"
         echo
-        echo "A foreign CUDA client or non-idle foreign MPS server is"
+        echo "A foreign direct CUDA client or non-idle MPS workload is"
         echo "already present on the allocated GPU node."
         echo "============================================================"
         echo
         echo "===== NVIDIA-SMI AT REJECTION ====="
         nvidia-smi || true
+        echo
+        echo "===== MPS PROCESS VIEW AT REJECTION ====="
+        ps -eo user,pid,ppid,etimes,cmd \
+            | grep -E "nvidia-cuda-mps-(control|server)" \
+            | grep -v grep || true
         echo
         echo "===== CURRENT NODE SLURM VIEW ====="
         squeue -w "$(hostname -s)" \
@@ -365,8 +380,8 @@ check_gpu_exclusivity() {
     if [[ "$foreign_mps" -gt 0 ]]; then
         echo
         echo "WARNING: small foreign MPS server residue detected."
-        echo "Continuing because no foreign CUDA client is visible and"
-        echo "the MPS footprint is within the idle ceiling."
+        echo "Continuing because KV-Aware explicitly bypasses MPS and no"
+        echo "foreign direct CUDA client or large MPS footprint is visible."
     else
         echo "GPU exclusivity preflight passed cleanly."
     fi
@@ -388,9 +403,34 @@ if [[ -f third_party/LMCache.UPSTREAM_COMMIT ]]; then
 fi
 
 echo
+echo "===== PREFLIGHT: CUDA TOOLKIT / JIT ====="
+echo "CUDA_HOME=${CUDA_HOME}"
+echo "nvcc=$(command -v nvcc || true)"
+
+if [[ ! -x "${CUDA_HOME}/bin/nvcc" ]]; then
+    echo "ERROR: nvcc missing at ${CUDA_HOME}/bin/nvcc"
+    exit 45
+fi
+
+"${CUDA_HOME}/bin/nvcc" --version
+
+echo
 echo "===== PREFLIGHT: PYTHON / CUDA / NATIVE IMPORTS ====="
-python - <<'PY'
+echo "CUDA_MPS_PIPE_DIRECTORY=${CUDA_MPS_PIPE_DIRECTORY}"
+
+if [[ -e "${CUDA_MPS_PIPE_DIRECTORY}" ]]; then
+    echo "ERROR: MPS bypass path unexpectedly exists: ${CUDA_MPS_PIPE_DIRECTORY}"
+    exit 44
+fi
+
+# Keep a 120-second backstop around the first real CUDA initialization and
+# native-import preflight.  The tiny tensor allocation/synchronize on each
+# visible GPU proves that direct CUDA is usable before the expensive workload
+# starts.
+set +e
+timeout --signal=TERM --kill-after=10s 120s python -u - <<'PY'
 import inspect
+import os
 import torch
 import vllm
 import vllm._C_stable_libtorch as vllm_C
@@ -401,21 +441,62 @@ from lmcache.integration.vllm.vllm_multi_process_adapter import (
     LoadStoreOp,
 )
 
-print("torch:", torch.__version__)
-print("torch.version.cuda:", torch.version.cuda)
-print("cuda_available:", torch.cuda.is_available())
+print("torch:", torch.__version__, flush=True)
+print("torch.version.cuda:", torch.version.cuda, flush=True)
+print("CUDA_MPS_PIPE_DIRECTORY:",
+      os.environ.get("CUDA_MPS_PIPE_DIRECTORY"), flush=True)
+print("PYTORCH_NVML_BASED_CUDA_CHECK:",
+      os.environ.get("PYTORCH_NVML_BASED_CUDA_CHECK"), flush=True)
+print("cuda_initialized_before:", torch.cuda.is_initialized(), flush=True)
+print("cuda_available:", torch.cuda.is_available(), flush=True)
+print("cuda_initialized_after_available:",
+      torch.cuda.is_initialized(), flush=True)
 
-if torch.cuda.is_available():
-    print("gpu:", torch.cuda.get_device_name(0))
-    print("capability:", torch.cuda.get_device_capability(0))
+if not torch.cuda.is_available():
+    raise RuntimeError("CUDA is not available")
 
-print("vllm:", vllm.__file__)
-print("vllm native:", vllm_C.__file__)
-print("lmcache:", lmcache.__file__)
-print("LoadStoreOp:", inspect.signature(LoadStoreOp))
-print("scheduler_adapter:", inspect.signature(LMCacheMPSchedulerAdapter))
-print("worker_adapter:", inspect.signature(LMCacheMPWorkerAdapter))
+device_count = torch.cuda.device_count()
+print("device_count:", device_count, flush=True)
+if device_count < 2:
+    raise RuntimeError(f"expected at least 2 visible GPUs, got {device_count}")
+
+for i in range(2):
+    print(f"gpu[{i}]:", torch.cuda.get_device_name(i), flush=True)
+    print(f"capability[{i}]:", torch.cuda.get_device_capability(i), flush=True)
+    x = torch.zeros(1, device=f"cuda:{i}")
+    torch.cuda.synchronize(i)
+    print(f"direct_cuda_smoke[{i}]: PASS", flush=True)
+    del x
+
+print("vllm:", vllm.__file__, flush=True)
+print("vllm native:", vllm_C.__file__, flush=True)
+print("lmcache:", lmcache.__file__, flush=True)
+print("LoadStoreOp:", inspect.signature(LoadStoreOp), flush=True)
+print("scheduler_adapter:", inspect.signature(LMCacheMPSchedulerAdapter), flush=True)
+print("worker_adapter:", inspect.signature(LMCacheMPWorkerAdapter), flush=True)
+print("DIRECT CUDA / NATIVE PREFLIGHT PASSED", flush=True)
 PY
+cuda_preflight_rc=$?
+set -e
+
+if [[ "$cuda_preflight_rc" -eq 124 || "$cuda_preflight_rc" -eq 137 ]]; then
+    echo
+    echo "============================================================"
+    echo "ERROR: CUDA/NATIVE PREFLIGHT TIMED OUT AFTER 120 SECONDS"
+    echo
+    echo "Direct CUDA initialization/device access did not complete."
+    echo "Refusing to consume the H100 allocation."
+    echo "============================================================"
+    nvidia-smi || true
+    echo
+    ps -eo user,pid,ppid,etimes,cmd \
+        | grep -E "nvidia-cuda-mps-(control|server)" \
+        | grep -v grep || true
+    exit 43
+elif [[ "$cuda_preflight_rc" -ne 0 ]]; then
+    echo "ERROR: CUDA/native import preflight failed with rc=${cuda_preflight_rc}"
+    exit "$cuda_preflight_rc"
+fi
 
 echo
 echo "===== PREFLIGHT: SOURCE COMPATIBILITY ====="
@@ -506,6 +587,8 @@ cat > "${RUN_DIR}/run_config.json" <<EOF
   "gpu_memory_utilization": ${GPU_MEMORY_UTILIZATION},
   "max_num_seqs": ${MAX_NUM_SEQS},
   "enable_vpc": ${ENABLE_VPC},
+  "cuda_mps_bypass": true,
+  "cuda_mps_pipe_directory": "${CUDA_MPS_PIPE_DIRECTORY}",
   "lmcache_chunk_size": ${LMCACHE_CHUNK_SIZE},
   "lmcache_l1_size_gb": ${LMCACHE_L1_SIZE_GB},
   "lmcache_l2_dir": "${LMCACHE_L2_DIR}",
@@ -585,6 +668,7 @@ print(
             "kv_connector": "LMCacheMPConnector",
             "kv_connector_module_path": "lmcache.integration.vllm.lmcache_mp_connector",
             "kv_role": "kv_both",
+            "kv_load_failure_policy": "recompute",
             "kv_connector_extra_config": {
                 "lmcache.mp.host": "tcp://localhost",
                 "lmcache.mp.port": 5556,

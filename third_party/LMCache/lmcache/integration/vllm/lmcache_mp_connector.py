@@ -483,6 +483,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         # while current vLLM's type declaration requires it.
         super().__init__(vllm_config, role, kv_cache_config)  # type: ignore[arg-type]
         self._connector_stats = LMCacheMPConnectorStats()
+        # Request IDs that vLLM has already declared finished.  LMCache may still
+        # produce an asynchronous receive completion for one of these requests later.
+        # Such a completion must never be forwarded back to the scheduler.
+        self._engine_finished_req_ids: set[str] = set()
 
         # Fail fast, before the server handshake below.
         kv_cache_config = getattr(self, "_kv_cache_config", None)
@@ -911,26 +915,50 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
     def get_finished(
         self, finished_req_ids: set[str]
-    ) -> tuple[set[str] | None, set[str] | None]:
+        ) -> tuple[set[str] | None, set[str] | None]:
         """
-        Notifies worker-side connector ids of requests that have
-        finished generating tokens on the worker.
-        The scheduler process (via the Executors) will use this output
-        to track which workers are done.
+        Return completed asynchronous KV operations.
 
-        Returns:
-            ids of requests that have finished asynchronous transfer
-            (requests that previously returned True from request_finished()),
-            tuple of (sending/saving ids, recving/loading ids).
-            The finished saves/sends req ids must belong to a set provided in a
-            call to this method (this call or a prior one).
+        vLLM may finish/fail/abort a request before LMCache's asynchronous
+        retrieve completion arrives.  Never forward such a stale receive
+        completion to the scheduler: the request may already have been removed
+        from Scheduler.requests.
         """
+
+        # Keep this cumulative, because the LMCache completion can arrive on a
+        # later engine step than the step in which vLLM finished the request.
+        self._engine_finished_req_ids.update(finished_req_ids)
+
         if self.lazy_offload:
-            val = self.worker_adapter.get_finished_with_lazy_offload()
+            finished_sending, finished_recving = (
+                self.worker_adapter.get_finished_with_lazy_offload()
+            )
         else:
-            val = self.worker_adapter.get_finished(finished_req_ids)
-        # logger.error("Finished req ids: %s, %s", val[0], val[1])
-        return val
+            finished_sending, finished_recving = (
+                self.worker_adapter.get_finished(
+                    finished_req_ids if self._can_store else set()
+                )
+            )
+
+        if finished_recving:
+            stale_recving = (
+                finished_recving & self._engine_finished_req_ids
+            )
+
+            if stale_recving:
+                logger.warning(
+                    "Ignoring late LMCache receive completion(s) for "
+                    "already-finished request(s): %s",
+                    sorted(stale_recving),
+                )
+
+                # Make a new set rather than mutating an adapter-owned set.
+                finished_recving = finished_recving - stale_recving
+
+        # IMPORTANT: do NOT similarly remove finished_sending.
+        # A finished request can legitimately be waiting for its async STORE
+        # completion before its blocks are released.
+        return finished_sending, finished_recvingl
 
     def build_connector_worker_meta(self):
         if not self.lazy_offload:
