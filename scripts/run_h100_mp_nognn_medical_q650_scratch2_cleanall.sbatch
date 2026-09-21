@@ -255,6 +255,14 @@ nvidia-smi \
 echo
 echo "===== PREFLIGHT: GPU EXCLUSIVITY ====="
 
+# A stale/idle foreign MPS server can remain after another user's Slurm job and
+# normally accounts for only ~60 MiB/GPU.  That alone should not invalidate a
+# benchmark.  Foreign CUDA clients still invalidate the allocation.
+#
+# For extra safety, an MPS server is tolerated only while each nvidia-smi entry
+# stays below this small-memory ceiling.  Override only deliberately.
+FOREIGN_MPS_MAX_MIB="${FOREIGN_MPS_MAX_MIB:-256}"
+
 check_gpu_exclusivity() {
     local current_job="${SLURM_JOB_ID:-}"
     local current_user
@@ -267,21 +275,21 @@ check_gpu_exclusivity() {
 
     echo "current Slurm job: $current_job"
     echo "current user:      $current_user"
+    echo "idle MPS ceiling:  ${FOREIGN_MPS_MAX_MIB} MiB per GPU entry"
     echo
 
     local bad=0
     local found=0
+    local foreign_mps=0
+    local foreign_clients=0
 
     while IFS=',' read -r pid process gpu_uuid used_mem; do
-        # Trim whitespace emitted by nvidia-smi CSV.
-        pid="$(echo "$pid" | xargs)"
-        process="$(echo "$process" | xargs)"
-        gpu_uuid="$(echo "$gpu_uuid" | xargs)"
-        used_mem="$(echo "$used_mem" | xargs)"
+        pid="$(xargs <<<"$pid")"
+        process="$(xargs <<<"$process")"
+        gpu_uuid="$(xargs <<<"$gpu_uuid")"
+        used_mem="$(xargs <<<"$used_mem")"
 
         [[ -z "$pid" ]] && continue
-        [[ "$pid" == "No running processes found" ]] && continue
-
         found=1
 
         local owner cgroup
@@ -296,50 +304,73 @@ check_gpu_exclusivity() {
         echo "  memory:    ${used_mem} MiB"
         echo "  cgroup:    ${cgroup:-UNREADABLE}"
 
-        # Allow a GPU process only if it belongs to THIS Slurm job.
         if grep -q "/job_${current_job}/" <<<"$cgroup"; then
             echo "  verdict:   OK -- belongs to current job"
+
+        elif [[ "$process" == *"nvidia-cuda-mps-server"* ]]; then
+            # nvidia-smi reports the same MPS server once per GPU it serves.
+            # Permit a tiny residual server, but reject one carrying a larger
+            # footprint because it may still be servicing hidden/active work.
+            if [[ "$used_mem" =~ ^[0-9]+$ ]] && \
+               (( used_mem <= FOREIGN_MPS_MAX_MIB )); then
+                echo "  verdict:   WARNING -- small foreign MPS server; tolerated"
+                foreign_mps=$((foreign_mps + 1))
+            else
+                echo "  verdict:   FAIL -- foreign MPS server exceeds idle ceiling"
+                foreign_mps=$((foreign_mps + 1))
+                bad=1
+            fi
+
         elif [[ "$owner" == "root" ]]; then
-            # Root-owned CUDA utilities/monitoring are not automatically fatal.
-            echo "  verdict:   WARNING -- root-owned foreign GPU process"
+            echo "  verdict:   WARNING -- root/system GPU process"
+
         else
-            echo "  verdict:   FAIL -- foreign GPU process"
+            echo "  verdict:   FAIL -- foreign CUDA client"
+            foreign_clients=$((foreign_clients + 1))
             bad=1
         fi
 
         echo
     done < <(
         nvidia-smi \
-          --query-compute-apps=pid,process_name,gpu_uuid,used_memory \
-          --format=csv,noheader,nounits 2>/dev/null || true
+            --query-compute-apps=pid,process_name,gpu_uuid,used_memory \
+            --format=csv,noheader,nounits 2>/dev/null || true
     )
 
     if [[ "$found" -eq 0 ]]; then
         echo "No CUDA compute processes detected before experiment startup."
     fi
 
+    echo "foreign tolerated MPS entries: $foreign_mps"
+    echo "foreign CUDA clients:          $foreign_clients"
+
     if [[ "$bad" -ne 0 ]]; then
         echo
         echo "============================================================"
         echo "ERROR: GPU EXCLUSIVITY CHECK FAILED"
         echo
-        echo "One or more non-root CUDA processes are already using the"
-        echo "GPU node but do not belong to Slurm job ${current_job}."
-        echo
-        echo "Refusing to run a reproducibility/performance experiment on"
-        echo "a contaminated GPU allocation."
+        echo "A foreign CUDA client or non-idle foreign MPS server is"
+        echo "already present on the allocated GPU node."
         echo "============================================================"
+        echo
         echo "===== NVIDIA-SMI AT REJECTION ====="
         nvidia-smi || true
-
         echo
         echo "===== CURRENT NODE SLURM VIEW ====="
         squeue -w "$(hostname -s)" \
-        -o "%.18i %.12u %.9P %.10T %.10M %.6D %R" || true
+            -o "%.18i %.12u %.9P %.10T %.10M %.6D %R" || true
         return 42
     fi
 
-    echo "GPU exclusivity preflight passed."
+    if [[ "$foreign_mps" -gt 0 ]]; then
+        echo
+        echo "WARNING: small foreign MPS server residue detected."
+        echo "Continuing because no foreign CUDA client is visible and"
+        echo "the MPS footprint is within the idle ceiling."
+    else
+        echo "GPU exclusivity preflight passed cleanly."
+    fi
+
     return 0
 }
 
@@ -648,7 +679,7 @@ curl -sf \
 # Actual project workload
 #
 # Hide CUDA from the retrieval driver so its sentence-transformer work cannot
-# consume memory from the already-running vLLM L40 process.
+# consume memory from the already-running vLLM H100 process.
 # ============================================================================
 
 echo
