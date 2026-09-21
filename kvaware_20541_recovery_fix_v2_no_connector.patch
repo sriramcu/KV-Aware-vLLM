@@ -1,0 +1,771 @@
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -144,6 +144,13 @@
+     new_block_ids: list[tuple[list[int], ...] | None]
+     num_computed_tokens: list[int]
+     num_output_tokens: list[int]
++    # V2 load-failure recovery only: requests whose computed-token position was
++    # explicitly moved backwards by the scheduler. The worker must restore
++    # device-side request state to this accepted scheduler state before forward.
++    rewound_req_ids: set[str] | None = None
++    # Accepted token history for rewound requests. Populated only on the rare
++    # recovery path so ordinary scheduler payloads are unchanged.
++    rewound_all_token_ids: dict[str, list[int]] | None = None
+ 
+     # Version of dataclass repr with token IDs obfuscated.
+     def anon_repr(self) -> str:
+@@ -194,6 +201,8 @@
+             new_block_ids=[],
+             num_computed_tokens=[],
+             num_output_tokens=[],
++            rewound_req_ids=set(),
++            rewound_all_token_ids={},
+         )
+ 
+ 
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
++import os
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+@@ -208,6 +209,11 @@
+ 
+         # IDs of requests preempted since the last call to schedule().
+         self.reset_preempted_req_ids: set[str] = set()
++        # Requests explicitly rewound after a rejected/failed external KV load.
++        # Kept until that request is next dispatched so Model Runner V2 can
++        # restore its device-side optimistic state to the scheduler's accepted state.
++        self.kv_rewound_req_ids: set[str] = set()
++        self._kv_recompute_debug = os.getenv("VLLM_KV_RECOMPUTE_DEBUG", "0") == "1"
+ 
+         # Counter for requests waiting for streaming input. Used to calculate
+         # number of unfinished requests
+@@ -1661,6 +1667,14 @@
+                 req.num_output_tokens + req.num_output_placeholders
+             )
+ 
++        dispatched_rewinds = self.kv_rewound_req_ids.intersection(req_ids)
++        rewound_all_token_ids = {
++            req.request_id: list(req.all_token_ids)
++            for req in itertools.chain(running_reqs, resumed_reqs)
++            if req.request_id in dispatched_rewinds
++        }
++        self.kv_rewound_req_ids.difference_update(dispatched_rewinds)
++
+         return CachedRequestData(
+             req_ids=req_ids,
+             resumed_req_ids=resumed_req_ids,
+@@ -1669,6 +1683,8 @@
+             new_block_ids=new_block_ids,
+             num_computed_tokens=num_computed_tokens,
+             num_output_tokens=num_output_tokens,
++            rewound_req_ids=dispatched_rewinds,
++            rewound_all_token_ids=rewound_all_token_ids,
+         )
+ 
+     def _try_schedule_encoder_inputs(
+@@ -2570,6 +2586,7 @@
+ 
+         self.encoder_cache_manager.free(request)
+         request_id = request.request_id
++        self.kv_rewound_req_ids.discard(request_id)
+         self.finished_req_ids.add(request_id)
+         if self.finished_req_ids_dict is not None:
+             self.finished_req_ids_dict[request.client_index].add(request_id)
+@@ -2994,6 +3011,38 @@
+             logger.debug("Finished sending KV transfer for request %s", req_id)
+             assert req_id in self.requests
+             self._free_blocks(self.requests[req_id])
++
++    def _mark_kv_load_rewind(self, request: Request, old_num_computed: int) -> None:
++        """Record and sanitize a backward KV-load-recovery transition.
++
++        The scheduler's accepted token history intentionally excludes async output
++        placeholders. Any in-flight output from the rejected optimistic path is
++        marked stale/drop-only so it cannot mutate the rewound counters later.
++        """
++        if request.num_computed_tokens >= old_num_computed:
++            return
++        self.kv_rewound_req_ids.add(request.request_id)
++
++        if request.num_in_flight_tokens > 0:
++            request.drop_stale_output = True
++            request.num_stale_output_tokens = max(
++                request.num_stale_output_tokens, request.num_in_flight_tokens
++            )
++        request.num_output_placeholders = 0
++        if request.spec_token_ids:
++            request.spec_token_ids = []
++
++        if self._kv_recompute_debug:
++            logger.warning(
++                "[KV_RECOMPUTE_REWIND] req=%s old_computed=%d new_computed=%d "
++                "in_flight=%d stale=%d accepted_tokens=%d",
++                request.request_id,
++                old_num_computed,
++                request.num_computed_tokens,
++                request.num_in_flight_tokens,
++                request.num_stale_output_tokens,
++                len(request.all_token_ids),
++            )
+ 
+     def _update_requests_with_invalid_blocks(
+         self,
+@@ -3071,8 +3120,10 @@
+                     continue
+ 
+                 marked_invalid_block = True
+-                # Truncate the computed tokens at the first failed block
++                # Truncate the computed tokens at the first failed block.
++                old_num_computed = request.num_computed_tokens
+                 request.num_computed_tokens = idx * self.block_size
++                self._mark_kv_load_rewind(request, old_num_computed)
+                 num_affected_tokens = (
+                     req_num_computed_tokens - request.num_computed_tokens
+                 )
+@@ -3092,7 +3143,9 @@
+                     total_affected_tokens += (
+                         request.num_computed_tokens - req_num_computed_tokens
+                     )
++                    old_num_computed = request.num_computed_tokens
+                     request.num_computed_tokens = req_num_computed_tokens
++                    self._mark_kv_load_rewind(request, old_num_computed)
+ 
+                 affected_req_ids.add(request.request_id)
+ 
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -19,6 +19,7 @@
+ 
+ import functools
+ import gc
++import os
+ import time
+ from contextlib import AbstractContextManager
+ from copy import deepcopy
+@@ -1071,15 +1072,89 @@
+         # Add new blocks and update num_computed_tokens for the existing requests.
+         reqs = scheduler_output.scheduled_cached_reqs
+         num_computed_tokens_np = self.req_states.num_computed_tokens_np
++        rewound_req_ids = reqs.rewound_req_ids or set()
++        rewound_all_token_ids = reqs.rewound_all_token_ids or {}
++        debug_recompute = os.getenv("VLLM_KV_RECOMPUTE_DEBUG", "0") == "1"
++        staged_rewind = False
+         for req_id, num_computed_tokens, req_new_block_ids in zip(
+             reqs.req_ids, reqs.num_computed_tokens, reqs.new_block_ids
+         ):
+             req_index = self.req_states.req_id_to_index[req_id]
++            old_cpu_num_computed = int(num_computed_tokens_np[req_index])
++
++            if req_id in rewound_req_ids:
++                accepted_token_ids = rewound_all_token_ids[req_id]
++                accepted_total_len = len(accepted_token_ids)
++                query_len = scheduler_output.num_scheduled_tokens.get(req_id, 0)
++
++                # Absolute rollback: the scheduler is authoritative after a
++                # rejected external KV load. Restore every request-state field
++                # used by vanilla Llama/Qwen sampling in this branch.
++                self.req_states.num_computed_tokens.stage_write_elem(
++                    req_index, num_computed_tokens
++                )
++                self.req_states.total_len.stage_write_elem(
++                    req_index, accepted_total_len
++                )
++                self.req_states.all_token_ids.stage_write(
++                    req_index, 0, accepted_token_ids
++                )
++                self.req_states.draft_tokens[req_index].zero_()
++                self.req_states.next_prefill_tokens[:, req_index].zero_()
++                prompt_len = int(self.req_states.prompt_len.np[req_index])
++                if accepted_total_len > prompt_len:
++                    self.req_states.last_sampled_tokens[req_index, 0] = (
++                        accepted_token_ids[-1]
++                    )
++                else:
++                    self.req_states.last_sampled_tokens[req_index, 0] = 0
++
++                # Rebuild output-token penalty counts when this request uses
++                # frequency/presence/repetition penalties. This is rare and
++                # only runs on recovery, so the explicit bincount is preferable
++                # to carrying stale counts from discarded optimistic frames.
++                if self.sampler is not None:
++                    penalties = self.sampler.penalties_state
++                    if penalties.use_penalty[req_index]:
++                        row = penalties.output_bin_counts[req_index]
++                        row.zero_()
++                        output_ids = accepted_token_ids[prompt_len:]
++                        if output_ids:
++                            ids = torch.tensor(
++                                output_ids, device=row.device, dtype=torch.int64
++                            )
++                            row.add_(torch.bincount(ids, minlength=row.numel()))
++
++                staged_rewind = True
++                if debug_recompute:
++                    effective_seq_len = num_computed_tokens + query_len
++                    logger.warning(
++                        "[KV_RECOMPUTE_WORKER] req=%s old_cpu_computed=%d "
++                        "new_computed=%d query_len=%d effective_seq_len=%d "
++                        "max_model_len=%d accepted_total_len=%d",
++                        req_id,
++                        old_cpu_num_computed,
++                        num_computed_tokens,
++                        query_len,
++                        effective_seq_len,
++                        self.max_model_len,
++                        accepted_total_len,
++                    )
++                    if effective_seq_len > self.max_model_len:
++                        raise RuntimeError(
++                            "KV recompute would exceed max_model_len after rewind: "
++                            f"req={req_id} computed={num_computed_tokens} "
++                            f"query={query_len} max={self.max_model_len}"
++                        )
++
+             num_computed_tokens_np[req_index] = num_computed_tokens
+             if req_new_block_ids is not None:
+                 self.block_tables.append_block_ids(
+                     req_index, req_new_block_ids, overwrite=False
+                 )
++
++        if staged_rewind:
++            self.req_states.apply_staged_writes()
+ 
+         # Update CPU num_computed_prefill_tokens.
+         np.minimum(
+--- a/third_party/LMCache/lmcache/integration/vllm/vllm_v1_adapter.py
++++ b/third_party/LMCache/lmcache/integration/vllm/vllm_v1_adapter.py
+@@ -66,8 +66,11 @@
+ class LoadSpec:
+     # Number of tokens cached in vLLM
+     vllm_cached_tokens: int
+-    # Number of tokens that are cached in LMCache
++    # Number of tokens that are cached in LMCache (lookup result / metrics).
+     lmcache_cached_tokens: int
++    # Exclusive token endpoint the scheduler actually allocated for external
++    # loading. This may be N-1 on a full-prompt hit, or lower after a load cap.
++    load_end_tokens: int
+     # Whether the scheduler allow us to load the tokens
+     can_load: bool
+ 
+@@ -819,7 +822,7 @@
+             )
+             token_mask[:masked_token_count] = False
+ 
+-            lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
++            lmcache_cached_tokens = request.load_spec.load_end_tokens
+             if self.use_layerwise:
+                 if idx == last_idx:
+                     sync = True
+@@ -1479,7 +1482,6 @@
+         # when many concurrent requests each need large allocations.
+         # Remaining tokens beyond the cap will be computed locally
+         # via chunked prefill rather than loaded from external cache.
+-        capped_lmcache_tokens = num_external_hit_tokens
+         if (
+             self._max_tokens_per_load > 0
+             and need_to_allocate > self._max_tokens_per_load
+@@ -1492,13 +1494,6 @@
+                 * self._lmcache_chunk_size
+             )
+             need_to_allocate = cap
+-            # Align capped_lmcache_tokens to chunk boundary so that
+-            # session.get_hashes() receives a chunk-aligned end value.
+-            capped_lmcache_tokens = (
+-                (num_computed_tokens + cap)
+-                // self._lmcache_chunk_size
+-                * self._lmcache_chunk_size
+-            )
+             logger.debug(
+                 "Reqid: %s, Chunked KV loading: capped from "
+                 "%d to %d external tokens "
+@@ -1509,9 +1504,11 @@
+                 self._max_tokens_per_load,
+             )
+ 
++        scheduled_load_tokens = max(need_to_allocate, 0)
+         self.load_specs[req_id] = LoadSpec(
+             vllm_cached_tokens=num_computed_tokens,
+-            lmcache_cached_tokens=capped_lmcache_tokens,
++            lmcache_cached_tokens=num_external_hit_tokens,
++            load_end_tokens=num_computed_tokens + scheduled_load_tokens,
+             can_load=False,
+         )
+ 
+@@ -1576,31 +1573,29 @@
+             self.load_specs[request.request_id].can_load = False
+             return
+ 
+-        recalc_last = (
+-            1
+-            if (
+-                self.load_specs[request.request_id].lmcache_cached_tokens
+-                == request.num_tokens
+-            )
+-            else 0
+-        )
+-        assert (
+-            num_external_tokens
+-            == self.load_specs[request.request_id].lmcache_cached_tokens
+-            - self.load_specs[request.request_id].vllm_cached_tokens
+-            - recalc_last
+-        ), (
+-            f"Mismatch in tokens to load: {num_external_tokens} vs "
+-            f"{self.load_specs[request.request_id].lmcache_cached_tokens} "
+-            "(tokens in lmcache) - "
+-            f"{self.load_specs[request.request_id].vllm_cached_tokens} "
+-            "(tokens in vllm) - "
+-            f"{recalc_last} "
+-            "(full lmcache hits subtracts last token to recalculate logits)"
+-            f" for request {request.request_id}"
+-        )
+-
+-        self.load_specs[request.request_id].can_load = True
++        load_spec = self.load_specs[request.request_id]
++        expected_external_tokens = load_spec.load_end_tokens - load_spec.vllm_cached_tokens
++        assert num_external_tokens == expected_external_tokens, (
++            f"Mismatch in tokens to load: scheduler allocated {num_external_tokens}, "
++            f"LMCache load endpoint implies {expected_external_tokens} "
++            f"(load_end={load_spec.load_end_tokens}, "
++            f"vllm_cached={load_spec.vllm_cached_tokens}, "
++            f"lmcache_hit={load_spec.lmcache_cached_tokens}) "
++            f"for request {request.request_id}"
++        )
++        if os.getenv("LMCACHE_KV_ACCOUNTING_DEBUG", "0") == "1":
++            logger.warning(
++                "[LMCACHE_LOAD_ACCOUNTING] req=%s vllm_cached=%d lmcache_hit=%d "
++                "scheduled_external=%d load_end=%d prompt_tokens=%d",
++                request.request_id,
++                load_spec.vllm_cached_tokens,
++                load_spec.lmcache_cached_tokens,
++                num_external_tokens,
++                load_spec.load_end_tokens,
++                request.num_tokens,
++            )
++
++        load_spec.can_load = True
+ 
+     @_lmcache_nvtx_annotate
+     def build_connector_meta(
+--- a/third_party/LMCache/lmcache/v1/distributed/l1_manager.py
++++ b/third_party/LMCache/lmcache/v1/distributed/l1_manager.py
+@@ -6,7 +6,9 @@
+ # Standard
+ from dataclasses import dataclass
+ from typing import Literal
++import os
+ import threading
++import time
+ 
+ # First Party
+ from lmcache.lmcache_native import TTLLock
+@@ -208,6 +210,13 @@
+         )
+         self._write_ttl_seconds = config.write_ttl_seconds
+         self._read_ttl_seconds = config.read_ttl_seconds
++        self._prefetch_lifetime_debug = (
++            os.getenv("LMCACHE_PREFETCH_LIFETIME_DEBUG", "0") == "1"
++        )
++        self._debug_read_reserved_at: dict[ObjectKey, float] = {}
++        self._prefetch_lifetime_warn_s = float(
++            os.getenv("LMCACHE_PREFETCH_LIFETIME_WARN_S", "30")
++        )
+ 
+         self._registered_listeners: list[L1ManagerListener] = []
+ 
+@@ -287,6 +296,8 @@
+                 entry.read_lock.lock()
+             ret[key] = (L1Error.SUCCESS, entry.memory_obj)
+             successful_keys.append(key)
++            if self._prefetch_lifetime_debug:
++                self._debug_read_reserved_at.setdefault(key, time.monotonic())
+ 
+         for listener in self._registered_listeners:
+             listener.on_l1_keys_reserved_read(successful_keys)
+@@ -325,10 +336,26 @@
+         for key in keys:
+             entry = self._objects.get(key, None)
+             if entry is None:
++                if self._prefetch_lifetime_debug:
++                    reserved_at = self._debug_read_reserved_at.get(key)
++                    age = time.monotonic() - reserved_at if reserved_at else -1.0
++                    logger.error(
++                        "[L1_READ_LIFETIME] unsafe_read missing key=%s "
++                        "reserved_age_s=%.3f read_ttl_s=%d objects=%d",
++                        key, age, self._read_ttl_seconds, len(self._objects),
++                    )
+                 ret[key] = (L1Error.KEY_NOT_EXIST, None)
+                 continue
+ 
+             if not entry.read_lock.is_locked():
++                if self._prefetch_lifetime_debug:
++                    reserved_at = self._debug_read_reserved_at.get(key)
++                    age = time.monotonic() - reserved_at if reserved_at else -1.0
++                    logger.error(
++                        "[L1_READ_LIFETIME] unsafe_read unlocked key=%s "
++                        "reserved_age_s=%.3f read_ttl_s=%d objects=%d",
++                        key, age, self._read_ttl_seconds, len(self._objects),
++                    )
+                 ret[key] = (L1Error.KEY_NOT_READABLE, None)
+                 continue
+ 
+@@ -375,6 +402,14 @@
+         for key in keys:
+             entry = self._objects.get(key, None)
+             if entry is None:
++                if self._prefetch_lifetime_debug:
++                    reserved_at = self._debug_read_reserved_at.pop(key, None)
++                    age = time.monotonic() - reserved_at if reserved_at else -1.0
++                    logger.warning(
++                        "[L1_READ_LIFETIME] finish_read missing key=%s "
++                        "reserved_age_s=%.3f read_ttl_s=%d objects=%d",
++                        key, age, self._read_ttl_seconds, len(self._objects),
++                    )
+                 logger.warning(
+                     "L1Manager: finish read on non-existing key %s, "
+                     "potential inconsistent data might be read",
+@@ -406,6 +441,17 @@
+             # overhead (TTLLock is C++ std::atomic).
+             for _ in range(total):
+                 entry.read_lock.unlock()
++            if self._prefetch_lifetime_debug and not entry.read_lock.is_locked():
++                reserved_at = self._debug_read_reserved_at.pop(key, None)
++                if reserved_at is not None:
++                    held_s = time.monotonic() - reserved_at
++                    if held_s >= self._prefetch_lifetime_warn_s:
++                        logger.warning(
++                            "[L1_READ_LIFETIME] long_read key=%s held_s=%.3f "
++                            "read_ttl_s=%d warn_s=%.1f",
++                            key, held_s, self._read_ttl_seconds,
++                            self._prefetch_lifetime_warn_s,
++                        )
+             if entry.is_temporary and not entry.read_lock.is_locked():
+                 # NOTE: temporary objects shouldn't have write-locks
+                 need_to_free.append(entry.memory_obj)
+--- a/examples/disaggregated/kv_load_failure_recovery_offline/prefill_example.py
++++ b/examples/disaggregated/kv_load_failure_recovery_offline/prefill_example.py
+@@ -1,5 +1,5 @@
+ # SPDX-License-Identifier: Apache-2.0
+-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import argparse
+ 
+ from vllm import LLM, SamplingParams
+ from vllm.config import KVTransferConfig
+@@ -17,38 +17,27 @@
+ 
+ 
+ def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--model", default="meta-llama/Llama-3.2-1B-Instruct")
++    parser.add_argument("--storage", default="local_storage")
++    parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
++    args = parser.parse_args()
++
+     prompts = read_prompts()
+-
+-    sampling_params = SamplingParams(temperature=0, top_p=0.95, max_tokens=1)
+-
++    sampling_params = SamplingParams(temperature=0, max_tokens=1)
+     llm = LLM(
+-        model="meta-llama/Llama-3.2-1B-Instruct",
++        model=args.model,
+         enforce_eager=True,
+-        gpu_memory_utilization=0.8,
++        gpu_memory_utilization=args.gpu_memory_utilization,
+         kv_transfer_config=KVTransferConfig(
+             kv_connector="ExampleConnector",
+             kv_role="kv_both",
+-            kv_connector_extra_config={"shared_storage_path": "local_storage"},
++            kv_connector_extra_config={"shared_storage_path": args.storage},
+         ),
+-    )  # , max_model_len=2048, max_num_batched_tokens=2048)
+-
+-    # 1ST generation (prefill instance)
+-    outputs = llm.generate(
+-        prompts,
+-        sampling_params,
+     )
+-
+-    new_prompts = []
+-    print("-" * 30)
+-    for output in outputs:
+-        prompt = output.prompt
+-        generated_text = output.outputs[0].text
+-        new_prompts.append(prompt + generated_text)
+-        print(f"Prompt: {prompt!r}\nGenerated text: {generated_text!r}")
+-        print("-" * 30)
+-
+-    # Write new_prompts to prefill_output.txt
+-    with open("prefill_output.txt", "w") as f:
++    outputs = llm.generate(prompts, sampling_params)
++    new_prompts = [o.prompt + o.outputs[0].text for o in outputs]
++    with open("prefill_output.txt", "w", encoding="utf-8") as f:
+         for prompt in new_prompts:
+             f.write(prompt + "\n")
+     print(f"Saved {len(new_prompts)} prompts to prefill_output.txt")
+--- a/examples/disaggregated/kv_load_failure_recovery_offline/decode_example.py
++++ b/examples/disaggregated/kv_load_failure_recovery_offline/decode_example.py
+@@ -1,85 +1,75 @@
+ # SPDX-License-Identifier: Apache-2.0
+-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import argparse
++import json
+ 
+ from vllm import LLM, SamplingParams
+ from vllm.config import KVTransferConfig
+ 
+ 
+ def read_prompts():
+-    """Read prompts from prefill_output.txt"""
+-    prompts = []
+-    try:
+-        with open("prefill_output.txt") as f:
+-            for line in f:
+-                prompts.append(line.strip())
+-        print(f"Loaded {len(prompts)} prompts from prefill_output.txt")
+-        return prompts
+-    except FileNotFoundError:
+-        print("Error: prefill_output.txt file not found")
+-        exit(-1)
++    with open("prefill_output.txt", encoding="utf-8") as f:
++        return [line.rstrip("\n") for line in f]
+ 
+ 
+ def main():
+-    prompts = read_prompts()
+-    sampling_params = SamplingParams(temperature=0, top_p=0.95, max_tokens=10)
+-
+     parser = argparse.ArgumentParser()
+-    parser.add_argument(
+-        "--simulate-failure", action="store_true", help="Simulate KV load failure."
+-    )
+-    parser.add_argument(
+-        "--async-load", action="store_true", help="Simulate async KV load"
+-    )
++    parser.add_argument("--model", default="meta-llama/Llama-3.2-1B-Instruct")
++    parser.add_argument("--storage", default="local_storage")
++    parser.add_argument("--simulate-failure", action="store_true")
++    parser.add_argument("--async-load", action="store_true")
++    parser.add_argument("--async-scheduling", action=argparse.BooleanOptionalAction, default=False)
++    parser.add_argument("--no-connector", action="store_true")
++    parser.add_argument("--output", required=True)
++    parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
+     args = parser.parse_args()
+ 
++    if args.no_connector and args.simulate_failure:
++        raise SystemExit("--no-connector and --simulate-failure are mutually exclusive")
++
++    ktc = None
+     if args.simulate_failure:
+         ktc = KVTransferConfig(
+             kv_connector="LoadRecoveryExampleConnector",
+             kv_role="kv_both",
+             kv_connector_extra_config={
+-                "shared_storage_path": "local_storage",
++                "shared_storage_path": args.storage,
+                 "async_load": args.async_load,
+             },
+             kv_connector_module_path="load_recovery_example_connector",
+             kv_load_failure_policy="recompute",
+         )
+-        out_file = (
+-            "async_decode_recovered_output.txt"
+-            if args.async_load
+-            else "sync_decode_recovered_output.txt"
+-        )
+-    else:
++    elif not args.no_connector:
+         ktc = KVTransferConfig(
+             kv_connector="ExampleConnector",
+             kv_role="kv_both",
+-            kv_connector_extra_config={
+-                "shared_storage_path": "local_storage",
+-            },
++            kv_connector_extra_config={"shared_storage_path": args.storage},
+         )
+-        out_file = "decode_output.txt"
+ 
+     llm = LLM(
+-        model="meta-llama/Llama-3.2-1B-Instruct",
++        model=args.model,
+         enforce_eager=True,
+-        gpu_memory_utilization=0.8,
++        gpu_memory_utilization=args.gpu_memory_utilization,
+         max_num_batched_tokens=64,
+         max_num_seqs=16,
++        async_scheduling=args.async_scheduling,
+         kv_transfer_config=ktc,
+     )
+-
+-    outputs = llm.generate(prompts, sampling_params)
+-
+-    sep_str = "-" * 30
+-    with open(out_file, "w", encoding="utf-8") as f:
+-        for output in outputs:
+-            prompt = output.prompt
+-            generated_text = output.outputs[0].text
+-            out_str = f"Prompt: {prompt!r}\nGenerated text: {generated_text!r}"
+-            print(out_str)
+-            print(sep_str)
+-            f.write(out_str)
+-            f.write(sep_str)
++    outputs = llm.generate(
++        read_prompts(), SamplingParams(temperature=0, max_tokens=10)
++    )
++    records = []
++    for output in outputs:
++        generated = output.outputs[0]
++        records.append(
++            {
++                "prompt": output.prompt,
++                "token_ids": list(generated.token_ids),
++                "text": generated.text,
++            }
++        )
++    with open(args.output, "w", encoding="utf-8") as f:
++        json.dump(records, f, indent=2, ensure_ascii=False)
++    print(json.dumps({"output": args.output, "token_ids": [r["token_ids"] for r in records]}))
+ 
+ 
+ if __name__ == "__main__":
+--- /dev/null
++++ b/examples/disaggregated/kv_load_failure_recovery_offline/compare_recovery.py
+@@ -0,0 +1,21 @@
++import json
++import sys
++
++base_path, *candidate_paths = sys.argv[1:]
++with open(base_path, encoding="utf-8") as f:
++    base = json.load(f)
++base_ids = [x["token_ids"] for x in base]
++failed = False
++for path in candidate_paths:
++    with open(path, encoding="utf-8") as f:
++        got = json.load(f)
++    got_ids = [x["token_ids"] for x in got]
++    if got_ids != base_ids:
++        print(f"FAIL: {path} differs from connector-free full recomputation")
++        for i, (a, b) in enumerate(zip(base_ids, got_ids)):
++            if a != b:
++                print(f"  request {i}: baseline={a} recovered={b}")
++        failed = True
++    else:
++        print(f"PASS: {path} exactly matches connector-free full recomputation")
++raise SystemExit(1 if failed else 0)
+--- /dev/null
++++ b/scripts/run_kv_recompute_repro_local.sh
+@@ -0,0 +1,41 @@
++#!/usr/bin/env bash
++set -Eeuo pipefail
++
++REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
++MODEL="${MODEL:-meta-llama/Llama-3.2-1B-Instruct}"
++GPU="${GPU:-0}"
++WORK="${WORK:-${TMPDIR:-/tmp}/kv-recompute-repro-${USER}-$$}"
++EXAMPLE="$REPO/examples/disaggregated/kv_load_failure_recovery_offline"
++mkdir -p "$WORK"
++cd "$WORK"
++rm -rf local_storage
++
++export PYTHONPATH="$EXAMPLE:${PYTHONPATH:-}"
++export VLLM_ENABLE_V1_MULTIPROCESSING=0
++export VLLM_KV_RECOMPUTE_DEBUG=1
++export CUDA_VISIBLE_DEVICES="$GPU"
++
++python "$EXAMPLE/prefill_example.py" --model "$MODEL" --storage local_storage
++python "$EXAMPLE/decode_example.py" --model "$MODEL" --storage local_storage \
++  --no-connector --no-async-scheduling --output oracle_full_recompute.json
++
++# Rejected synchronous load, synchronous scheduler.
++python "$EXAMPLE/decode_example.py" --model "$MODEL" --storage local_storage \
++  --simulate-failure --no-async-scheduling --output recovered_sync_sched.json
++
++# Rejected synchronous load while scheduler overlaps batches. This is the key
++# regression cell for the 20541-style V2 optimistic-state rewind.
++python "$EXAMPLE/decode_example.py" --model "$MODEL" --storage local_storage \
++  --simulate-failure --async-scheduling --output recovered_async_sched.json
++
++# Also cover the connector's asynchronous completion path.
++python "$EXAMPLE/decode_example.py" --model "$MODEL" --storage local_storage \
++  --simulate-failure --async-load --async-scheduling \
++  --output recovered_async_load_async_sched.json
++
++python "$EXAMPLE/compare_recovery.py" oracle_full_recompute.json \
++  recovered_sync_sched.json recovered_async_sched.json \
++  recovered_async_load_async_sched.json
++
++echo "PASS: all forced KV-load-recovery cells matched full recomputation"
++echo "Artifacts: $WORK"
+--- /dev/null
++++ b/scripts/run_h100_kv_recompute_repro.sbatch
+@@ -0,0 +1,21 @@
++#!/usr/bin/env bash
++#SBATCH --job-name=kv-recompute-h100
++#SBATCH --partition=gpu-h100-dchen
++#SBATCH --nodes=1
++#SBATCH --ntasks=1
++#SBATCH --gres=gpu:1
++#SBATCH --cpus-per-task=8
++#SBATCH --time=01:00:00
++#SBATCH --output=/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/logs/%x_%j.out
++#SBATCH --error=/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/logs/%x_%j.err
++set -Eeuo pipefail
++REPO=/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
++source /mnt/shared/gpfs/home/sriramc2/venvs/kvaware-vllm029/bin/activate
++export CUDA_HOME=/usr/local/cuda-13.1
++export PATH="$CUDA_HOME/bin:$PATH"
++export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
++export CUDA_MPS_PIPE_DIRECTORY="/tmp/kvaware-no-mps-${USER}-${SLURM_JOB_ID}-DO-NOT-CREATE"
++export REPO
++export WORK="/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/repro_h100_${SLURM_JOB_ID}"
++cd "$REPO"
++./scripts/run_kv_recompute_repro_local.sh
+--- /dev/null
++++ b/scripts/run_l40_kv_recompute_repro.sbatch
+@@ -0,0 +1,24 @@
++#!/usr/bin/env bash
++#SBATCH --job-name=kv-recompute-l40
++#SBATCH --partition=gpu-l40-dchen
++#SBATCH --nodelist=codenimbus-002-1
++#SBATCH --nodes=1
++#SBATCH --ntasks=1
++#SBATCH --gres=gpu:1
++#SBATCH --cpus-per-task=8
++#SBATCH --mem=64G
++#SBATCH --time=01:00:00
++#SBATCH --output=/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/logs/%x_%j.out
++#SBATCH --error=/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/logs/%x_%j.err
++set -Eeuo pipefail
++REPO=/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
++source /mnt/shared/gpfs/home/sriramc2/venvs/kvaware-vllm029/bin/activate
++# Existing L40 project scripts use this toolkit path.
++export CUDA_HOME=/usr/local/cuda-13.0
++export PATH="$CUDA_HOME/bin:$PATH"
++export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
++export CUDA_MPS_PIPE_DIRECTORY="/tmp/kvaware-no-mps-${USER}-${SLURM_JOB_ID}-DO-NOT-CREATE"
++export REPO
++export WORK="/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/repro_l40_${SLURM_JOB_ID}"
++cd "$REPO"
++./scripts/run_kv_recompute_repro_local.sh
+--- a/scripts/run_h100_mp_nognn_medical_q650_scratch2_cleanall.sbatch
++++ b/scripts/run_h100_mp_nognn_medical_q650_scratch2_cleanall.sbatch
+@@ -102,6 +102,14 @@
+ export PYTHONUNBUFFERED=1
+ export TOKENIZERS_PARALLELISM=false
+ export HF_HOME="${HF_HOME:-/mnt/shared/gpfs/home/sriramc2/.cache/huggingface}"
++
++# Post-fix recovery/accounting instrumentation. These are intentionally scoped
++# to anomaly/recovery paths; L1 normal-lifetime logging only emits for reads held
++# longer than the threshold. Set any of these to 0 to disable after validation.
++export VLLM_KV_RECOMPUTE_DEBUG="${VLLM_KV_RECOMPUTE_DEBUG:-1}"
++export LMCACHE_KV_ACCOUNTING_DEBUG="${LMCACHE_KV_ACCOUNTING_DEBUG:-1}"
++export LMCACHE_PREFETCH_LIFETIME_DEBUG="${LMCACHE_PREFETCH_LIFETIME_DEBUG:-1}"
++export LMCACHE_PREFETCH_LIFETIME_WARN_S="${LMCACHE_PREFETCH_LIFETIME_WARN_S:-30}"
+ 
+ LMCACHE_PID=""
+ VLLM_PID=""

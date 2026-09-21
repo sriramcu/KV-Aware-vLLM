@@ -66,8 +66,11 @@ logger = init_logger(__name__)
 class LoadSpec:
     # Number of tokens cached in vLLM
     vllm_cached_tokens: int
-    # Number of tokens that are cached in LMCache
+    # Number of tokens that are cached in LMCache (lookup result / metrics).
     lmcache_cached_tokens: int
+    # Exclusive token endpoint the scheduler actually allocated for external
+    # loading. This may be N-1 on a full-prompt hit, or lower after a load cap.
+    load_end_tokens: int
     # Whether the scheduler allow us to load the tokens
     can_load: bool
 
@@ -819,7 +822,7 @@ class LMCacheConnectorV1Impl:
             )
             token_mask[:masked_token_count] = False
 
-            lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
+            lmcache_cached_tokens = request.load_spec.load_end_tokens
             if self.use_layerwise:
                 if idx == last_idx:
                     sync = True
@@ -1479,7 +1482,6 @@ class LMCacheConnectorV1Impl:
         # when many concurrent requests each need large allocations.
         # Remaining tokens beyond the cap will be computed locally
         # via chunked prefill rather than loaded from external cache.
-        capped_lmcache_tokens = num_external_hit_tokens
         if (
             self._max_tokens_per_load > 0
             and need_to_allocate > self._max_tokens_per_load
@@ -1492,13 +1494,6 @@ class LMCacheConnectorV1Impl:
                 * self._lmcache_chunk_size
             )
             need_to_allocate = cap
-            # Align capped_lmcache_tokens to chunk boundary so that
-            # session.get_hashes() receives a chunk-aligned end value.
-            capped_lmcache_tokens = (
-                (num_computed_tokens + cap)
-                // self._lmcache_chunk_size
-                * self._lmcache_chunk_size
-            )
             logger.debug(
                 "Reqid: %s, Chunked KV loading: capped from "
                 "%d to %d external tokens "
@@ -1509,9 +1504,11 @@ class LMCacheConnectorV1Impl:
                 self._max_tokens_per_load,
             )
 
+        scheduled_load_tokens = max(need_to_allocate, 0)
         self.load_specs[req_id] = LoadSpec(
             vllm_cached_tokens=num_computed_tokens,
-            lmcache_cached_tokens=capped_lmcache_tokens,
+            lmcache_cached_tokens=num_external_hit_tokens,
+            load_end_tokens=num_computed_tokens + scheduled_load_tokens,
             can_load=False,
         )
 
@@ -1576,31 +1573,29 @@ class LMCacheConnectorV1Impl:
             self.load_specs[request.request_id].can_load = False
             return
 
-        recalc_last = (
-            1
-            if (
-                self.load_specs[request.request_id].lmcache_cached_tokens
-                == request.num_tokens
+        load_spec = self.load_specs[request.request_id]
+        expected_external_tokens = load_spec.load_end_tokens - load_spec.vllm_cached_tokens
+        assert num_external_tokens == expected_external_tokens, (
+            f"Mismatch in tokens to load: scheduler allocated {num_external_tokens}, "
+            f"LMCache load endpoint implies {expected_external_tokens} "
+            f"(load_end={load_spec.load_end_tokens}, "
+            f"vllm_cached={load_spec.vllm_cached_tokens}, "
+            f"lmcache_hit={load_spec.lmcache_cached_tokens}) "
+            f"for request {request.request_id}"
+        )
+        if os.getenv("LMCACHE_KV_ACCOUNTING_DEBUG", "0") == "1":
+            logger.warning(
+                "[LMCACHE_LOAD_ACCOUNTING] req=%s vllm_cached=%d lmcache_hit=%d "
+                "scheduled_external=%d load_end=%d prompt_tokens=%d",
+                request.request_id,
+                load_spec.vllm_cached_tokens,
+                load_spec.lmcache_cached_tokens,
+                num_external_tokens,
+                load_spec.load_end_tokens,
+                request.num_tokens,
             )
-            else 0
-        )
-        assert (
-            num_external_tokens
-            == self.load_specs[request.request_id].lmcache_cached_tokens
-            - self.load_specs[request.request_id].vllm_cached_tokens
-            - recalc_last
-        ), (
-            f"Mismatch in tokens to load: {num_external_tokens} vs "
-            f"{self.load_specs[request.request_id].lmcache_cached_tokens} "
-            "(tokens in lmcache) - "
-            f"{self.load_specs[request.request_id].vllm_cached_tokens} "
-            "(tokens in vllm) - "
-            f"{recalc_last} "
-            "(full lmcache hits subtracts last token to recalculate logits)"
-            f" for request {request.request_id}"
-        )
 
-        self.load_specs[request.request_id].can_load = True
+        load_spec.can_load = True
 
     @_lmcache_nvtx_annotate
     def build_connector_meta(

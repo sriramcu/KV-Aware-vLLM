@@ -144,6 +144,13 @@ class CachedRequestData:
     new_block_ids: list[tuple[list[int], ...] | None]
     num_computed_tokens: list[int]
     num_output_tokens: list[int]
+    # V2 load-failure recovery only: requests whose computed-token position was
+    # explicitly moved backwards by the scheduler. The worker must restore
+    # device-side request state to this accepted scheduler state before forward.
+    rewound_req_ids: set[str] | None = None
+    # Accepted token history for rewound requests. Populated only on the rare
+    # recovery path so ordinary scheduler payloads are unchanged.
+    rewound_all_token_ids: dict[str, list[int]] | None = None
 
     # Version of dataclass repr with token IDs obfuscated.
     def anon_repr(self) -> str:
@@ -194,6 +201,8 @@ class CachedRequestData:
             new_block_ids=[],
             num_computed_tokens=[],
             num_output_tokens=[],
+            rewound_req_ids=set(),
+            rewound_all_token_ids={},
         )
 
 

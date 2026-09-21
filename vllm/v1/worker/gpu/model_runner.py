@@ -19,6 +19,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from contextlib import AbstractContextManager
 from copy import deepcopy
@@ -1071,15 +1072,89 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Add new blocks and update num_computed_tokens for the existing requests.
         reqs = scheduler_output.scheduled_cached_reqs
         num_computed_tokens_np = self.req_states.num_computed_tokens_np
+        rewound_req_ids = reqs.rewound_req_ids or set()
+        rewound_all_token_ids = reqs.rewound_all_token_ids or {}
+        debug_recompute = os.getenv("VLLM_KV_RECOMPUTE_DEBUG", "0") == "1"
+        staged_rewind = False
         for req_id, num_computed_tokens, req_new_block_ids in zip(
             reqs.req_ids, reqs.num_computed_tokens, reqs.new_block_ids
         ):
             req_index = self.req_states.req_id_to_index[req_id]
+            old_cpu_num_computed = int(num_computed_tokens_np[req_index])
+
+            if req_id in rewound_req_ids:
+                accepted_token_ids = rewound_all_token_ids[req_id]
+                accepted_total_len = len(accepted_token_ids)
+                query_len = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+
+                # Absolute rollback: the scheduler is authoritative after a
+                # rejected external KV load. Restore every request-state field
+                # used by vanilla Llama/Qwen sampling in this branch.
+                self.req_states.num_computed_tokens.stage_write_elem(
+                    req_index, num_computed_tokens
+                )
+                self.req_states.total_len.stage_write_elem(
+                    req_index, accepted_total_len
+                )
+                self.req_states.all_token_ids.stage_write(
+                    req_index, 0, accepted_token_ids
+                )
+                self.req_states.draft_tokens[req_index].zero_()
+                self.req_states.next_prefill_tokens[:, req_index].zero_()
+                prompt_len = int(self.req_states.prompt_len.np[req_index])
+                if accepted_total_len > prompt_len:
+                    self.req_states.last_sampled_tokens[req_index, 0] = (
+                        accepted_token_ids[-1]
+                    )
+                else:
+                    self.req_states.last_sampled_tokens[req_index, 0] = 0
+
+                # Rebuild output-token penalty counts when this request uses
+                # frequency/presence/repetition penalties. This is rare and
+                # only runs on recovery, so the explicit bincount is preferable
+                # to carrying stale counts from discarded optimistic frames.
+                if self.sampler is not None:
+                    penalties = self.sampler.penalties_state
+                    if penalties.use_penalty[req_index]:
+                        row = penalties.output_bin_counts[req_index]
+                        row.zero_()
+                        output_ids = accepted_token_ids[prompt_len:]
+                        if output_ids:
+                            ids = torch.tensor(
+                                output_ids, device=row.device, dtype=torch.int64
+                            )
+                            row.add_(torch.bincount(ids, minlength=row.numel()))
+
+                staged_rewind = True
+                if debug_recompute:
+                    effective_seq_len = num_computed_tokens + query_len
+                    logger.warning(
+                        "[KV_RECOMPUTE_WORKER] req=%s old_cpu_computed=%d "
+                        "new_computed=%d query_len=%d effective_seq_len=%d "
+                        "max_model_len=%d accepted_total_len=%d",
+                        req_id,
+                        old_cpu_num_computed,
+                        num_computed_tokens,
+                        query_len,
+                        effective_seq_len,
+                        self.max_model_len,
+                        accepted_total_len,
+                    )
+                    if effective_seq_len > self.max_model_len:
+                        raise RuntimeError(
+                            "KV recompute would exceed max_model_len after rewind: "
+                            f"req={req_id} computed={num_computed_tokens} "
+                            f"query={query_len} max={self.max_model_len}"
+                        )
+
             num_computed_tokens_np[req_index] = num_computed_tokens
             if req_new_block_ids is not None:
                 self.block_tables.append_block_ids(
                     req_index, req_new_block_ids, overwrite=False
                 )
+
+        if staged_rewind:
+            self.req_states.apply_staged_writes()
 
         # Update CPU num_computed_prefill_tokens.
         np.minimum(

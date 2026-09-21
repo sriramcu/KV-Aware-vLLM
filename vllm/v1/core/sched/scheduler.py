@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -208,6 +209,11 @@ class Scheduler(SchedulerInterface):
 
         # IDs of requests preempted since the last call to schedule().
         self.reset_preempted_req_ids: set[str] = set()
+        # Requests explicitly rewound after a rejected/failed external KV load.
+        # Kept until that request is next dispatched so Model Runner V2 can
+        # restore its device-side optimistic state to the scheduler's accepted state.
+        self.kv_rewound_req_ids: set[str] = set()
+        self._kv_recompute_debug = os.getenv("VLLM_KV_RECOMPUTE_DEBUG", "0") == "1"
 
         # Counter for requests waiting for streaming input. Used to calculate
         # number of unfinished requests
@@ -1316,6 +1322,18 @@ class Scheduler(SchedulerInterface):
         if self.use_v2_model_runner:
             scheduled_new_reqs.extend(scheduled_resumed_reqs)
             scheduled_resumed_reqs.clear()
+
+            # V2 add_requests() removes any old worker state and recreates the
+            # request from NewRequestData. A KV-load rewind therefore needs no
+            # later CachedRequestData rewind marker for requests entering via
+            # this path. Keeping the marker would incorrectly replay the rewind
+            # on the next async scheduling step after num_computed_tokens has
+            # already advanced.
+            if self.kv_rewound_req_ids and scheduled_new_reqs:
+                self.kv_rewound_req_ids.difference_update(
+                    req.request_id for req in scheduled_new_reqs
+                )
+
             new_reqs_data = [
                 NewRequestData.from_request(
                     req,
@@ -1661,6 +1679,14 @@ class Scheduler(SchedulerInterface):
                 req.num_output_tokens + req.num_output_placeholders
             )
 
+        dispatched_rewinds = self.kv_rewound_req_ids.intersection(req_ids)
+        rewound_all_token_ids = {
+            req.request_id: list(req.all_token_ids)
+            for req in itertools.chain(running_reqs, resumed_reqs)
+            if req.request_id in dispatched_rewinds
+        }
+        self.kv_rewound_req_ids.difference_update(dispatched_rewinds)
+
         return CachedRequestData(
             req_ids=req_ids,
             resumed_req_ids=resumed_req_ids,
@@ -1669,6 +1695,8 @@ class Scheduler(SchedulerInterface):
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
+            rewound_req_ids=dispatched_rewinds,
+            rewound_all_token_ids=rewound_all_token_ids,
         )
 
     def _try_schedule_encoder_inputs(
@@ -2570,6 +2598,7 @@ class Scheduler(SchedulerInterface):
 
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
+        self.kv_rewound_req_ids.discard(request_id)
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
@@ -2995,6 +3024,38 @@ class Scheduler(SchedulerInterface):
             assert req_id in self.requests
             self._free_blocks(self.requests[req_id])
 
+    def _mark_kv_load_rewind(self, request: Request, old_num_computed: int) -> None:
+        """Record and sanitize a backward KV-load-recovery transition.
+
+        The scheduler's accepted token history intentionally excludes async output
+        placeholders. Any in-flight output from the rejected optimistic path is
+        marked stale/drop-only so it cannot mutate the rewound counters later.
+        """
+        if request.num_computed_tokens >= old_num_computed:
+            return
+        self.kv_rewound_req_ids.add(request.request_id)
+
+        if request.num_in_flight_tokens > 0:
+            request.drop_stale_output = True
+            request.num_stale_output_tokens = max(
+                request.num_stale_output_tokens, request.num_in_flight_tokens
+            )
+        request.num_output_placeholders = 0
+        if request.spec_token_ids:
+            request.spec_token_ids = []
+
+        if self._kv_recompute_debug:
+            logger.warning(
+                "[KV_RECOMPUTE_REWIND] req=%s old_computed=%d new_computed=%d "
+                "in_flight=%d stale=%d accepted_tokens=%d",
+                request.request_id,
+                old_num_computed,
+                request.num_computed_tokens,
+                request.num_in_flight_tokens,
+                request.num_stale_output_tokens,
+                len(request.all_token_ids),
+            )
+
     def _update_requests_with_invalid_blocks(
         self,
         requests: Iterable[Request],
@@ -3071,8 +3132,10 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 marked_invalid_block = True
-                # Truncate the computed tokens at the first failed block
+                # Truncate the computed tokens at the first failed block.
+                old_num_computed = request.num_computed_tokens
                 request.num_computed_tokens = idx * self.block_size
+                self._mark_kv_load_rewind(request, old_num_computed)
                 num_affected_tokens = (
                     req_num_computed_tokens - request.num_computed_tokens
                 )
@@ -3092,7 +3155,9 @@ class Scheduler(SchedulerInterface):
                     total_affected_tokens += (
                         request.num_computed_tokens - req_num_computed_tokens
                     )
+                    old_num_computed = request.num_computed_tokens
                     request.num_computed_tokens = req_num_computed_tokens
+                    self._mark_kv_load_rewind(request, old_num_computed)
 
                 affected_req_ids.add(request.request_id)
 

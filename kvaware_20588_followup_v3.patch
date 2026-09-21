@@ -1,0 +1,68 @@
+diff -ruN '--exclude=.git' a/examples/disaggregated/kv_load_failure_recovery_offline/load_recovery_example_connector.py b/examples/disaggregated/kv_load_failure_recovery_offline/load_recovery_example_connector.py
+--- a/examples/disaggregated/kv_load_failure_recovery_offline/load_recovery_example_connector.py	2026-09-21 04:37:00.000000000 +0000
++++ b/examples/disaggregated/kv_load_failure_recovery_offline/load_recovery_example_connector.py	2026-09-21 17:10:05.052442425 +0000
+@@ -84,8 +84,16 @@
+ 
+     def start_load_kv(self, forward_context: ForwardContext, **kwargs) -> None:
+         if self._async_load and forward_context.attn_metadata is None:
+-            # Bypass  sanity check in super().start_load_kv
+-            forward_context.attn_metadata = "None"
++            # Async loads may be started from a connector-only/no-forward step.
++            # ExampleConnector only performs its KV assignment when
++            # attn_metadata is a dict. Llama-style attention does not otherwise
++            # need per-layer metadata for this debug copy, so provide a dict of
++            # non-MLA sentinels instead of the old string sentinel (which logged
++            # "Inject KV cache" but skipped the assignment entirely).
++            forward_context.attn_metadata = {
++                layer_name: None
++                for layer_name in forward_context.no_compile_layers
++            }
+ 
+         super().start_load_kv(forward_context, **kwargs)
+ 
+diff -ruN '--exclude=.git' a/scripts/run_kv_recompute_repro_local.sh b/scripts/run_kv_recompute_repro_local.sh
+--- a/scripts/run_kv_recompute_repro_local.sh	2026-09-21 17:06:54.750060230 +0000
++++ b/scripts/run_kv_recompute_repro_local.sh	2026-09-21 17:10:05.052548015 +0000
+@@ -28,13 +28,19 @@
+ python "$EXAMPLE/decode_example.py" --model "$MODEL" --storage local_storage \
+   --simulate-failure --async-scheduling --output recovered_async_sched.json
+ 
+-# Also cover the connector's asynchronous completion path.
++# Cover asynchronous KV loading independently of scheduler overlap.
++python "$EXAMPLE/decode_example.py" --model "$MODEL" --storage local_storage \
++  --simulate-failure --async-load --no-async-scheduling \
++  --output recovered_async_load_sync_sched.json
++
++# Cover the full async-load + async-scheduling overlap.
+ python "$EXAMPLE/decode_example.py" --model "$MODEL" --storage local_storage \
+   --simulate-failure --async-load --async-scheduling \
+   --output recovered_async_load_async_sched.json
+ 
+ python "$EXAMPLE/compare_recovery.py" oracle_full_recompute.json \
+   recovered_sync_sched.json recovered_async_sched.json \
++  recovered_async_load_sync_sched.json \
+   recovered_async_load_async_sched.json
+ 
+ echo "PASS: all forced KV-load-recovery cells matched full recomputation"
+diff -ruN '--exclude=.git' a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+--- a/vllm/v1/core/sched/scheduler.py	2026-09-21 17:06:54.747337178 +0000
++++ b/vllm/v1/core/sched/scheduler.py	2026-09-21 17:10:05.051808069 +0000
+@@ -1322,6 +1322,18 @@
+         if self.use_v2_model_runner:
+             scheduled_new_reqs.extend(scheduled_resumed_reqs)
+             scheduled_resumed_reqs.clear()
++
++            # V2 add_requests() removes any old worker state and recreates the
++            # request from NewRequestData. A KV-load rewind therefore needs no
++            # later CachedRequestData rewind marker for requests entering via
++            # this path. Keeping the marker would incorrectly replay the rewind
++            # on the next async scheduling step after num_computed_tokens has
++            # already advanced.
++            if self.kv_rewound_req_ids and scheduled_new_reqs:
++                self.kv_rewound_req_ids.difference_update(
++                    req.request_id for req in scheduled_new_reqs
++                )
++
+             new_reqs_data = [
+                 NewRequestData.from_request(
+                     req,

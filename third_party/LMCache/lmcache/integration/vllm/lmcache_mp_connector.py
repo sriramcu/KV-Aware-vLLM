@@ -916,29 +916,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
     def get_finished(
         self, finished_req_ids: set[str]
         ) -> tuple[set[str] | None, set[str] | None]:
-        """
-        Return completed asynchronous KV operations.
-
-        vLLM may finish/fail/abort a request before LMCache's asynchronous
-        retrieve completion arrives.  Never forward such a stale receive
-        completion to the scheduler: the request may already have been removed
-        from Scheduler.requests.
-        """
-
-        # Keep this cumulative, because the LMCache completion can arrive on a
-        # later engine step than the step in which vLLM finished the request.
         self._engine_finished_req_ids.update(finished_req_ids)
 
-        if self.lazy_offload:
-            finished_sending, finished_recving = (
-                self.worker_adapter.get_finished_with_lazy_offload()
-            )
-        else:
-            finished_sending, finished_recving = (
-                self.worker_adapter.get_finished(
-                    finished_req_ids if self._can_store else set()
-                )
-            )
+        finished_sending, finished_recving = (
+            self.worker_adapter.get_finished(finished_req_ids)
+        )
 
         if finished_recving:
             stale_recving = (
@@ -951,14 +933,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                     "already-finished request(s): %s",
                     sorted(stale_recving),
                 )
-
-                # Make a new set rather than mutating an adapter-owned set.
                 finished_recving = finished_recving - stale_recving
 
-        # IMPORTANT: do NOT similarly remove finished_sending.
-        # A finished request can legitimately be waiting for its async STORE
-        # completion before its blocks are released.
-        return finished_sending, finished_recvingl
+        return finished_sending, finished_recving
 
     def build_connector_worker_meta(self):
         if not self.lazy_offload:

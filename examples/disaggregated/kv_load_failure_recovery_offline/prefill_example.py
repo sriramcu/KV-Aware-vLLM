@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import argparse
 
 from vllm import LLM, SamplingParams
 from vllm.config import KVTransferConfig
@@ -17,38 +17,27 @@ def read_prompts():
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", default="meta-llama/Llama-3.2-1B-Instruct")
+    parser.add_argument("--storage", default="local_storage")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
+    args = parser.parse_args()
+
     prompts = read_prompts()
-
-    sampling_params = SamplingParams(temperature=0, top_p=0.95, max_tokens=1)
-
+    sampling_params = SamplingParams(temperature=0, max_tokens=1)
     llm = LLM(
-        model="meta-llama/Llama-3.2-1B-Instruct",
+        model=args.model,
         enforce_eager=True,
-        gpu_memory_utilization=0.8,
+        gpu_memory_utilization=args.gpu_memory_utilization,
         kv_transfer_config=KVTransferConfig(
             kv_connector="ExampleConnector",
             kv_role="kv_both",
-            kv_connector_extra_config={"shared_storage_path": "local_storage"},
+            kv_connector_extra_config={"shared_storage_path": args.storage},
         ),
-    )  # , max_model_len=2048, max_num_batched_tokens=2048)
-
-    # 1ST generation (prefill instance)
-    outputs = llm.generate(
-        prompts,
-        sampling_params,
     )
-
-    new_prompts = []
-    print("-" * 30)
-    for output in outputs:
-        prompt = output.prompt
-        generated_text = output.outputs[0].text
-        new_prompts.append(prompt + generated_text)
-        print(f"Prompt: {prompt!r}\nGenerated text: {generated_text!r}")
-        print("-" * 30)
-
-    # Write new_prompts to prefill_output.txt
-    with open("prefill_output.txt", "w") as f:
+    outputs = llm.generate(prompts, sampling_params)
+    new_prompts = [o.prompt + o.outputs[0].text for o in outputs]
+    with open("prefill_output.txt", "w", encoding="utf-8") as f:
         for prompt in new_prompts:
             f.write(prompt + "\n")
     print(f"Saved {len(new_prompts)} prompts to prefill_output.txt")

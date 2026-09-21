@@ -84,8 +84,16 @@ class LoadRecoveryExampleConnector(ExampleConnector):
 
     def start_load_kv(self, forward_context: ForwardContext, **kwargs) -> None:
         if self._async_load and forward_context.attn_metadata is None:
-            # Bypass  sanity check in super().start_load_kv
-            forward_context.attn_metadata = "None"
+            # Async loads may be started from a connector-only/no-forward step.
+            # ExampleConnector only performs its KV assignment when
+            # attn_metadata is a dict. Llama-style attention does not otherwise
+            # need per-layer metadata for this debug copy, so provide a dict of
+            # non-MLA sentinels instead of the old string sentinel (which logged
+            # "Inject KV cache" but skipped the assignment entirely).
+            forward_context.attn_metadata = {
+                layer_name: None
+                for layer_name in forward_context.no_compile_layers
+            }
 
         super().start_load_kv(forward_context, **kwargs)
 

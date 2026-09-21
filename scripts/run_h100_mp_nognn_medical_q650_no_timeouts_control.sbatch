@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=kvaware-mp-nognn-med-q650
+#SBATCH --job-name=kvaware-mp-nognn-med-q650-notimeouts
 #SBATCH --partition=gpu-h100-dchen
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -22,7 +22,7 @@ CUDA_HOME=/usr/local/cuda-13.1
 LINEARRAG_ROOT="${REPO}/Hierarchical_KV/LinearRAG"
 
 RUN_ROOT=/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro
-RUN_DIR="${RUN_ROOT}/h100_mp_nognn_${SLURM_JOB_ID}"
+RUN_DIR="${RUN_ROOT}/h100_mp_nognn_notimeouts_${SLURM_JOB_ID}"
 LOG_DIR="${RUN_DIR}/logs"
 RESULT_DIR="${RUN_DIR}/results"
 
@@ -604,9 +604,19 @@ cat > "${RUN_DIR}/run_config.json" <<EOF
   "num_questions": ${NUM_QUESTIONS},
   "question_file": "${QUESTION_FILE}",
   "request_order": "${REQUEST_ORDER}",
-  "warm_order": "${WARM_ORDER}"
+  "warm_order": "${WARM_ORDER}",
+  "lmcache_lookup_timeout_s": 0.0,
+  "lmcache_starvation_fallback": false,
+  "http_request_timeout_s": 7200,
+  "control_note": "20417-style wait behavior on current vLLM/LMCache stack; fixed lookup timeout disabled and starvation fallback disabled"
 }
 EOF
+
+echo
+echo "===== CONTROL: 20417-STYLE NO TIMEOUT / NO STARVATION FALLBACK ====="
+echo "lmcache.mp.lookup_timeout=0.0"
+echo "lmcache.mp.starvation_fallback=False"
+echo "HTTP request timeout=7200 s"
 
 # ============================================================================
 # Standalone LMCache MP server: CPU L1 + filesystem L2
@@ -682,7 +692,7 @@ print(
                 "lmcache.mp.port": 5556,
                 "lmcache.mp.mq_timeout": timeout,
                 "lmcache.mp.lookup_timeout": 0.0,
-                "lmcache.mp.starvation_fallback": True,
+                "lmcache.mp.starvation_fallback": False,
             },
         }
     )

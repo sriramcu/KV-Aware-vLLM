@@ -6,7 +6,9 @@ Managing objects and memory for L1 cache
 # Standard
 from dataclasses import dataclass
 from typing import Literal
+import os
 import threading
+import time
 
 # First Party
 from lmcache.lmcache_native import TTLLock
@@ -208,6 +210,13 @@ class L1Manager:
         )
         self._write_ttl_seconds = config.write_ttl_seconds
         self._read_ttl_seconds = config.read_ttl_seconds
+        self._prefetch_lifetime_debug = (
+            os.getenv("LMCACHE_PREFETCH_LIFETIME_DEBUG", "0") == "1"
+        )
+        self._debug_read_reserved_at: dict[ObjectKey, float] = {}
+        self._prefetch_lifetime_warn_s = float(
+            os.getenv("LMCACHE_PREFETCH_LIFETIME_WARN_S", "30")
+        )
 
         self._registered_listeners: list[L1ManagerListener] = []
 
@@ -287,6 +296,8 @@ class L1Manager:
                 entry.read_lock.lock()
             ret[key] = (L1Error.SUCCESS, entry.memory_obj)
             successful_keys.append(key)
+            if self._prefetch_lifetime_debug:
+                self._debug_read_reserved_at.setdefault(key, time.monotonic())
 
         for listener in self._registered_listeners:
             listener.on_l1_keys_reserved_read(successful_keys)
@@ -325,10 +336,26 @@ class L1Manager:
         for key in keys:
             entry = self._objects.get(key, None)
             if entry is None:
+                if self._prefetch_lifetime_debug:
+                    reserved_at = self._debug_read_reserved_at.get(key)
+                    age = time.monotonic() - reserved_at if reserved_at else -1.0
+                    logger.error(
+                        "[L1_READ_LIFETIME] unsafe_read missing key=%s "
+                        "reserved_age_s=%.3f read_ttl_s=%d objects=%d",
+                        key, age, self._read_ttl_seconds, len(self._objects),
+                    )
                 ret[key] = (L1Error.KEY_NOT_EXIST, None)
                 continue
 
             if not entry.read_lock.is_locked():
+                if self._prefetch_lifetime_debug:
+                    reserved_at = self._debug_read_reserved_at.get(key)
+                    age = time.monotonic() - reserved_at if reserved_at else -1.0
+                    logger.error(
+                        "[L1_READ_LIFETIME] unsafe_read unlocked key=%s "
+                        "reserved_age_s=%.3f read_ttl_s=%d objects=%d",
+                        key, age, self._read_ttl_seconds, len(self._objects),
+                    )
                 ret[key] = (L1Error.KEY_NOT_READABLE, None)
                 continue
 
@@ -375,6 +402,14 @@ class L1Manager:
         for key in keys:
             entry = self._objects.get(key, None)
             if entry is None:
+                if self._prefetch_lifetime_debug:
+                    reserved_at = self._debug_read_reserved_at.pop(key, None)
+                    age = time.monotonic() - reserved_at if reserved_at else -1.0
+                    logger.warning(
+                        "[L1_READ_LIFETIME] finish_read missing key=%s "
+                        "reserved_age_s=%.3f read_ttl_s=%d objects=%d",
+                        key, age, self._read_ttl_seconds, len(self._objects),
+                    )
                 logger.warning(
                     "L1Manager: finish read on non-existing key %s, "
                     "potential inconsistent data might be read",
@@ -406,6 +441,17 @@ class L1Manager:
             # overhead (TTLLock is C++ std::atomic).
             for _ in range(total):
                 entry.read_lock.unlock()
+            if self._prefetch_lifetime_debug and not entry.read_lock.is_locked():
+                reserved_at = self._debug_read_reserved_at.pop(key, None)
+                if reserved_at is not None:
+                    held_s = time.monotonic() - reserved_at
+                    if held_s >= self._prefetch_lifetime_warn_s:
+                        logger.warning(
+                            "[L1_READ_LIFETIME] long_read key=%s held_s=%.3f "
+                            "read_ttl_s=%d warn_s=%.1f",
+                            key, held_s, self._read_ttl_seconds,
+                            self._prefetch_lifetime_warn_s,
+                        )
             if entry.is_temporary and not entry.read_lock.is_locked():
                 # NOTE: temporary objects shouldn't have write-locks
                 need_to_free.append(entry.memory_obj)
