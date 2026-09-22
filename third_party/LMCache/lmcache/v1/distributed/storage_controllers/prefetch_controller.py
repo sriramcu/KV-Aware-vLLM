@@ -323,6 +323,10 @@ class PrefetchController(StorageControllerInterface):
         # Thread-safe lookup results (background -> external)
         self._lookup_results_lock = threading.Lock()
         self._completed_lookups: dict[PrefetchRequestId, int] = {}
+        # Optional lookup-phase found bitmap. Legacy callers only need the
+        # prefix count; the L0 union path needs sparse positions so it can map
+        # them back into the original L0/L1/L2 chunk order.
+        self._completed_lookup_bitmaps: dict[PrefetchRequestId, Bitmap] = {}
 
         # Thread-safe prefetch results (background -> external).  The condition
         # variable lets a WAIT_PREFETCH_STATUS handler block until a result is
@@ -460,6 +464,19 @@ class PrefetchController(StorageControllerInterface):
         with self._lookup_results_lock:
             return self._completed_lookups.get(request_id, None)
 
+    def peek_lookup_result_bitmap(
+        self, request_id: PrefetchRequestId
+    ) -> Bitmap | None:
+        """Return lookup-phase found positions without consuming the result.
+
+        The legacy API reports only a prefix count. The persistent-L0 union
+        path submits sparse local-tier misses to L2 and needs their actual
+        found positions to compute the model-wide union prefix before the
+        L2 -> L1 load finishes.
+        """
+        with self._lookup_results_lock:
+            return self._completed_lookup_bitmaps.get(request_id)
+
     def query_prefetch_result(self, request_id: PrefetchRequestId) -> Bitmap | None:
         """
         Query the result of a prefetch request.
@@ -485,6 +502,7 @@ class PrefetchController(StorageControllerInterface):
         if result is not None:
             with self._lookup_results_lock:
                 self._completed_lookups.pop(request_id, None)
+                self._completed_lookup_bitmaps.pop(request_id, None)
         return result
 
     def wait_prefetch_result(
@@ -1029,7 +1047,11 @@ class PrefetchController(StorageControllerInterface):
 
         # Step 5 — submit loads; report the hit.
         self._submit_load_tasks(request, trimmed_plan)
-        self._report_lookup_hit(request, hit_length)
+        self._report_lookup_hit(
+            request,
+            hit_length,
+            union_bitmap if request.policy is TrimPolicy.SPARSE else None,
+        )
 
     def _reserve_load_buffers(
         self,
@@ -1191,18 +1213,28 @@ class PrefetchController(StorageControllerInterface):
         )
 
     def _update_lookup_results(
-        self, request_id: PrefetchRequestId, prefix_hit_count: int
+        self,
+        request_id: PrefetchRequestId,
+        prefix_hit_count: int,
+        found_bitmap: Bitmap | None = None,
     ) -> None:
-        """Store the prefix-hit count from the lookup phase."""
+        """Store lookup-phase prefix count and optional sparse found positions."""
         with self._lookup_results_lock:
             self._completed_lookups[request_id] = prefix_hit_count
+            if found_bitmap is not None:
+                self._completed_lookup_bitmaps[request_id] = found_bitmap
 
     def _report_lookup_hit(
-        self, request: InFlightPrefetchRequest, prefix_hit_count: int
+        self,
+        request: InFlightPrefetchRequest,
+        prefix_hit_count: int,
+        found_bitmap: Bitmap | None = None,
     ) -> None:
         """Store the lookup-phase hit and publish its completion event."""
         request.hit_reported = True
-        self._update_lookup_results(request.request_id, prefix_hit_count)
+        self._update_lookup_results(
+            request.request_id, prefix_hit_count, found_bitmap
+        )
         self._event_bus.publish(
             Event(
                 event_type=EventType.L2_PREFETCH_LOOKUP_COMPLETED,
@@ -1415,7 +1447,11 @@ class PrefetchController(StorageControllerInterface):
         # already reported at submit time (so the engine never waits on the
         # load) and is not re-reported.
         if not request.hit_reported:
-            self._report_lookup_hit(request, hit_length)
+            self._report_lookup_hit(
+                request,
+                hit_length,
+                result_bitmap if request.policy is TrimPolicy.SPARSE else None,
+            )
 
         self._complete_request(request.request_id, retained)
 

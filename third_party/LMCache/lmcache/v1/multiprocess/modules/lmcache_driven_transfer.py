@@ -4,6 +4,7 @@
 # Standard
 from dataclasses import dataclass
 from typing import Any, Sequence
+import os
 import threading
 import time
 
@@ -49,6 +50,34 @@ from lmcache.v1.platform.cache_context import create_cache_context
 import lmcache.lmcache_native as lmcache_native
 
 logger = init_logger(__name__)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+_L0_SMOKE_STORE_ENABLED = _env_flag("LMCACHE_L0_SMOKE_STORE")
+_L0_SMOKE_MOD = int(os.getenv("LMCACHE_L0_SMOKE_MOD", "4"))
+_L0_SMOKE_TAKE = int(os.getenv("LMCACHE_L0_SMOKE_TAKE", "2"))
+if _L0_SMOKE_MOD <= 0:
+    raise ValueError("LMCACHE_L0_SMOKE_MOD must be > 0")
+if not 0 <= _L0_SMOKE_TAKE <= _L0_SMOKE_MOD:
+    raise ValueError(
+        "LMCACHE_L0_SMOKE_TAKE must be between 0 and LMCACHE_L0_SMOKE_MOD"
+    )
+
+
+def _l0_smoke_select_chunk(global_chunk_idx: int) -> bool:
+    """Deterministic smoke-only L0 placement rule.
+
+    With the defaults, global logical chunk indices 0,1,4,5,... go to L0;
+    all other chunks stay on the normal L1/L2 path. The rule is stable across
+    partial STORE ranges because it uses the request-global chunk index.
+    """
+    return (global_chunk_idx % _L0_SMOKE_MOD) < _L0_SMOKE_TAKE
 
 
 def get_layout_desc(
@@ -180,6 +209,19 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         self._device_host_func_dispatcher.register(
             "finish_write",
             self._ctx.storage_manager.finish_write,
+            payload_type=list[ObjectKey],
+        )
+        # Dormant L0 completion hook. No current placement policy submits this
+        # callback; it exists so a later explicit L0 store can publish only
+        # after its D2D copy reaches this stream position.
+        self._device_host_func_dispatcher.register(
+            "finish_l0_write",
+            self._ctx.storage_manager.finish_l0_write,
+            payload_type=list[ObjectKey],
+        )
+        self._device_host_func_dispatcher.register(
+            "abort_l0_write",
+            self._ctx.storage_manager.abort_l0_write,
             payload_type=list[ObjectKey],
         )
         self._device_host_func_dispatcher.register(
@@ -680,65 +722,192 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             )
 
             reserved_dict: dict[ObjectKey, MemoryObj] = {}
-            all_dict: dict[ObjectKey, MemoryObj] = {}
+            all_l1_dict: dict[ObjectKey, MemoryObj] = {}
+            all_l0_dict: dict[ObjectKey, MemoryObj] = {}
             total_bytes: int = 0
             store_succeeded = False
+            smoke_l0 = _L0_SMOKE_STORE_ENABLED and self._ctx.storage_manager.l0_enabled
+            global_start_chunk = key.start // self._ctx.chunk_size
+
+            if _L0_SMOKE_STORE_ENABLED and not self._ctx.storage_manager.l0_enabled:
+                logger.warning(
+                    "LMCACHE_L0_SMOKE_STORE is enabled but L0 itself is disabled; "
+                    "falling back to the legacy L1/L2 store path"
+                )
+
+            if smoke_l0 and num_chunks:
+                first_keys = obj_keys_per_obj_group[0]
+                if first_keys:
+                    group_layout_descs = {
+                        gid: get_layout_desc(
+                            cache_context,
+                            self._ctx.chunk_size,
+                            object_group_id=gid,
+                        )
+                        for gid in range(num_object_groups)
+                    }
+                    prepared = self._ctx.storage_manager.prepare_l0_rank_arena(
+                        first_keys[0].kv_rank,
+                        cache_context.device,
+                        group_layout_descs,
+                    )
+                    if not prepared:
+                        logger.error(
+                            "[L0_SMOKE_STORE] failed to prepare L0 arena for "
+                            "request_id=%s kv_rank=%d; selected chunks will not "
+                            "be stored",
+                            key.request_id,
+                            first_keys[0].kv_rank,
+                        )
+
             try:
                 for obj_group_id in range(num_object_groups):
                     obj_keys = obj_keys_per_obj_group[obj_group_id]
                     skip_mask = skipped_chunks[obj_group_id]
-                    keys_to_reserve = [
-                        k for i, k in enumerate(obj_keys) if not skip_mask[i]
-                    ]
                     layout_desc = get_layout_desc(
                         cache_context,
                         self._ctx.chunk_size,
                         object_group_id=obj_group_id,
                     )
-                    reserved_dict = self._ctx.storage_manager.reserve_write(
-                        keys_to_reserve, layout_desc, "new"
-                    )
-                    all_dict.update(reserved_dict)
-                    if reserved_dict:
-                        total_bytes += next(
-                            iter(reserved_dict.values())
-                        ).get_size() * len(reserved_dict)
 
-                    # Keys not in reserved_dict (all-null chunks skipped above, or
-                    # skipped by the storage manager) become None entries; the
-                    # helper skips them for D2H.
-                    memory_objs: list[MemoryObj | None] = [
-                        reserved_dict.get(obj_key) for obj_key in obj_keys
-                    ]
+                    if smoke_l0:
+                        l0_selected = [
+                            (not skip_mask[i])
+                            and _l0_smoke_select_chunk(global_start_chunk + i)
+                            for i in range(len(obj_keys))
+                        ]
+                        l0_keys = [
+                            k for i, k in enumerate(obj_keys) if l0_selected[i]
+                        ]
+                        l1_keys = [
+                            k
+                            for i, k in enumerate(obj_keys)
+                            if not skip_mask[i] and not l0_selected[i]
+                        ]
 
-                    # NOTE: batch_size must stay 1 for store.
-                    transfer_kv_per_object_group(
-                        cache_context,
-                        block_ids_per_group_gpu,
-                        memory_objs,
-                        object_group_id=obj_group_id,
-                        batch_size=1,
-                        skip_first_n_tokens=0,
-                        direction=lmcache_native.TransferDirection.D2H,
-                        transfer_key=transfer_key,
-                    )
+                        l0_reserved = self._ctx.storage_manager.reserve_l0_write(
+                            l0_keys, layout_desc
+                        )
+                        reserved_dict = self._ctx.storage_manager.reserve_write(
+                            l1_keys, layout_desc, "new"
+                        )
+                        all_l0_dict.update(l0_reserved)
+                        all_l1_dict.update(reserved_dict)
+
+                        for current in (l0_reserved, reserved_dict):
+                            if current:
+                                total_bytes += next(
+                                    iter(current.values())
+                                ).get_size() * len(current)
+
+                        l0_memory_objs: list[MemoryObj | None] = [
+                            l0_reserved.get(obj_key) for obj_key in obj_keys
+                        ]
+                        l1_memory_objs: list[MemoryObj | None] = [
+                            reserved_dict.get(obj_key) for obj_key in obj_keys
+                        ]
+
+                        if l0_reserved:
+                            transfer_kv_per_object_group(
+                                cache_context,
+                                block_ids_per_group_gpu,
+                                l0_memory_objs,
+                                object_group_id=obj_group_id,
+                                batch_size=1,
+                                skip_first_n_tokens=0,
+                                direction=lmcache_native.TransferDirection.D2H,
+                                transfer_key=transfer_key,
+                            )
+                        if reserved_dict:
+                            transfer_kv_per_object_group(
+                                cache_context,
+                                block_ids_per_group_gpu,
+                                l1_memory_objs,
+                                object_group_id=obj_group_id,
+                                batch_size=1,
+                                skip_first_n_tokens=0,
+                                direction=lmcache_native.TransferDirection.D2H,
+                                transfer_key=transfer_key,
+                            )
+                    else:
+                        keys_to_reserve = [
+                            k for i, k in enumerate(obj_keys) if not skip_mask[i]
+                        ]
+                        reserved_dict = self._ctx.storage_manager.reserve_write(
+                            keys_to_reserve, layout_desc, "new"
+                        )
+                        all_l1_dict.update(reserved_dict)
+                        if reserved_dict:
+                            total_bytes += next(
+                                iter(reserved_dict.values())
+                            ).get_size() * len(reserved_dict)
+
+                        # Keys not in reserved_dict (all-null chunks skipped above,
+                        # or skipped by the storage manager) become None entries;
+                        # the helper skips them for D2H.
+                        memory_objs: list[MemoryObj | None] = [
+                            reserved_dict.get(obj_key) for obj_key in obj_keys
+                        ]
+
+                        # NOTE: batch_size must stay 1 for store.
+                        transfer_kv_per_object_group(
+                            cache_context,
+                            block_ids_per_group_gpu,
+                            memory_objs,
+                            object_group_id=obj_group_id,
+                            batch_size=1,
+                            skip_first_n_tokens=0,
+                            direction=lmcache_native.TransferDirection.D2H,
+                            transfer_key=transfer_key,
+                        )
 
                 store_succeeded = True
             except Exception:
                 logger.exception("Cannot store keys due to exception")
             finally:
                 event_backend.record_event(event, cache_context.stream)
-                # Fail closed: commit the reserved objects only when every chunk
-                # copied successfully; otherwise the whole store is skipped.
-                stored_count = len(all_dict) if store_succeeded else 0
-                if stored_count:
-                    submit_callback_to_stream(
-                        cache_context.cupy_stream,
-                        "finish_write",
-                        list(all_dict.keys()),
-                    )
+                # Publish L1 and L0 only after every copy has reached this stream
+                # point. On a failed smoke L0 store, release unpublished GPU pages
+                # at the same stream point instead of freeing them while a D2D may
+                # still be in flight.
+                stored_count = (
+                    len(all_l1_dict) + len(all_l0_dict) if store_succeeded else 0
+                )
+                if store_succeeded:
+                    if all_l1_dict:
+                        submit_callback_to_stream(
+                            cache_context.cupy_stream,
+                            "finish_write",
+                            list(all_l1_dict.keys()),
+                        )
+                    if all_l0_dict:
+                        submit_callback_to_stream(
+                            cache_context.cupy_stream,
+                            "finish_l0_write",
+                            list(all_l0_dict.keys()),
+                        )
                 else:
+                    if all_l0_dict:
+                        submit_callback_to_stream(
+                            cache_context.cupy_stream,
+                            "abort_l0_write",
+                            list(all_l0_dict.keys()),
+                        )
                     total_bytes = 0
+
+                if smoke_l0:
+                    logger.info(
+                        "[L0_SMOKE_STORE] request_id=%s worker=%s "
+                        "global_chunks=[%d,%d) L0_reserved=%d L1_reserved=%d "
+                        "success=%s",
+                        key.request_id,
+                        key.worker_id,
+                        global_start_chunk,
+                        global_start_chunk + num_chunks,
+                        len(all_l0_dict),
+                        len(all_l1_dict),
+                        store_succeeded,
+                    )
                 num_tokens = num_chunks * self._ctx.chunk_size if stored_count else 0
                 self._ctx.event_bus.publish_on_stream(
                     cache_context.cupy_stream,

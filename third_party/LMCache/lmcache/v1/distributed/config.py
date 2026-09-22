@@ -197,6 +197,37 @@ class GdsL1Config:
 
 
 @dataclass
+class L0ManagerConfig:
+    """Configuration for the persistent LMCache GPU L0 tier.
+
+    L0 is opt-in. Keeping ``enabled=False`` and ``capacity_bytes=0`` as the
+    defaults guarantees that merely applying the L0 patch does not reserve
+    GPU memory or alter the existing L1/L2 lookup path.
+    """
+
+    enabled: bool = False
+    """Whether persistent LMCache L0 is enabled."""
+
+    capacity_bytes: int = 0
+    """Fixed per-GPU / per-KV-rank L0 budget Q in bytes."""
+
+    eviction_policy: Literal["LRU"] = "LRU"
+    """L0 v1 intentionally supports only chunk-granularity LRU."""
+
+    write_ttl_seconds: int = 600
+    """TTL for an in-flight L0 write reservation."""
+
+    read_ttl_seconds: int = 300
+    """TTL for L0 read reservations."""
+
+    temp_capacity_bytes: int = 0
+    """Per-rank temporary-L0 budget. Zero keeps temp L0 dormant."""
+
+    temp_max_in_flight: int = 0
+    """Maximum temporary L0 objects. Zero keeps temp L0 dormant."""
+
+
+@dataclass
 class L1ManagerConfig:
     """
     Special config for the L1 Object/Key manager
@@ -296,6 +327,9 @@ class StorageManagerConfig:
     eviction_config: EvictionConfig
     """ The configuration for eviction policies. """
 
+    l0_manager_config: L0ManagerConfig = field(default_factory=L0ManagerConfig)
+    """ Persistent GPU L0 configuration. Disabled by default. """
+
     l2_adapter_config: L2AdaptersConfig = field(
         default_factory=lambda: L2AdaptersConfig([])
     )
@@ -353,6 +387,18 @@ def validate_storage_manager_config(config: StorageManagerConfig) -> None:
         ValueError: If mutually exclusive L1 tiers are both configured, or
             hybrid L1 is paired with incompatible L2 adapters.
     """
+    l0 = config.l0_manager_config
+    if l0.eviction_policy != "LRU":
+        raise ValueError("l0 v1 supports only the LRU eviction policy")
+    if l0.capacity_bytes < 0:
+        raise ValueError("l0 capacity_bytes must be >= 0")
+    if l0.write_ttl_seconds <= 0 or l0.read_ttl_seconds <= 0:
+        raise ValueError("l0 read/write TTLs must be > 0")
+    if l0.temp_capacity_bytes < 0 or l0.temp_max_in_flight < 0:
+        raise ValueError("l0 temporary capacity/count must be >= 0")
+    if l0.temp_capacity_bytes > l0.capacity_bytes:
+        raise ValueError("l0 temp_capacity_bytes cannot exceed capacity_bytes")
+
     if (
         config.l1_manager_config.gds_l1_config is not None
         and config.l1_manager_config.memory_config.devdax_path
@@ -494,6 +540,49 @@ def add_storage_manager_args(
         "treats --gds-l1-path as /dev/ugds_drvX; phx uses the Phoenix phxfs "
         "DMA path with a matching libphoenix.so.",
     )
+    # Persistent LMCache GPU L0 (opt-in). This configures only the LMCache
+    # tier; vLLM's P budget remains independently controlled by
+    # kv_cache_memory_bytes in the engine launch.
+    l0_group = parser.add_argument_group(
+        "L0 GPU Cache", "Persistent LMCache GPU L0 configuration"
+    )
+    l0_group.add_argument(
+        "--l0-enable",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable persistent LMCache GPU L0. Default False.",
+    )
+    l0_group.add_argument(
+        "--l0-capacity-gb",
+        type=float,
+        default=0.0,
+        help="Fixed per-GPU L0 budget Q in GiB. Default 0.",
+    )
+    l0_group.add_argument(
+        "--l0-write-ttl-seconds",
+        type=int,
+        default=600,
+        help="Time to live for an L0 write reservation. Default 600s.",
+    )
+    l0_group.add_argument(
+        "--l0-read-ttl-seconds",
+        type=int,
+        default=300,
+        help="Time to live for an L0 read reservation. Default 300s.",
+    )
+    l0_group.add_argument(
+        "--l0-temp-capacity-gb",
+        type=float,
+        default=0.0,
+        help="Temporary-L0 budget per GPU. Keep 0 for L0 v1.",
+    )
+    l0_group.add_argument(
+        "--l0-temp-max-in-flight",
+        type=int,
+        default=0,
+        help="Maximum temporary-L0 objects. Keep 0 for L0 v1.",
+    )
+
     # L1 Manager Config (TTL settings)
     ttl_group = parser.add_argument_group(
         "L1 Manager TTL", "TTL configuration for L1 manager locks"
@@ -651,6 +740,15 @@ def parse_args_to_config(
             backend=args.gds_l1_backend,
         )
 
+    l0_manager_config = L0ManagerConfig(
+        enabled=args.l0_enable,
+        capacity_bytes=int(args.l0_capacity_gb * (1 << 30)),
+        write_ttl_seconds=args.l0_write_ttl_seconds,
+        read_ttl_seconds=args.l0_read_ttl_seconds,
+        temp_capacity_bytes=int(args.l0_temp_capacity_gb * (1 << 30)),
+        temp_max_in_flight=args.l0_temp_max_in_flight,
+    )
+
     l1_manager_config = L1ManagerConfig(
         memory_config=memory_config,
         gds_l1_config=gds_l1_config,
@@ -671,6 +769,7 @@ def parse_args_to_config(
     config = StorageManagerConfig(
         l1_manager_config=l1_manager_config,
         eviction_config=eviction_config,
+        l0_manager_config=l0_manager_config,
         l2_adapter_config=l2_adapter_config,
         store_policy=args.l2_store_policy,
         prefetch_policy=args.l2_prefetch_policy,

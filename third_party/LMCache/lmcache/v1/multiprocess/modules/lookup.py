@@ -395,19 +395,28 @@ class LookupModule:
             tuple(range(job.attn_desc.num_object_groups)),
         )
 
-        # ``l1_hit_chunks`` is the prefix L1 could serve on its own under each
-        # object group's window rule, so L2's contribution is however much
-        # further ``found_count`` reaches -- not a count of L1-resident keys.
-        l1_chunks = job.handle.l1_hit_chunks
-        if l1_chunks > found_count:
-            logger.error(
-                "L1 hit chunks exceed total hit chunks: l1=%d total=%d request=%s",
-                l1_chunks,
-                found_count,
-                request_id,
-            )
-            l1_chunks = found_count
-        l2_chunks = found_count - l1_chunks
+        if job.handle.l0_union_enabled:
+            # L0 union lookups may alternate L0/L1/L2 at chunk/object level,
+            # so the legacy monotonic L1-prefix/L2-suffix attribution is not
+            # meaningful. Keep the total exact and expose an explicit union
+            # flag; object-level L0 counters live in L0Manager.
+            l1_chunks = 0
+            l2_chunks = 0
+        else:
+            # ``l1_hit_chunks`` is the prefix L1 could serve on its own under
+            # each object group's window rule, so L2's contribution is however
+            # much further ``found_count`` reaches.
+            l1_chunks = job.handle.l1_hit_chunks
+            if l1_chunks > found_count:
+                logger.error(
+                    "L1 hit chunks exceed total hit chunks: "
+                    "l1=%d total=%d request=%s",
+                    l1_chunks,
+                    found_count,
+                    request_id,
+                )
+                l1_chunks = found_count
+            l2_chunks = found_count - l1_chunks
 
         self._ctx.event_bus.publish(
             Event(
@@ -419,6 +428,7 @@ class LookupModule:
                     "hit_tokens": found_count * self._ctx.chunk_size,
                     "l1_hit_tokens": l1_chunks * self._ctx.chunk_size,
                     "l2_hit_tokens": l2_chunks * self._ctx.chunk_size,
+                    "l0_union_enabled": job.handle.l0_union_enabled,
                     "early_exit_reason": job.early_exit_reason,
                     "model_name": job.model_name,
                     "cache_salt": job.cache_salt,

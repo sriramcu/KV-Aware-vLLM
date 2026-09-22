@@ -1,0 +1,78 @@
+--- a/scripts/run_h100_l0_smoke.sbatch
++++ b/scripts/run_h100_l0_smoke.sbatch
+@@ -59,7 +59,12 @@
+ MAX_TOKENS="${MAX_TOKENS:-64}"
+ TOP_P="${TOP_P:-0.95}"
+ REQUEST_TIMEOUT_S="${REQUEST_TIMEOUT_S:-1800}"
+-ENABLE_VPC="${ENABLE_VPC:-1}"
++# IMPORTANT: this integration smoke must force Stage-2 external retrieval.
++# If native vLLM prefix caching remains enabled, the immediate warm replay can
++# satisfy the same prompts from vLLM's own GPU block cache. LMCache Stage-1 may
++# still report L0/L1 hits, but the scheduler then computes need_to_load=0 and no
++# L0 -> vLLM D2D is exercised. Keep VPC disabled by default for this smoke.
++ENABLE_VPC="${ENABLE_VPC:-0}"
+ ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
+ 
+ mkdir -p "$LOG_DIR" "$RESULT_DIR" "$LMCACHE_L2_ROOT"
+@@ -162,6 +167,7 @@
+   "l0_smoke_take": ${L0_SMOKE_TAKE},
+   "questions": ${NUM_QUESTIONS},
+   "smoke_expect_eviction": ${SMOKE_EXPECT_EVICTION},
++  "enable_vpc": ${ENABLE_VPC},
+   "l2_dir": "${LMCACHE_L2_DIR}"
+ }
+ EOF_JSON
+@@ -325,6 +331,7 @@
+     "${RESULT_DIR}/summary.json" \
+     "${RUN_DIR}/lmcache_status_after.json" \
+     "${RUN_DIR}/l0_smoke_events.txt" \
++    "${RUN_DIR}/vllm_metrics_after.txt" \
+     "$NUM_QUESTIONS" \
+     "$SMOKE_EXPECT_EVICTION" <<'PY'
+ import json, re, sys
+@@ -333,8 +340,9 @@
+ summary = json.loads(Path(sys.argv[1]).read_text())
+ status = json.loads(Path(sys.argv[2]).read_text())
+ events = Path(sys.argv[3]).read_text()
+-expected_questions = int(sys.argv[4])
+-expect_eviction = bool(int(sys.argv[5]))
++vllm_metrics = Path(sys.argv[4]).read_text()
++expected_questions = int(sys.argv[5])
++expect_eviction = bool(int(sys.argv[6]))
+ 
+ assert summary["cold"]["successful"] == expected_questions, summary["cold"]
+ assert summary["warm"]["successful"] == expected_questions, summary["warm"]
+@@ -351,7 +359,24 @@
+ evictions = events.count("[L0_SMOKE_EVICT]")
+ assert store_markers > 0, "no L0 smoke stores observed"
+ assert d2d_store > 0, "no device-backed L0 store D2D observed"
+-assert d2d_load > 0, "no device-backed L0 retrieve D2D observed"
++assert d2d_load > 0, (
++    "no device-backed L0 retrieve D2D observed; if Stage-1 L0 hits exist but "
++    "this is zero, verify native vLLM prefix caching is disabled for the smoke"
++)
++
++# A real Stage-2 load must also be visible to the scheduler metrics. This
++# distinguishes an L0/L1 Stage-1 lookup from an actual external KV transfer.
++m = re.search(
++    r'vllm:external_prefix_cache_hits_total\{[^}]*\}\s+([0-9.eE+-]+)',
++    vllm_metrics,
++)
++assert m is not None, "external-prefix-hit metric missing from vLLM metrics"
++external_hit_tokens = float(m.group(1))
++assert external_hit_tokens > 0, (
++    "LMCache lookup ran but vLLM consumed zero external KV tokens; "
++    "the smoke did not exercise Stage-2 retrieval"
++)
++
+ if expect_eviction:
+     assert evictions > 0, "eviction smoke requested but no L0 eviction observed"
+ 
+@@ -374,6 +399,7 @@
+ print("store_markers=", store_markers)
+ print("d2d_store_markers=", d2d_store)
+ print("d2d_load_markers=", d2d_load)
++print("external_hit_tokens=", external_hit_tokens)
+ print("eviction_markers=", evictions)
+ print("union_source_counts=", triples)
+ PY

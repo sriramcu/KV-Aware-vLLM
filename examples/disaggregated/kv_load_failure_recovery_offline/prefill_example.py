@@ -21,6 +21,13 @@ def main():
     parser.add_argument("--model", default="meta-llama/Llama-3.2-1B-Instruct")
     parser.add_argument("--storage", default="local_storage")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
+    parser.add_argument(
+        "--flash-attn-version",
+        type=int,
+        choices=(2, 3, 4),
+        default=None,
+        help="Force a FlashAttention version for diagnostic runs.",
+    )
     args = parser.parse_args()
 
     prompts = read_prompts()
@@ -29,6 +36,11 @@ def main():
         model=args.model,
         enforce_eager=True,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        attention_config=(
+            {"flash_attn_version": args.flash_attn_version}
+            if args.flash_attn_version is not None
+            else None
+        ),
         kv_transfer_config=KVTransferConfig(
             kv_connector="ExampleConnector",
             kv_role="kv_both",

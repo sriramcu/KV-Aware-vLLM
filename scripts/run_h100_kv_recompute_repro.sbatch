@@ -3,8 +3,8 @@
 #SBATCH --partition=gpu-h100-dchen
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:2
-#SBATCH --cpus-per-task=16
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
 #SBATCH --time=06:00:00
 #SBATCH --output=/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/logs/%x_%j.out
 #SBATCH --error=/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/logs/%x_%j.err

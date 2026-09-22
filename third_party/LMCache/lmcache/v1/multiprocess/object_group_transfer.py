@@ -10,6 +10,7 @@ the per-object-group transfer plan the copy kernels run.
 # Standard
 from itertools import islice
 from typing import Any, Generator, Sequence
+import os
 
 # Third Party
 import torch
@@ -376,6 +377,20 @@ def _run_object_group_transfer_plan(
     )
 
 
+def _is_device_backed_memory_obj(memory_obj: MemoryObj | None) -> bool:
+    """Return True when ``memory_obj`` is backed by accelerator memory.
+
+    The native object-group fast path treats the MemoryObj side as host/lazy
+    memory. Persistent L0 objects are CUDA/accelerator tensors, so they must
+    use the ordinary tensor-copy staging path; torch then dispatches the
+    staging leg as a real device-to-device copy without a CPU bounce.
+    """
+    if memory_obj is None or isinstance(memory_obj, GDSMemoryObject):
+        return False
+    raw = memory_obj.raw_tensor
+    return raw is not None and raw.device.type != "cpu"
+
+
 def transfer_kv_per_object_group(
     cache_context: BaseCacheContext,
     block_ids_gpu: list[torch.Tensor],
@@ -415,8 +430,28 @@ def transfer_kv_per_object_group(
         This function expects the caller to stage the block ids (list[list[int]])
         into GPU tensors and pass them in as `block_ids_gpu`.
     """
-    if _HAS_NATIVE_OBJECT_GROUP_TRANSFER and not any(
-        isinstance(mo, GDSMemoryObject) for mo in memory_objs
+    device_backed_count = sum(
+        1 for mo in memory_objs if _is_device_backed_memory_obj(mo)
+    )
+    if device_backed_count and os.getenv("LMCACHE_L0_SMOKE_TRACE_D2D", "0") == "1":
+        direction_name = (
+            "H2D"
+            if direction == lmcache_native.TransferDirection.H2D
+            else "D2H"
+        )
+        logger.info(
+            "[L0_SMOKE_D2D] direction=%s object_group=%d device_objects=%d "
+            "transfer_key=%s",
+            direction_name,
+            object_group_id,
+            device_backed_count,
+            transfer_key,
+        )
+
+    if (
+        _HAS_NATIVE_OBJECT_GROUP_TRANSFER
+        and not any(isinstance(mo, GDSMemoryObject) for mo in memory_objs)
+        and device_backed_count == 0
     ):
         _run_object_group_transfer_plan(
             cache_context,

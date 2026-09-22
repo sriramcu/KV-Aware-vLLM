@@ -489,6 +489,21 @@ class PrefetchHandle:
     """Original-key index of each key submitted to L2; maps the controller's
     local result bitmap back to original positions."""
 
+    l0_found_indices: tuple[int, ...] = ()
+    """Original-key indices read-reserved from persistent GPU L0."""
+
+    l0_union_enabled: bool = False
+    """Whether this handle uses the non-monotonic L0/L1/L2 union path."""
+
+    num_kv_readers: int = 1
+    """Read-lock multiplicity reserved for each retained object."""
+
+    attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC
+    """Original model-wide attention descriptor used for final union folding."""
+
+    original_keys: tuple[ObjectKey, ...] = ()
+    """Original flat key order, retained only by the opt-in L0 union path."""
+
 
 def ipc_key_to_object_keys(
     ipc_key: "IPCCacheServerKey",

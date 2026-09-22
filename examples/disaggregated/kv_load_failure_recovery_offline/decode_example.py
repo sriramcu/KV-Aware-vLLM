@@ -21,6 +21,13 @@ def main():
     parser.add_argument("--no-connector", action="store_true")
     parser.add_argument("--output", required=True)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
+    parser.add_argument(
+        "--flash-attn-version",
+        type=int,
+        choices=(2, 3, 4),
+        default=None,
+        help="Force a FlashAttention version for diagnostic runs.",
+    )
     args = parser.parse_args()
 
     if args.no_connector and args.simulate_failure:
@@ -49,6 +56,11 @@ def main():
         model=args.model,
         enforce_eager=True,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        attention_config=(
+            {"flash_attn_version": args.flash_attn_version}
+            if args.flash_attn_version is not None
+            else None
+        ),
         max_num_batched_tokens=64,
         max_num_seqs=16,
         async_scheduling=args.async_scheduling,

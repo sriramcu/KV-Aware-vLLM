@@ -1,0 +1,1875 @@
+diff --git a/third_party/LMCache/lmcache/v1/distributed/api.py b/third_party/LMCache/lmcache/v1/distributed/api.py
+index ab8876c..c23652d 100644
+--- a/third_party/LMCache/lmcache/v1/distributed/api.py
++++ b/third_party/LMCache/lmcache/v1/distributed/api.py
+@@ -489,6 +489,21 @@ class PrefetchHandle:
+     """Original-key index of each key submitted to L2; maps the controller's
+     local result bitmap back to original positions."""
+ 
++    l0_found_indices: tuple[int, ...] = ()
++    """Original-key indices read-reserved from persistent GPU L0."""
++
++    l0_union_enabled: bool = False
++    """Whether this handle uses the non-monotonic L0/L1/L2 union path."""
++
++    num_kv_readers: int = 1
++    """Read-lock multiplicity reserved for each retained object."""
++
++    attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC
++    """Original model-wide attention descriptor used for final union folding."""
++
++    original_keys: tuple[ObjectKey, ...] = ()
++    """Original flat key order, retained only by the opt-in L0 union path."""
++
+ 
+ def ipc_key_to_object_keys(
+     ipc_key: "IPCCacheServerKey",
+diff --git a/third_party/LMCache/lmcache/v1/distributed/config.py b/third_party/LMCache/lmcache/v1/distributed/config.py
+index a5899b0..8e15608 100644
+--- a/third_party/LMCache/lmcache/v1/distributed/config.py
++++ b/third_party/LMCache/lmcache/v1/distributed/config.py
+@@ -196,6 +196,37 @@ class GdsL1Config:
+     """Allocation alignment; cuFile/hipFile and O_DIRECT require 4 KiB."""
+ 
+ 
++@dataclass
++class L0ManagerConfig:
++    """Configuration for the persistent LMCache GPU L0 tier.
++
++    L0 is opt-in. Keeping ``enabled=False`` and ``capacity_bytes=0`` as the
++    defaults guarantees that merely applying the L0 patch does not reserve
++    GPU memory or alter the existing L1/L2 lookup path.
++    """
++
++    enabled: bool = False
++    """Whether persistent LMCache L0 is enabled."""
++
++    capacity_bytes: int = 0
++    """Fixed per-GPU / per-KV-rank L0 budget Q in bytes."""
++
++    eviction_policy: Literal["LRU"] = "LRU"
++    """L0 v1 intentionally supports only chunk-granularity LRU."""
++
++    write_ttl_seconds: int = 600
++    """TTL for an in-flight L0 write reservation."""
++
++    read_ttl_seconds: int = 300
++    """TTL for L0 read reservations."""
++
++    temp_capacity_bytes: int = 0
++    """Per-rank temporary-L0 budget. Zero keeps temp L0 dormant."""
++
++    temp_max_in_flight: int = 0
++    """Maximum temporary L0 objects. Zero keeps temp L0 dormant."""
++
++
+ @dataclass
+ class L1ManagerConfig:
+     """
+@@ -296,6 +327,9 @@ class StorageManagerConfig:
+     eviction_config: EvictionConfig
+     """ The configuration for eviction policies. """
+ 
++    l0_manager_config: L0ManagerConfig = field(default_factory=L0ManagerConfig)
++    """ Persistent GPU L0 configuration. Disabled by default. """
++
+     l2_adapter_config: L2AdaptersConfig = field(
+         default_factory=lambda: L2AdaptersConfig([])
+     )
+@@ -353,6 +387,18 @@ def validate_storage_manager_config(config: StorageManagerConfig) -> None:
+         ValueError: If mutually exclusive L1 tiers are both configured, or
+             hybrid L1 is paired with incompatible L2 adapters.
+     """
++    l0 = config.l0_manager_config
++    if l0.eviction_policy != "LRU":
++        raise ValueError("l0 v1 supports only the LRU eviction policy")
++    if l0.capacity_bytes < 0:
++        raise ValueError("l0 capacity_bytes must be >= 0")
++    if l0.write_ttl_seconds <= 0 or l0.read_ttl_seconds <= 0:
++        raise ValueError("l0 read/write TTLs must be > 0")
++    if l0.temp_capacity_bytes < 0 or l0.temp_max_in_flight < 0:
++        raise ValueError("l0 temporary capacity/count must be >= 0")
++    if l0.temp_capacity_bytes > l0.capacity_bytes:
++        raise ValueError("l0 temp_capacity_bytes cannot exceed capacity_bytes")
++
+     if (
+         config.l1_manager_config.gds_l1_config is not None
+         and config.l1_manager_config.memory_config.devdax_path
+@@ -494,6 +540,49 @@ def add_storage_manager_args(
+         "treats --gds-l1-path as /dev/ugds_drvX; phx uses the Phoenix phxfs "
+         "DMA path with a matching libphoenix.so.",
+     )
++    # Persistent LMCache GPU L0 (opt-in). This configures only the LMCache
++    # tier; vLLM's P budget remains independently controlled by
++    # kv_cache_memory_bytes in the engine launch.
++    l0_group = parser.add_argument_group(
++        "L0 GPU Cache", "Persistent LMCache GPU L0 configuration"
++    )
++    l0_group.add_argument(
++        "--l0-enable",
++        action=argparse.BooleanOptionalAction,
++        default=False,
++        help="Enable persistent LMCache GPU L0. Default False.",
++    )
++    l0_group.add_argument(
++        "--l0-capacity-gb",
++        type=float,
++        default=0.0,
++        help="Fixed per-GPU L0 budget Q in GiB. Default 0.",
++    )
++    l0_group.add_argument(
++        "--l0-write-ttl-seconds",
++        type=int,
++        default=600,
++        help="Time to live for an L0 write reservation. Default 600s.",
++    )
++    l0_group.add_argument(
++        "--l0-read-ttl-seconds",
++        type=int,
++        default=300,
++        help="Time to live for an L0 read reservation. Default 300s.",
++    )
++    l0_group.add_argument(
++        "--l0-temp-capacity-gb",
++        type=float,
++        default=0.0,
++        help="Temporary-L0 budget per GPU. Keep 0 for L0 v1.",
++    )
++    l0_group.add_argument(
++        "--l0-temp-max-in-flight",
++        type=int,
++        default=0,
++        help="Maximum temporary-L0 objects. Keep 0 for L0 v1.",
++    )
++
+     # L1 Manager Config (TTL settings)
+     ttl_group = parser.add_argument_group(
+         "L1 Manager TTL", "TTL configuration for L1 manager locks"
+@@ -651,6 +740,15 @@ def parse_args_to_config(
+             backend=args.gds_l1_backend,
+         )
+ 
++    l0_manager_config = L0ManagerConfig(
++        enabled=args.l0_enable,
++        capacity_bytes=int(args.l0_capacity_gb * (1 << 30)),
++        write_ttl_seconds=args.l0_write_ttl_seconds,
++        read_ttl_seconds=args.l0_read_ttl_seconds,
++        temp_capacity_bytes=int(args.l0_temp_capacity_gb * (1 << 30)),
++        temp_max_in_flight=args.l0_temp_max_in_flight,
++    )
++
+     l1_manager_config = L1ManagerConfig(
+         memory_config=memory_config,
+         gds_l1_config=gds_l1_config,
+@@ -671,6 +769,7 @@ def parse_args_to_config(
+     config = StorageManagerConfig(
+         l1_manager_config=l1_manager_config,
+         eviction_config=eviction_config,
++        l0_manager_config=l0_manager_config,
+         l2_adapter_config=l2_adapter_config,
+         store_policy=args.l2_store_policy,
+         prefetch_policy=args.l2_prefetch_policy,
+diff --git a/third_party/LMCache/lmcache/v1/distributed/l0_manager.py b/third_party/LMCache/lmcache/v1/distributed/l0_manager.py
+new file mode 100644
+index 0000000..56299bb
+--- /dev/null
++++ b/third_party/LMCache/lmcache/v1/distributed/l0_manager.py
+@@ -0,0 +1,554 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Persistent GPU-resident L0 object manager for multiprocess LMCache.
++
++L0 is deliberately local to the MP storage server.  It owns GPU memory that is
++separate from vLLM's execution/prefix-cache pool; hits are copied into vLLM
++owned KV blocks before attention executes.
++
++The v1 implementation is intentionally small:
++* one fixed-size paged arena per KV rank/device;
++* chunk-granularity LRU eviction (all object-group/rank pieces of a logical
++  chunk are evicted together when possible);
++* L1-like read/write lifetime locks;
++* temporary state is represented, but defaults to disabled.
++"""
++
++# Future
++from __future__ import annotations
++
++# Standard
++from collections import OrderedDict
++from dataclasses import dataclass
++import threading
++
++# Third Party
++import torch
++from opentelemetry import metrics
++
++# First Party
++from lmcache.lmcache_native import TTLLock
++from lmcache.logging import init_logger
++from lmcache.utils import get_size_bytes
++from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
++from lmcache.v1.distributed.config import L0ManagerConfig
++from lmcache.v1.distributed.error import L1Error
++from lmcache.v1.memory_allocators.gpu_memory_allocator import GPUMemoryAllocator
++from lmcache.v1.memory_management import MemoryFormat, MemoryObj
++from lmcache.v1.mp_observability.otel_init import register_gauge
++
++logger = init_logger(__name__)
++
++_MAX_READ_LOCK_COUNT = 128
++
++
++@dataclass
++class _L0ObjectState:
++    memory_obj: MemoryObj
++    write_lock: TTLLock
++    read_lock: TTLLock
++    is_temporary: bool
++    published: bool = False
++
++    def readable(self) -> bool:
++        return self.published and not self.write_lock.is_locked()
++
++    def evictable(self) -> bool:
++        return not self.write_lock.is_locked() and not self.read_lock.is_locked()
++
++
++@dataclass
++class _L0Arena:
++    kv_rank: int
++    device: torch.device
++    allocator: GPUMemoryAllocator
++    page_bytes: int
++    configured_bytes: int
++    usable_bytes: int
++
++
++# LRU is keyed at logical LMCache-chunk granularity. Object group / TP rank are
++# intentionally omitted so one victim means one logical cached chunk.
++_ChunkIdentity = tuple[bytes, str, str]
++
++
++def _chunk_identity(key: ObjectKey) -> _ChunkIdentity:
++    return (key.chunk_hash, key.model_name, key.cache_salt)
++
++
++def _clamp_read_locks(read_locks: int) -> int:
++    if read_locks < 1:
++        return 1
++    return min(read_locks, _MAX_READ_LOCK_COUNT)
++
++
++class L0Manager:
++    """Fixed-capacity persistent GPU tier owned by LMCache.
++
++    The manager is safe to construct while disabled. GPU arenas are allocated
++    lazily, only after a placement path explicitly prepares a KV rank for L0.
++    Applying the L0 patch therefore has no GPU-memory effect by itself.
++    """
++
++    _gauge_registered = False
++    _gauge_target: "L0Manager | None" = None
++
++    def __init__(self, config: L0ManagerConfig):
++        self._config = config
++        self._lock = threading.RLock()
++        self._objects: dict[ObjectKey, _L0ObjectState] = {}
++        self._arenas: dict[int, _L0Arena] = {}
++        self._lru: OrderedDict[_ChunkIdentity, None] = OrderedDict()
++        self._temp_objects = 0
++        self._temp_bytes_by_rank: dict[int, int] = {}
++
++        meter = metrics.get_meter("lmcache.l0_persistent")
++        self._store_counter = meter.create_counter(
++            "lmcache_mp.l0_stores_total",
++            description="L0 objects published after a completed GPU store",
++        )
++        self._hit_counter = meter.create_counter(
++            "lmcache_mp.l0_read_hits_total",
++            description="L0 object read reservations that succeeded",
++        )
++        self._miss_counter = meter.create_counter(
++            "lmcache_mp.l0_read_misses_total",
++            description="L0 object read reservations that missed or were unreadable",
++        )
++        self._eviction_counter = meter.create_counter(
++            "lmcache_mp.l0_evictions_total",
++            description="Logical L0 chunks evicted by the local LRU",
++        )
++        self._admission_failure_counter = meter.create_counter(
++            "lmcache_mp.l0_admission_failures_total",
++            description="L0 object admissions that failed for capacity/layout reasons",
++        )
++        self._temp_counter = meter.create_counter(
++            "lmcache_mp.l0_temp_allocations_total",
++            description="Temporary L0 allocations (expected to remain zero in v1)",
++        )
++
++        L0Manager._gauge_target = self
++        if not L0Manager._gauge_registered:
++            L0Manager._gauge_registered = True
++            register_gauge(
++                "lmcache.l0_persistent",
++                "lmcache_mp.l0_memory_usage_bytes",
++                "Bytes physically occupied by persistent LMCache L0 pages",
++                lambda: (
++                    L0Manager._gauge_target.get_memory_usage()[0]
++                    if L0Manager._gauge_target is not None
++                    else 0
++                ),
++            )
++            register_gauge(
++                "lmcache.l0_persistent",
++                "lmcache_mp.l0_capacity_bytes",
++                "Usable bytes in all initialized LMCache L0 rank-local arenas",
++                lambda: (
++                    L0Manager._gauge_target.get_memory_usage()[1]
++                    if L0Manager._gauge_target is not None
++                    else 0
++                ),
++            )
++            register_gauge(
++                "lmcache.l0_persistent",
++                "lmcache_mp.l0_temp_objects",
++                "Current temporary L0 objects (expected zero in v1)",
++                lambda: (
++                    L0Manager._gauge_target.temp_object_count
++                    if L0Manager._gauge_target is not None
++                    else 0
++                ),
++            )
++
++    @property
++    def enabled(self) -> bool:
++        return self._config.enabled and self._config.capacity_bytes > 0
++
++    @property
++    def temp_object_count(self) -> int:
++        with self._lock:
++            return self._temp_objects
++
++    def prepare_rank_arena(
++        self,
++        kv_rank: int,
++        device: torch.device | str,
++        group_layout_descs: dict[int, MemoryLayoutDesc],
++    ) -> bool:
++        """Create the fixed Q arena for one KV rank if it does not exist.
++
++        The page size is the largest object-group layout registered for the
++        model. Smaller groups occupy one page and leave the tail unused. This
++        keeps one allocator/arena per rank instead of multiplying Q by the
++        number of object groups.
++        """
++        if not self.enabled:
++            return False
++        if not group_layout_descs:
++            return False
++
++        with self._lock:
++            dev = torch.device(device)
++            existing = self._arenas.get(kv_rank)
++            max_desc = max(
++                group_layout_descs.values(),
++                key=lambda d: get_size_bytes(d.shapes, d.dtypes),
++            )
++            page_bytes = get_size_bytes(max_desc.shapes, max_desc.dtypes)
++            if page_bytes <= 0:
++                return False
++
++            if existing is not None:
++                if existing.device != dev:
++                    raise ValueError(
++                        f"L0 kv_rank={kv_rank} already bound to {existing.device}, "
++                        f"cannot rebind to {dev}"
++                    )
++                if page_bytes > existing.page_bytes:
++                    logger.error(
++                        "L0 rank %d was initialized with page_bytes=%d but a "
++                        "larger layout (%d bytes) was later registered; L0 "
++                        "admission for that layout will fail closed",
++                        kv_rank,
++                        existing.page_bytes,
++                        page_bytes,
++                    )
++                return True
++
++            usable = (self._config.capacity_bytes // page_bytes) * page_bytes
++            if usable <= 0:
++                logger.warning(
++                    "L0 rank %d disabled effectively: configured Q=%d bytes is "
++                    "smaller than one %d-byte LMCache page",
++                    kv_rank,
++                    self._config.capacity_bytes,
++                    page_bytes,
++                )
++                return False
++
++            allocator = GPUMemoryAllocator(
++                size=usable,
++                device=dev,
++                use_paging=True,
++                shapes=max_desc.shapes,
++                dtypes=max_desc.dtypes,
++                fmt=MemoryFormat.KV_2LTD,
++            )
++            self._arenas[kv_rank] = _L0Arena(
++                kv_rank=kv_rank,
++                device=dev,
++                allocator=allocator,
++                page_bytes=page_bytes,
++                configured_bytes=self._config.capacity_bytes,
++                usable_bytes=usable,
++            )
++            logger.info(
++                "Initialized LMCache L0 arena rank=%d device=%s Q=%d usable=%d "
++                "page_bytes=%d pages=%d",
++                kv_rank,
++                dev,
++                self._config.capacity_bytes,
++                usable,
++                page_bytes,
++                usable // page_bytes,
++            )
++            return True
++
++    def _touch_locked(self, key: ObjectKey) -> None:
++        cid = _chunk_identity(key)
++        if cid in self._lru:
++            self._lru.move_to_end(cid)
++        else:
++            self._lru[cid] = None
++
++    def _free_entry_locked(self, key: ObjectKey, entry: _L0ObjectState) -> None:
++        arena = self._arenas.get(key.kv_rank)
++        if arena is None:
++            return
++        if entry.is_temporary:
++            self._temp_objects = max(0, self._temp_objects - 1)
++            self._temp_bytes_by_rank[key.kv_rank] = max(
++                0,
++                self._temp_bytes_by_rank.get(key.kv_rank, 0)
++                - entry.memory_obj.get_physical_size(),
++            )
++        arena.allocator.free(entry.memory_obj)
++
++    def _evict_one_chunk_locked(self, target_rank: int) -> bool:
++        """Evict the oldest fully-unlocked logical chunk touching target_rank."""
++        for cid in list(self._lru.keys()):
++            chunk_items = [
++                (key, entry)
++                for key, entry in self._objects.items()
++                if _chunk_identity(key) == cid
++            ]
++            if not any(key.kv_rank == target_rank for key, _ in chunk_items):
++                continue
++            if not chunk_items or any(
++                not entry.evictable() for _, entry in chunk_items
++            ):
++                continue
++
++            for key, entry in chunk_items:
++                self._free_entry_locked(key, entry)
++                del self._objects[key]
++            self._lru.pop(cid, None)
++            self._eviction_counter.add(1)
++            return True
++        return False
++
++    def reserve_write(
++        self,
++        keys: list[ObjectKey],
++        layout_desc: MemoryLayoutDesc,
++        *,
++        is_temporary: bool = False,
++    ) -> dict[ObjectKey, tuple[L1Error, MemoryObj | None]]:
++        """Reserve L0 pages for a write; capacity pressure uses local LRU."""
++        with self._lock:
++            ret: dict[ObjectKey, tuple[L1Error, MemoryObj | None]] = {}
++            requested_bytes = get_size_bytes(layout_desc.shapes, layout_desc.dtypes)
++
++            for key in keys:
++                entry = self._objects.get(key)
++                # L0 v1 is first-assignment-wins: existing objects are never
++                # updated/promoted in place. A later placement decision can only
++                # establish a new L0 owner after the old object is genuinely gone.
++                if entry is not None:
++                    ret[key] = (L1Error.KEY_NOT_WRITABLE, None)
++                    continue
++
++                arena = self._arenas.get(key.kv_rank)
++                if arena is None or requested_bytes > arena.page_bytes:
++                    self._admission_failure_counter.add(1)
++                    ret[key] = (L1Error.OUT_OF_MEMORY, None)
++                    continue
++
++                if is_temporary:
++                    next_temp_bytes = (
++                        self._temp_bytes_by_rank.get(key.kv_rank, 0) + arena.page_bytes
++                    )
++                    if (
++                        self._config.temp_max_in_flight <= 0
++                        or self._config.temp_capacity_bytes <= 0
++                        or self._temp_objects >= self._config.temp_max_in_flight
++                        or next_temp_bytes > self._config.temp_capacity_bytes
++                    ):
++                        self._admission_failure_counter.add(1)
++                        ret[key] = (L1Error.OUT_OF_MEMORY, None)
++                        continue
++
++                mem_obj = arena.allocator.allocate(
++                    layout_desc.shapes,
++                    layout_desc.dtypes,
++                    MemoryFormat.KV_2LTD,
++                )
++                while mem_obj is None and self._evict_one_chunk_locked(key.kv_rank):
++                    mem_obj = arena.allocator.allocate(
++                        layout_desc.shapes,
++                        layout_desc.dtypes,
++                        MemoryFormat.KV_2LTD,
++                    )
++
++                if mem_obj is None:
++                    self._admission_failure_counter.add(1)
++                    ret[key] = (L1Error.OUT_OF_MEMORY, None)
++                    continue
++
++                state = _L0ObjectState(
++                    memory_obj=mem_obj,
++                    write_lock=TTLLock(self._config.write_ttl_seconds),
++                    read_lock=TTLLock(self._config.read_ttl_seconds),
++                    is_temporary=is_temporary,
++                    published=False,
++                )
++                state.write_lock.lock()
++                self._objects[key] = state
++                self._touch_locked(key)
++                if is_temporary:
++                    self._temp_objects += 1
++                    self._temp_bytes_by_rank[key.kv_rank] = (
++                        self._temp_bytes_by_rank.get(key.kv_rank, 0) + arena.page_bytes
++                    )
++                    self._temp_counter.add(1)
++                ret[key] = (L1Error.SUCCESS, mem_obj)
++            return ret
++
++    def finish_write(self, keys: list[ObjectKey]) -> dict[ObjectKey, L1Error]:
++        """Publish completed L0 writes. Call only after the D2D stream completes."""
++        with self._lock:
++            ret: dict[ObjectKey, L1Error] = {}
++            for key in keys:
++                entry = self._objects.get(key)
++                if entry is None:
++                    ret[key] = L1Error.KEY_NOT_EXIST
++                    continue
++                if not entry.write_lock.is_locked() or entry.read_lock.is_locked():
++                    ret[key] = L1Error.KEY_IN_WRONG_STATE
++                    continue
++                entry.write_lock.unlock()
++                entry.published = True
++                self._touch_locked(key)
++                self._store_counter.add(1)
++                ret[key] = L1Error.SUCCESS
++            return ret
++
++    def abort_write(self, keys: list[ObjectKey]) -> dict[ObjectKey, L1Error]:
++        """Drop unpublished write reservations after a failed/cancelled store."""
++        with self._lock:
++            ret: dict[ObjectKey, L1Error] = {}
++            for key in keys:
++                entry = self._objects.get(key)
++                if entry is None:
++                    ret[key] = L1Error.KEY_NOT_EXIST
++                    continue
++                if entry.published or not entry.write_lock.is_locked():
++                    ret[key] = L1Error.KEY_IN_WRONG_STATE
++                    continue
++                self._free_entry_locked(key, entry)
++                del self._objects[key]
++                cid = _chunk_identity(key)
++                if not any(_chunk_identity(k) == cid for k in self._objects):
++                    self._lru.pop(cid, None)
++                ret[key] = L1Error.SUCCESS
++            return ret
++
++    def reserve_read(
++        self, keys: list[ObjectKey], read_locks: int = 1
++    ) -> dict[ObjectKey, tuple[L1Error, MemoryObj | None]]:
++        """Reserve readable L0 objects; unpublished writes never hit."""
++        total = _clamp_read_locks(read_locks)
++        with self._lock:
++            ret: dict[ObjectKey, tuple[L1Error, MemoryObj | None]] = {}
++            for key in keys:
++                entry = self._objects.get(key)
++                if entry is None:
++                    self._miss_counter.add(1)
++                    ret[key] = (L1Error.KEY_NOT_EXIST, None)
++                    continue
++                if not entry.readable():
++                    self._miss_counter.add(1)
++                    ret[key] = (L1Error.KEY_NOT_READABLE, None)
++                    continue
++                for _ in range(total):
++                    entry.read_lock.lock()
++                self._touch_locked(key)
++                self._hit_counter.add(1)
++                ret[key] = (L1Error.SUCCESS, entry.memory_obj)
++            return ret
++
++    def unsafe_read(
++        self, keys: list[ObjectKey]
++    ) -> dict[ObjectKey, tuple[L1Error, MemoryObj | None]]:
++        """Read already-reserved L0 objects without acquiring another lock."""
++        with self._lock:
++            ret: dict[ObjectKey, tuple[L1Error, MemoryObj | None]] = {}
++            for key in keys:
++                entry = self._objects.get(key)
++                if entry is None:
++                    ret[key] = (L1Error.KEY_NOT_EXIST, None)
++                elif not entry.published or not entry.read_lock.is_locked():
++                    ret[key] = (L1Error.KEY_NOT_READABLE, None)
++                else:
++                    ret[key] = (L1Error.SUCCESS, entry.memory_obj)
++            return ret
++
++    def finish_read(
++        self, keys: list[ObjectKey], read_locks: int = 1
++    ) -> dict[ObjectKey, L1Error]:
++        total = _clamp_read_locks(read_locks)
++        with self._lock:
++            ret: dict[ObjectKey, L1Error] = {}
++            to_delete: list[tuple[ObjectKey, _L0ObjectState]] = []
++            for key in keys:
++                entry = self._objects.get(key)
++                if entry is None:
++                    ret[key] = L1Error.KEY_NOT_EXIST
++                    continue
++                if entry.write_lock.is_locked() or not entry.read_lock.is_locked():
++                    ret[key] = L1Error.KEY_IN_WRONG_STATE
++                    continue
++                for _ in range(total):
++                    if entry.read_lock.is_locked():
++                        entry.read_lock.unlock()
++                if entry.is_temporary and not entry.read_lock.is_locked():
++                    to_delete.append((key, entry))
++                ret[key] = L1Error.SUCCESS
++
++            for key, entry in to_delete:
++                self._free_entry_locked(key, entry)
++                del self._objects[key]
++                cid = _chunk_identity(key)
++                if not any(_chunk_identity(k) == cid for k in self._objects):
++                    self._lru.pop(cid, None)
++            return ret
++
++    def has_read_lock(self, key: ObjectKey) -> bool:
++        with self._lock:
++            entry = self._objects.get(key)
++            return bool(entry is not None and entry.read_lock.is_locked())
++
++    def touch_keys(self, keys: list[ObjectKey]) -> None:
++        with self._lock:
++            for key in keys:
++                if key in self._objects:
++                    self._touch_locked(key)
++
++    def clear(self, force: bool = False) -> None:
++        with self._lock:
++            victims = [
++                (key, entry)
++                for key, entry in self._objects.items()
++                if force or entry.evictable()
++            ]
++            for key, entry in victims:
++                self._free_entry_locked(key, entry)
++                del self._objects[key]
++            self._lru = OrderedDict(
++                (cid, None)
++                for cid in self._lru
++                if any(_chunk_identity(key) == cid for key in self._objects)
++            )
++
++    def get_memory_usage(self) -> tuple[int, int]:
++        with self._lock:
++            used = sum(
++                entry.memory_obj.get_physical_size() for entry in self._objects.values()
++            )
++            total = sum(arena.usable_bytes for arena in self._arenas.values())
++            return used, total
++
++    def report_status(self) -> dict:
++        with self._lock:
++            used, total = self.get_memory_usage()
++            return {
++                "is_healthy": True,
++                "enabled": self.enabled,
++                "configured_capacity_bytes_per_rank": self._config.capacity_bytes,
++                "used_bytes": used,
++                "initialized_capacity_bytes": total,
++                "objects": len(self._objects),
++                "logical_chunks": len(self._lru),
++                "temp_objects": self._temp_objects,
++                "temp_capacity_bytes": self._config.temp_capacity_bytes,
++                "temp_max_in_flight": self._config.temp_max_in_flight,
++                "ranks": {
++                    rank: {
++                        "device": str(arena.device),
++                        "page_bytes": arena.page_bytes,
++                        "configured_bytes": arena.configured_bytes,
++                        "usable_bytes": arena.usable_bytes,
++                    }
++                    for rank, arena in self._arenas.items()
++                },
++            }
++
++    def memcheck(self) -> bool:
++        with self._lock:
++            return all(arena.allocator.memcheck() for arena in self._arenas.values())
++
++    def close(self) -> None:
++        with self._lock:
++            self.clear(force=True)
++            self._arenas.clear()
+diff --git a/third_party/LMCache/lmcache/v1/distributed/storage_controllers/prefetch_controller.py b/third_party/LMCache/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
+index ef78cee..b89863e 100644
+--- a/third_party/LMCache/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
++++ b/third_party/LMCache/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
+@@ -323,6 +323,10 @@ class PrefetchController(StorageControllerInterface):
+         # Thread-safe lookup results (background -> external)
+         self._lookup_results_lock = threading.Lock()
+         self._completed_lookups: dict[PrefetchRequestId, int] = {}
++        # Optional lookup-phase found bitmap. Legacy callers only need the
++        # prefix count; the L0 union path needs sparse positions so it can map
++        # them back into the original L0/L1/L2 chunk order.
++        self._completed_lookup_bitmaps: dict[PrefetchRequestId, Bitmap] = {}
+ 
+         # Thread-safe prefetch results (background -> external).  The condition
+         # variable lets a WAIT_PREFETCH_STATUS handler block until a result is
+@@ -460,6 +464,19 @@ class PrefetchController(StorageControllerInterface):
+         with self._lookup_results_lock:
+             return self._completed_lookups.get(request_id, None)
+ 
++    def peek_lookup_result_bitmap(
++        self, request_id: PrefetchRequestId
++    ) -> Bitmap | None:
++        """Return lookup-phase found positions without consuming the result.
++
++        The legacy API reports only a prefix count. The persistent-L0 union
++        path submits sparse local-tier misses to L2 and needs their actual
++        found positions to compute the model-wide union prefix before the
++        L2 -> L1 load finishes.
++        """
++        with self._lookup_results_lock:
++            return self._completed_lookup_bitmaps.get(request_id)
++
+     def query_prefetch_result(self, request_id: PrefetchRequestId) -> Bitmap | None:
+         """
+         Query the result of a prefetch request.
+@@ -485,6 +502,7 @@ class PrefetchController(StorageControllerInterface):
+         if result is not None:
+             with self._lookup_results_lock:
+                 self._completed_lookups.pop(request_id, None)
++                self._completed_lookup_bitmaps.pop(request_id, None)
+         return result
+ 
+     def wait_prefetch_result(
+@@ -1029,7 +1047,11 @@ class PrefetchController(StorageControllerInterface):
+ 
+         # Step 5 — submit loads; report the hit.
+         self._submit_load_tasks(request, trimmed_plan)
+-        self._report_lookup_hit(request, hit_length)
++        self._report_lookup_hit(
++            request,
++            hit_length,
++            union_bitmap if request.policy is TrimPolicy.SPARSE else None,
++        )
+ 
+     def _reserve_load_buffers(
+         self,
+@@ -1191,18 +1213,28 @@ class PrefetchController(StorageControllerInterface):
+         )
+ 
+     def _update_lookup_results(
+-        self, request_id: PrefetchRequestId, prefix_hit_count: int
++        self,
++        request_id: PrefetchRequestId,
++        prefix_hit_count: int,
++        found_bitmap: Bitmap | None = None,
+     ) -> None:
+-        """Store the prefix-hit count from the lookup phase."""
++        """Store lookup-phase prefix count and optional sparse found positions."""
+         with self._lookup_results_lock:
+             self._completed_lookups[request_id] = prefix_hit_count
++            if found_bitmap is not None:
++                self._completed_lookup_bitmaps[request_id] = found_bitmap
+ 
+     def _report_lookup_hit(
+-        self, request: InFlightPrefetchRequest, prefix_hit_count: int
++        self,
++        request: InFlightPrefetchRequest,
++        prefix_hit_count: int,
++        found_bitmap: Bitmap | None = None,
+     ) -> None:
+         """Store the lookup-phase hit and publish its completion event."""
+         request.hit_reported = True
+-        self._update_lookup_results(request.request_id, prefix_hit_count)
++        self._update_lookup_results(
++            request.request_id, prefix_hit_count, found_bitmap
++        )
+         self._event_bus.publish(
+             Event(
+                 event_type=EventType.L2_PREFETCH_LOOKUP_COMPLETED,
+@@ -1415,7 +1447,11 @@ class PrefetchController(StorageControllerInterface):
+         # already reported at submit time (so the engine never waits on the
+         # load) and is not re-reported.
+         if not request.hit_reported:
+-            self._report_lookup_hit(request, hit_length)
++            self._report_lookup_hit(
++                request,
++                hit_length,
++                result_bitmap if request.policy is TrimPolicy.SPARSE else None,
++            )
+ 
+         self._complete_request(request.request_id, retained)
+ 
+diff --git a/third_party/LMCache/lmcache/v1/distributed/storage_manager.py b/third_party/LMCache/lmcache/v1/distributed/storage_manager.py
+index 1bd2602..9d59757 100644
+--- a/third_party/LMCache/lmcache/v1/distributed/storage_manager.py
++++ b/third_party/LMCache/lmcache/v1/distributed/storage_manager.py
+@@ -32,6 +32,7 @@ from lmcache.v1.distributed.config import (
+ )
+ from lmcache.v1.distributed.error import L1Error, strerror
+ from lmcache.v1.distributed.internal_api import L1MemoryDesc, L2AdapterListener
++from lmcache.v1.distributed.l0_manager import L0Manager
+ from lmcache.v1.distributed.l1_manager import L1Manager
+ from lmcache.v1.distributed.l2_adapters import create_l2_adapter
+ from lmcache.v1.distributed.l2_adapters.base import AdapterUsage, L2AdapterInterface
+@@ -74,6 +75,7 @@ logger = init_logger(__name__)
+ 
+ class StorageManager:
+     def __init__(self, config: StorageManagerConfig):
++        self._l0_manager = L0Manager(config.l0_manager_config)
+         self._l1_manager = L1Manager(config.l1_manager_config)
+         # Retained for the L1 half of the capacity report; L1's configured
+         # size is a pure function of it.
+@@ -178,6 +180,48 @@ class StorageManager:
+         )
+ 
+     # External APIs for serving engine integration code to call
++    @property
++    def l0_enabled(self) -> bool:
++        """Whether the opt-in persistent GPU L0 data path is active."""
++        return self._l0_manager.enabled
++
++    def prepare_l0_rank_arena(
++        self,
++        kv_rank: int,
++        device,
++        group_layout_descs: dict[int, MemoryLayoutDesc],
++    ) -> bool:
++        """Prepare one fixed-Q rank-local L0 arena.
++
++        This is intentionally explicit and is not called by the legacy/default
++        store path. A future placement policy must opt a rank into L0 before it
++        can reserve L0 objects.
++        """
++        return self._l0_manager.prepare_rank_arena(
++            kv_rank, device, group_layout_descs
++        )
++
++    def reserve_l0_write(
++        self,
++        keys: list[ObjectKey],
++        layout_desc: MemoryLayoutDesc,
++        *,
++        is_temporary: bool = False,
++    ) -> dict[ObjectKey, MemoryObj]:
++        """Reserve persistent-GPU L0 objects for an explicit placement path."""
++        result = self._l0_manager.reserve_write(
++            keys, layout_desc, is_temporary=is_temporary
++        )
++        return {key: obj for key, (_err, obj) in result.items() if obj is not None}
++
++    def finish_l0_write(self, keys: list[ObjectKey]) -> None:
++        """Publish L0 objects after their D2D copies have completed."""
++        self._l0_manager.finish_write(keys)
++
++    def abort_l0_write(self, keys: list[ObjectKey]) -> None:
++        """Release unpublished L0 reservations after store failure/cancellation."""
++        self._l0_manager.abort_write(keys)
++
+     @enable_tracing()
+     def reserve_write(
+         self,
+@@ -261,6 +305,61 @@ class StorageManager:
+ 
+         # TODO: global key states update
+ 
++    def _unsafe_read_prefetched(
++        self, keys: list[ObjectKey]
++    ) -> dict[ObjectKey, tuple[L1Error, MemoryObj | None]]:
++        """Read already-reserved local sources with deterministic L0 > L1 priority."""
++        if not self._l0_manager.enabled:
++            return self._l1_manager.unsafe_read(keys)
++
++        l0_result = self._l0_manager.unsafe_read(keys)
++        remaining = [
++            key
++            for key in keys
++            if l0_result[key][0] != L1Error.SUCCESS
++            or l0_result[key][1] is None
++        ]
++        l1_result = self._l1_manager.unsafe_read(remaining) if remaining else {}
++        return {
++            key: (
++                l0_result[key]
++                if l0_result[key][0] == L1Error.SUCCESS
++                and l0_result[key][1] is not None
++                else l1_result.get(key, l0_result[key])
++            )
++            for key in keys
++        }
++
++    def _finish_prefetched_by_source(
++        self, keys: list[ObjectKey], read_locks: int = 1
++    ) -> tuple[list[ObjectKey], list[ObjectKey]]:
++        """Release the manager that actually owns each lookup read lock."""
++        if not self._l0_manager.enabled:
++            result = self._l1_manager.finish_read(keys, read_locks=read_locks)
++            return (
++                [k for k, e in result.items() if e == L1Error.SUCCESS],
++                [k for k, e in result.items() if e != L1Error.SUCCESS],
++            )
++
++        l0_keys = [key for key in keys if self._l0_manager.has_read_lock(key)]
++        l0_set = set(l0_keys)
++        l1_keys = [key for key in keys if key not in l0_set]
++        l0_result = (
++            self._l0_manager.finish_read(l0_keys, read_locks=read_locks)
++            if l0_keys
++            else {}
++        )
++        l1_result = (
++            self._l1_manager.finish_read(l1_keys, read_locks=read_locks)
++            if l1_keys
++            else {}
++        )
++        combined = {**l0_result, **l1_result}
++        return (
++            [k for k, e in combined.items() if e == L1Error.SUCCESS],
++            [k for k, e in combined.items() if e != L1Error.SUCCESS],
++        )
++
+     @contextmanager
+     def read_prefetched_results(
+         self,
+@@ -298,7 +397,7 @@ class StorageManager:
+                 "StorageManager.read_prefetched_results.__enter__",
+                 {"keys": keys},
+             )
+-        read_results = self._l1_manager.unsafe_read(keys)
++        read_results = self._unsafe_read_prefetched(keys)
+         good_keys: list[ObjectKey] = []
+         good_objs: list[MemoryObj] = []
+         bad_keys: list[ObjectKey] = []
+@@ -308,7 +407,7 @@ class StorageManager:
+         for k, (e, o) in read_results.items():
+             if o is None:
+                 logger.error(
+-                    "Failed to read prefetched object %s from L1 storage: %s",
++                    "Failed to read prefetched object %s from local L0/L1 storage: %s",
+                     k,
+                     strerror(e),
+                 )
+@@ -363,7 +462,7 @@ class StorageManager:
+             # Decrease the read lock for all successfully read memory objects
+             # if None is yielded or exception occurs during caller's processing
+             if not all_good or not successfully_yielded:
+-                self._l1_manager.finish_read(good_keys)
++                self._finish_prefetched_by_source(good_keys)
+                 self._event_bus.publish(
+                     Event(
+                         event_type=EventType.SM_READ_PREFETCHED_FINISHED,
+@@ -393,9 +492,9 @@ class StorageManager:
+             read_locks: Read locks to release per key (the whole
+                 reservation when releasing a lookup's locks).
+         """
+-        finish_result = self._l1_manager.finish_read(keys, read_locks=read_locks)
+-        successful_keys = [k for k, e in finish_result.items() if e == L1Error.SUCCESS]
+-        failed_keys = [k for k, e in finish_result.items() if e != L1Error.SUCCESS]
++        successful_keys, failed_keys = self._finish_prefetched_by_source(
++            keys, read_locks=read_locks
++        )
+         self._event_bus.publish(
+             Event(
+                 event_type=EventType.SM_READ_PREFETCHED_FINISHED,
+@@ -446,9 +545,16 @@ class StorageManager:
+                 ),
+             )
+ 
+-        # NOTE: now we only have L1, so the prefetch is essentially checking how many
+-        # objects are already in L1, and adding read locks to them.
++        # Persistent L0 is opt-in. Keep the legacy L1/L2 path completely
++        # unchanged while it is disabled. PREFIX is the normal vLLM lookup
++        # mode; the L0 v1 union path deliberately does not alter sparse/blend
++        # behavior yet.
++        if self._l0_manager.enabled and spec.policy is TrimPolicy.PREFIX:
++            return self._submit_prefix_l0_union(
++                spec, external_request_id, skip_l2
++            )
+ 
++        # Legacy L1/L2 path.
+         l1_read_result = self._l1_manager.reserve_read(
+             keys, read_locks=spec.num_kv_readers
+         )
+@@ -512,6 +618,100 @@ class StorageManager:
+ 
+         raise ValueError(f"Unsupported trim policy: {spec.policy}")
+ 
++    def _submit_prefix_l0_union(
++        self,
++        spec: PrefetchRequestSpec,
++        external_request_id: str,
++        skip_l2: bool,
++    ) -> PrefetchHandle:
++        """PREFIX lookup over a non-monotonic L0/L1/L2 local-source union.
++
++        L0 is probed first and read-locked. L1 is probed only for L0 misses,
++        giving deterministic source priority L0 > L1. Every remaining key is
++        submitted to L2 with SPARSE retention so holes in one tier do not
++        prevent a later chunk from being supplied by another tier. The final
++        model-wide prefix fold still happens over the union, so the first true
++        cross-tier miss truncates reuse exactly as before.
++        """
++        keys = spec.keys
++        l0_result = self._l0_manager.reserve_read(
++            keys, read_locks=spec.num_kv_readers
++        )
++        l0_presence = Bitmap(len(keys))
++        l0_indices: list[int] = []
++        non_l0_keys: list[ObjectKey] = []
++        non_l0_indices: list[int] = []
++        for i, key in enumerate(keys):
++            err, obj = l0_result[key]
++            if err == L1Error.SUCCESS and obj is not None:
++                l0_presence.set(i)
++                l0_indices.append(i)
++            else:
++                non_l0_keys.append(key)
++                non_l0_indices.append(i)
++
++        l1_result = self._l1_manager.reserve_read(
++            non_l0_keys, read_locks=spec.num_kv_readers
++        )
++        l1_presence = Bitmap(len(keys))
++        l1_indices: list[int] = []
++        for original_i, key in zip(non_l0_indices, non_l0_keys, strict=True):
++            err, obj = l1_result[key]
++            if err == L1Error.SUCCESS and obj is not None:
++                l1_presence.set(original_i)
++                l1_indices.append(original_i)
++
++        local_presence = l0_presence | l1_presence
++        stride = spec.attn_desc.num_object_groups * spec.attn_desc.world_size
++        num_chunks = len(keys) // stride
++        local_hit_chunks, _ = fold_unfold_ranked(
++            local_presence,
++            num_chunks,
++            spec.attn_desc.world_size,
++            spec.attn_desc.num_chunks_in_sw,
++        )
++
++        local_indices = set(l0_indices) | set(l1_indices)
++        remaining_indices = [i for i in range(len(keys)) if i not in local_indices]
++        remaining_keys = [keys[i] for i in remaining_indices]
++
++        self._event_bus.publish(
++            Event(
++                event_type=EventType.SM_READ_PREFETCHED,
++                metadata={
++                    "succeeded_keys": [keys[i] for i in sorted(local_indices)],
++                    "failed_keys": remaining_keys,
++                },
++            )
++        )
++
++        prefetch_request_id = -1
++        l2_orig_indices: tuple[int, ...] = ()
++        if not skip_l2 and remaining_keys and self._has_l2_adapters():
++            # The remaining list is intentionally sparse in original chunk
++            # space. SPARSE makes the L2 controller load every independently
++            # found key; StorageManager performs the model-wide prefix fold
++            # after mapping those results back to original positions.
++            prefetch_request_id = self._prefetch_controller.submit_prefetch_request(
++                replace(spec, keys=remaining_keys, policy=TrimPolicy.SPARSE)
++            )
++            l2_orig_indices = tuple(remaining_indices)
++
++        return PrefetchHandle(
++            prefetch_request_id=prefetch_request_id,
++            external_request_id=external_request_id,
++            l1_found_indices=tuple(l1_indices),
++            l1_hit_chunks=local_hit_chunks,
++            total_requested_keys=len(keys),
++            submit_time=time.monotonic(),
++            l2_orig_indices=l2_orig_indices,
++            l0_found_indices=tuple(l0_indices),
++            l0_union_enabled=True,
++            num_kv_readers=spec.num_kv_readers,
++            attn_desc=spec.attn_desc,
++            original_keys=tuple(keys),
++        )
++
+     def _submit_prefix_fold(
+         self,
+         spec: PrefetchRequestSpec,
+@@ -621,6 +821,7 @@ class StorageManager:
+         ``handle.l2_orig_indices``.
+         """
+         found = Bitmap(handle.total_requested_keys)
++        found.batched_set(handle.l0_found_indices)
+         found.batched_set(handle.l1_found_indices)
+         if l2_local is not None:
+             # gather maps each L2 set bit i to its original position
+@@ -656,6 +857,27 @@ class StorageManager:
+         if handle.prefetch_request_id == -1:
+             return handle.l1_hit_chunks
+ 
++        if handle.l0_union_enabled:
++            # The L2 controller sees only sparse local-tier misses, so its
++            # scalar prefix count is not meaningful in original chunk space.
++            # Use lookup-phase found positions (available before the load
++            # finishes), map them back, and fold the real L0/L1/L2 union.
++            l2_bitmap = self._prefetch_controller.peek_lookup_result_bitmap(
++                handle.prefetch_request_id
++            )
++            if l2_bitmap is None:
++                return None
++            found = self._combine_found(handle, l2_bitmap)
++            stride = handle.attn_desc.num_object_groups * handle.attn_desc.world_size
++            num_chunks = handle.total_requested_keys // stride
++            hit_chunks, _ = fold_unfold_ranked(
++                found,
++                num_chunks,
++                handle.attn_desc.world_size,
++                handle.attn_desc.num_chunks_in_sw,
++            )
++            return hit_chunks
++
+         l2_r = self._prefetch_controller.query_lookup_result(handle.prefetch_request_id)
+         if l2_r is None:
+             # Still in progress, or already consumed by query_prefetch_status.
+@@ -714,21 +936,44 @@ class StorageManager:
+                 return None
+ 
+         found = self._combine_found(handle, l2_r)
++
++        if handle.l0_union_enabled:
++            stride = handle.attn_desc.num_object_groups * handle.attn_desc.world_size
++            num_chunks = handle.total_requested_keys // stride
++            _hit_chunks, retain = fold_unfold_ranked(
++                found,
++                num_chunks,
++                handle.attn_desc.world_size,
++                handle.attn_desc.num_chunks_in_sw,
++            )
++            released = (found & (~retain)).gather(
++                list(handle.original_keys)
++            )
++            if released:
++                self._finish_prefetched_by_source(
++                    released, read_locks=handle.num_kv_readers
++                )
++            retained_keys = retain.gather(list(handle.original_keys))
++            if retained_keys:
++                self._l0_manager.touch_keys(retained_keys)
++                self._l1_manager.touch_keys(retained_keys)
++
+         # popcount (not count_leading_ones) so the log is accurate for
+         # non-contiguous policies (SEGMENTED_PREFIX / SPARSE) too.
+         total_hits = found.popcount()
+         elapsed_ms = (time.monotonic() - handle.submit_time) * 1000
+ 
+         if total_hits > 0:
+-            # L1 and L2 sets are disjoint (only L1-misses go to L2).
++            l0_hits = len(handle.l0_found_indices)
+             l1_hits = len(handle.l1_found_indices)
+             l2_hits = l2_r.popcount() if l2_r is not None else 0
+             logger.info(
+-                "Prefetch request completed (L1+L2): "
+-                "%d/%d retained keys (%d L1, %d L2) in %.1f ms "
++                "Prefetch request completed (L0+L1+L2): "
++                "%d/%d found keys (%d L0, %d L1, %d L2) in %.1f ms "
+                 "(external_request_id=%s, prefetch_request_id=%d)",
+                 total_hits,
+                 handle.total_requested_keys,
++                l0_hits,
+                 l1_hits,
+                 l2_hits,
+                 elapsed_ms,
+@@ -745,6 +990,7 @@ class StorageManager:
+         Args:
+             keys (list[ObjectKey]): List of object keys to touch.
+         """
++        self._l0_manager.touch_keys(keys)
+         self._l1_manager.touch_keys(keys)
+ 
+     def delete_l1_keys(
+@@ -771,7 +1017,7 @@ class StorageManager:
+         self, keys: list[ObjectKey]
+     ) -> tuple[list[ObjectKey], list[MemoryObj]]:
+         """Read already read-locked objects without acquiring new read locks."""
+-        read_results = self._l1_manager.unsafe_read(keys)
++        read_results = self._unsafe_read_prefetched(keys)
+         good_keys: list[ObjectKey] = []
+         good_objs: list[MemoryObj] = []
+         for key in keys:
+@@ -1107,6 +1353,7 @@ class StorageManager:
+                 If False (default), only clear unlocked objects, keeping
+                 write-locked and read-locked objects intact.
+         """
++        self._l0_manager.clear(force=force)
+         self._l1_manager.clear(force=force)
+ 
+     def close(self):
+@@ -1123,19 +1370,22 @@ class StorageManager:
+         for adapter in self._l2_adapters.values():
+             adapter.close()
+ 
++        self._l0_manager.close()
+         self._l1_manager.close()
+ 
+     def report_status(self) -> dict:
+         """Return a status dict aggregating all sub-component statuses."""
++        l0 = self._l0_manager.report_status()
+         l1 = self._l1_manager.report_status()
+         store = self._store_controller.report_status()
+         prefetch = self._prefetch_controller.report_status()
+         l1_eviction = self._eviction_controller.report_status()
+         l2_eviction = self._l2_eviction_controller.report_status()
+         adapters = [a.report_status() for _id, _desc, a in self._snapshot_adapters()]
+-        children = [l1, store, prefetch, l1_eviction, l2_eviction] + adapters
++        children = [l0, l1, store, prefetch, l1_eviction, l2_eviction] + adapters
+         return {
+             "is_healthy": all(c["is_healthy"] for c in children),
++            "l0_manager": l0,
+             "l1_manager": l1,
+             "store_controller": store,
+             "prefetch_controller": prefetch,
+@@ -1167,7 +1417,7 @@ class StorageManager:
+         Returns:
+             True if memory is consistent, False otherwise.
+         """
+-        return self._l1_manager.memcheck()
++        return self._l0_manager.memcheck() and self._l1_manager.memcheck()
+ 
+     def _snapshot_adapters(
+         self,
+diff --git a/third_party/LMCache/lmcache/v1/mp_observability/subscribers/metrics/lookup.py b/third_party/LMCache/lmcache/v1/mp_observability/subscribers/metrics/lookup.py
+index 80ee921..a02f9cb 100644
+--- a/third_party/LMCache/lmcache/v1/mp_observability/subscribers/metrics/lookup.py
++++ b/third_party/LMCache/lmcache/v1/mp_observability/subscribers/metrics/lookup.py
+@@ -1,17 +1,18 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+-"""Lookup metrics subscriber — OTel counters for L1+L2 token-level hit rate.
++"""Lookup metrics subscriber — OTel counters for external-KV token hit rate.
+ 
+ Exposes counters driven by the ``MP_LOOKUP_PREFETCH_END`` event.  The
+ combined pair ``lookup_requested`` / ``lookup_hit`` gives the fraction of
+-tokens requested by a lookup that were served from the L1 or L2 caches
+-(L0/GPU prefix cache is vLLM-owned and not observable here):
++tokens requested by a lookup that were served from LMCache. vLLM's own
++prefix cache is outside this metric; optional persistent LMCache L0 is included.
+ 
+     rate(lmcache_mp_lookup_hit_tokens_total[5m])
+     / rate(lmcache_mp_lookup_requested_tokens_total[5m])
+ 
+-``lookup_hit_l1`` / ``lookup_hit_l2`` split ``lookup_hit`` by tier
+-(``l1 + l2 == hit`` per event); ``lookups`` counts completed lookups and
++For legacy L1/L2 lookups, ``lookup_hit_l1`` / ``lookup_hit_l2`` split the
++hit exactly. Non-monotonic L0-union lookups increment ``lookup_hit_l0_union``
++instead of fabricating a tier split. ``lookups`` counts completed lookups and
+ ``lookup_early_exit`` those that short-circuited before a cache probe,
+ labeled by ``reason``.
+ 
+@@ -54,18 +55,20 @@ def _lookup_attrs(event: Event) -> dict[str, Any]:
+ 
+ 
+ class LookupMetricsSubscriber(EventSubscriber):
+-    """Maintains OTel counters for L1+L2 token-level cache hit rate.
++    """Maintains OTel counters for LMCache token-level cache hit rate.
+ 
+     Metrics (all labeled by ``model_name`` and ``cache_salt``):
+     - ``lmcache_mp.lookup_requested`` — tokens submitted for lookup
+       (denominator).  Counts only the chunk-aligned portion; sub-chunk
+       trailing tokens are excluded because they cannot hit by design.
+-    - ``lmcache_mp.lookup_hit`` — tokens found in L1+L2 during the
+-      lookup (numerator).  Counts the contiguous prefix hit only.
++    - ``lmcache_mp.lookup_hit`` — tokens found in LMCache during the
++      lookup (numerator). Counts the contiguous prefix hit only.
+     - ``lmcache_mp.lookup_hit_l1`` — of lookup_hit, tokens L1 could serve
+       on its own under each object group's attention-window rule.
+-    - ``lmcache_mp.lookup_hit_l2`` — of lookup_hit, tokens L2 added beyond
+-      the L1-servable prefix.  ``l1 + l2 == lookup_hit`` per event.
++    - ``lmcache_mp.lookup_hit_l2`` — for legacy L1/L2 lookup, tokens L2
++      added beyond the L1-servable prefix. There, ``l1 + l2 == lookup_hit``.
++    - ``lmcache_mp.lookup_hit_l0_union`` — total hit tokens for an L0/L1/L2
++      union lookup; deliberately not a fabricated per-tier split.
+     - ``lmcache_mp.lookups`` — completed lookups (denominator for
+       ``lookup_early_exit``).
+     - ``lmcache_mp.lookup_early_exit`` — lookups that exited before a
+@@ -80,7 +83,7 @@ class LookupMetricsSubscriber(EventSubscriber):
+             "lmcache_mp.lookup_requested",
+             description=(
+                 "Total tokens submitted for lookup (denominator of the "
+-                "L1+L2 token-level hit rate). Only chunk-aligned tokens "
++                "LMCache token-level hit rate). Only chunk-aligned tokens "
+                 "are counted."
+             ),
+             unit="tokens",
+@@ -88,8 +91,8 @@ class LookupMetricsSubscriber(EventSubscriber):
+         self._hit_tokens = meter.create_counter(
+             "lmcache_mp.lookup_hit",
+             description=(
+-                "Total tokens found in L1+L2 during lookup (numerator of "
+-                "the L1+L2 token-level hit rate). Counts the contiguous "
++                "Total tokens found in LMCache during lookup (numerator of "
++                "the LMCache token-level hit rate). Counts the contiguous "
+                 "prefix hit only."
+             ),
+             unit="tokens",
+@@ -111,6 +114,15 @@ class LookupMetricsSubscriber(EventSubscriber):
+             ),
+             unit="tokens",
+         )
++        self._l0_union_hit_tokens = meter.create_counter(
++            "lmcache_mp.lookup_hit_l0_union",
++            description=(
++                "Total contiguous hit tokens for lookups using the "
++                "non-monotonic persistent-L0/L1/L2 union path. This is not "
++                "a per-tier attribution."
++            ),
++            unit="tokens",
++        )
+         self._lookups = meter.create_counter(
+             "lmcache_mp.lookups",
+             description="Completed lookups (denominator for lookup_early_exit).",
+@@ -138,12 +150,17 @@ class LookupMetricsSubscriber(EventSubscriber):
+         self._lookups.add(1, attributes=attrs)
+         # .get(): tolerate events from emitters predating the attribution
+         # fields; they simply do not move the split counters.
+-        self._l1_hit_tokens.add(
+-            event.metadata.get("l1_hit_tokens", 0), attributes=attrs
+-        )
+-        self._l2_hit_tokens.add(
+-            event.metadata.get("l2_hit_tokens", 0), attributes=attrs
+-        )
++        if event.metadata.get("l0_union_enabled", False):
++            self._l0_union_hit_tokens.add(
++                event.metadata.get("hit_tokens", 0), attributes=attrs
++            )
++        else:
++            self._l1_hit_tokens.add(
++                event.metadata.get("l1_hit_tokens", 0), attributes=attrs
++            )
++            self._l2_hit_tokens.add(
++                event.metadata.get("l2_hit_tokens", 0), attributes=attrs
++            )
+         early_exit_reason = event.metadata.get("early_exit_reason", "")
+         if early_exit_reason:
+             self._early_exits.add(1, attributes={**attrs, "reason": early_exit_reason})
+diff --git a/third_party/LMCache/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py b/third_party/LMCache/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
+index 7fa212c..ca2695e 100644
+--- a/third_party/LMCache/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
++++ b/third_party/LMCache/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
+@@ -182,6 +182,19 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
+             self._ctx.storage_manager.finish_write,
+             payload_type=list[ObjectKey],
+         )
++        # Dormant L0 completion hook. No current placement policy submits this
++        # callback; it exists so a later explicit L0 store can publish only
++        # after its D2D copy reaches this stream position.
++        self._device_host_func_dispatcher.register(
++            "finish_l0_write",
++            self._ctx.storage_manager.finish_l0_write,
++            payload_type=list[ObjectKey],
++        )
++        self._device_host_func_dispatcher.register(
++            "abort_l0_write",
++            self._ctx.storage_manager.abort_l0_write,
++            payload_type=list[ObjectKey],
++        )
+         self._device_host_func_dispatcher.register(
+             "finish_read_prefetched",
+             self._ctx.storage_manager.finish_read_prefetched,
+diff --git a/third_party/LMCache/lmcache/v1/multiprocess/modules/lookup.py b/third_party/LMCache/lmcache/v1/multiprocess/modules/lookup.py
+index 0e20566..864eb1c 100644
+--- a/third_party/LMCache/lmcache/v1/multiprocess/modules/lookup.py
++++ b/third_party/LMCache/lmcache/v1/multiprocess/modules/lookup.py
+@@ -395,19 +395,28 @@ class LookupModule:
+             tuple(range(job.attn_desc.num_object_groups)),
+         )
+ 
+-        # ``l1_hit_chunks`` is the prefix L1 could serve on its own under each
+-        # object group's window rule, so L2's contribution is however much
+-        # further ``found_count`` reaches -- not a count of L1-resident keys.
+-        l1_chunks = job.handle.l1_hit_chunks
+-        if l1_chunks > found_count:
+-            logger.error(
+-                "L1 hit chunks exceed total hit chunks: l1=%d total=%d request=%s",
+-                l1_chunks,
+-                found_count,
+-                request_id,
+-            )
+-            l1_chunks = found_count
+-        l2_chunks = found_count - l1_chunks
++        if job.handle.l0_union_enabled:
++            # L0 union lookups may alternate L0/L1/L2 at chunk/object level,
++            # so the legacy monotonic L1-prefix/L2-suffix attribution is not
++            # meaningful. Keep the total exact and expose an explicit union
++            # flag; object-level L0 counters live in L0Manager.
++            l1_chunks = 0
++            l2_chunks = 0
++        else:
++            # ``l1_hit_chunks`` is the prefix L1 could serve on its own under
++            # each object group's window rule, so L2's contribution is however
++            # much further ``found_count`` reaches.
++            l1_chunks = job.handle.l1_hit_chunks
++            if l1_chunks > found_count:
++                logger.error(
++                    "L1 hit chunks exceed total hit chunks: "
++                    "l1=%d total=%d request=%s",
++                    l1_chunks,
++                    found_count,
++                    request_id,
++                )
++                l1_chunks = found_count
++            l2_chunks = found_count - l1_chunks
+ 
+         self._ctx.event_bus.publish(
+             Event(
+@@ -419,6 +428,7 @@ class LookupModule:
+                     "hit_tokens": found_count * self._ctx.chunk_size,
+                     "l1_hit_tokens": l1_chunks * self._ctx.chunk_size,
+                     "l2_hit_tokens": l2_chunks * self._ctx.chunk_size,
++                    "l0_union_enabled": job.handle.l0_union_enabled,
+                     "early_exit_reason": job.early_exit_reason,
+                     "model_name": job.model_name,
+                     "cache_salt": job.cache_salt,
+diff --git a/third_party/LMCache/lmcache/v1/multiprocess/object_group_transfer.py b/third_party/LMCache/lmcache/v1/multiprocess/object_group_transfer.py
+index f2a323e..2e134ec 100644
+--- a/third_party/LMCache/lmcache/v1/multiprocess/object_group_transfer.py
++++ b/third_party/LMCache/lmcache/v1/multiprocess/object_group_transfer.py
+@@ -376,6 +376,20 @@ def _run_object_group_transfer_plan(
+     )
+ 
+ 
++def _is_device_backed_memory_obj(memory_obj: MemoryObj | None) -> bool:
++    """Return True when ``memory_obj`` is backed by accelerator memory.
++
++    The native object-group fast path treats the MemoryObj side as host/lazy
++    memory. Persistent L0 objects are CUDA/accelerator tensors, so they must
++    use the ordinary tensor-copy staging path; torch then dispatches the
++    staging leg as a real device-to-device copy without a CPU bounce.
++    """
++    if memory_obj is None or isinstance(memory_obj, GDSMemoryObject):
++        return False
++    raw = memory_obj.raw_tensor
++    return raw is not None and raw.device.type != "cpu"
++
++
+ def transfer_kv_per_object_group(
+     cache_context: BaseCacheContext,
+     block_ids_gpu: list[torch.Tensor],
+@@ -415,8 +429,10 @@ def transfer_kv_per_object_group(
+         This function expects the caller to stage the block ids (list[list[int]])
+         into GPU tensors and pass them in as `block_ids_gpu`.
+     """
+-    if _HAS_NATIVE_OBJECT_GROUP_TRANSFER and not any(
+-        isinstance(mo, GDSMemoryObject) for mo in memory_objs
++    if (
++        _HAS_NATIVE_OBJECT_GROUP_TRANSFER
++        and not any(isinstance(mo, GDSMemoryObject) for mo in memory_objs)
++        and not any(_is_device_backed_memory_obj(mo) for mo in memory_objs)
+     ):
+         _run_object_group_transfer_plan(
+             cache_context,
+diff --git a/third_party/LMCache/tests/v1/distributed/test_l0_manager.py b/third_party/LMCache/tests/v1/distributed/test_l0_manager.py
+new file mode 100644
+index 0000000..72133f1
+--- /dev/null
++++ b/third_party/LMCache/tests/v1/distributed/test_l0_manager.py
+@@ -0,0 +1,149 @@
++# SPDX-License-Identifier: Apache-2.0
++
++# Third Party
++import pytest
++import torch
++
++pytest.importorskip("lmcache.lmcache_native")
++
++# First Party
++from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
++from lmcache.v1.distributed.config import L0ManagerConfig
++from lmcache.v1.distributed.error import L1Error
++from lmcache.v1.distributed.l0_manager import L0Manager
++
++
++def _layout(num_bytes: int = 64) -> MemoryLayoutDesc:
++    return MemoryLayoutDesc(shapes=[torch.Size([num_bytes])], dtypes=[torch.uint8])
++
++
++def _key(chunk: int, rank: int, group: int = 0) -> ObjectKey:
++    return ObjectKey(
++        chunk_hash=ObjectKey.IntHash2Bytes(chunk),
++        model_name="l0-test-model",
++        kv_rank=rank,
++        object_group_id=group,
++    )
++
++
++def _manager(page_bytes: int = 64, pages_per_rank: int = 1) -> L0Manager:
++    return L0Manager(
++        L0ManagerConfig(
++            enabled=True,
++            capacity_bytes=page_bytes * pages_per_rank,
++            write_ttl_seconds=60,
++            read_ttl_seconds=60,
++        )
++    )
++
++
++def _prepare(mgr: L0Manager, rank: int, page_bytes: int = 64) -> None:
++    assert mgr.prepare_rank_arena(rank, "cpu", {0: _layout(page_bytes)})
++
++
++def _store(mgr: L0Manager, key: ObjectKey, page_bytes: int = 64) -> None:
++    result = mgr.reserve_write([key], _layout(page_bytes))
++    assert result[key][0] == L1Error.SUCCESS
++    assert result[key][1] is not None
++    assert mgr.finish_write([key])[key] == L1Error.SUCCESS
++
++
++def test_l0_disabled_and_q_zero_do_not_allocate() -> None:
++    disabled = L0Manager(L0ManagerConfig())
++    assert not disabled.enabled
++    assert not disabled.prepare_rank_arena(0, "cpu", {0: _layout()})
++    assert disabled.get_memory_usage() == (0, 0)
++
++    q_zero = L0Manager(L0ManagerConfig(enabled=True, capacity_bytes=0))
++    assert not q_zero.enabled
++    assert not q_zero.prepare_rank_arena(0, "cpu", {0: _layout()})
++    assert q_zero.get_memory_usage() == (0, 0)
++
++
++def test_l0_write_is_not_visible_until_published() -> None:
++    mgr = _manager()
++    _prepare(mgr, 0)
++    key = _key(1, 0)
++
++    write_result = mgr.reserve_write([key], _layout())
++    assert write_result[key][0] == L1Error.SUCCESS
++
++    read_before_publish = mgr.reserve_read([key])
++    assert read_before_publish[key][0] == L1Error.KEY_NOT_READABLE
++
++    assert mgr.finish_write([key])[key] == L1Error.SUCCESS
++    read_after_publish = mgr.reserve_read([key])
++    assert read_after_publish[key][0] == L1Error.SUCCESS
++    assert read_after_publish[key][1] is not None
++    assert mgr.finish_read([key])[key] == L1Error.SUCCESS
++    mgr.close()
++
++
++def test_l0_lru_evicts_a_logical_chunk_across_rank_shards() -> None:
++    mgr = _manager()
++    _prepare(mgr, 0)
++    _prepare(mgr, 1)
++
++    a0 = _key(10, 0)
++    a1 = _key(10, 1)
++    b0 = _key(20, 0)
++    _store(mgr, a0)
++    _store(mgr, a1)
++
++    # Rank 0 is full. Admitting B on rank 0 evicts logical chunk A, including
++    # its rank-1 shard, rather than leaving a partial logical L0 residency.
++    b_result = mgr.reserve_write([b0], _layout())
++    assert b_result[b0][0] == L1Error.SUCCESS
++    assert mgr.finish_write([b0])[b0] == L1Error.SUCCESS
++
++    assert mgr.reserve_read([a0])[a0][0] == L1Error.KEY_NOT_EXIST
++    assert mgr.reserve_read([a1])[a1][0] == L1Error.KEY_NOT_EXIST
++    assert mgr.reserve_read([b0])[b0][0] == L1Error.SUCCESS
++    assert mgr.finish_read([b0])[b0] == L1Error.SUCCESS
++    mgr.close()
++
++
++def test_l0_full_with_pinned_victim_fails_admission_cleanly() -> None:
++    mgr = _manager()
++    _prepare(mgr, 0)
++    a = _key(1, 0)
++    b = _key(2, 0)
++    _store(mgr, a)
++
++    assert mgr.reserve_read([a])[a][0] == L1Error.SUCCESS
++    b_result = mgr.reserve_write([b], _layout())
++    assert b_result[b][0] == L1Error.OUT_OF_MEMORY
++    assert b_result[b][1] is None
++
++    # The pinned object remains usable and can be released normally.
++    assert mgr.unsafe_read([a])[a][0] == L1Error.SUCCESS
++    assert mgr.finish_read([a])[a] == L1Error.SUCCESS
++
++    # Once unpinned, a new admission may evict A.
++    b_result = mgr.reserve_write([b], _layout())
++    assert b_result[b][0] == L1Error.SUCCESS
++    assert mgr.finish_write([b])[b] == L1Error.SUCCESS
++    mgr.close()
++
++
++def test_l0_abort_drops_unpublished_reservation() -> None:
++    mgr = _manager()
++    _prepare(mgr, 0)
++    key = _key(7, 0)
++
++    assert mgr.reserve_write([key], _layout())[key][0] == L1Error.SUCCESS
++    assert mgr.abort_write([key])[key] == L1Error.SUCCESS
++    assert mgr.reserve_read([key])[key][0] == L1Error.KEY_NOT_EXIST
++    assert mgr.get_memory_usage()[0] == 0
++    mgr.close()
++
++
++def test_temp_l0_is_dormant_by_default() -> None:
++    mgr = _manager()
++    _prepare(mgr, 0)
++    key = _key(99, 0)
++
++    result = mgr.reserve_write([key], _layout(), is_temporary=True)
++    assert result[key][0] == L1Error.OUT_OF_MEMORY
++    assert mgr.temp_object_count == 0
++    mgr.close()
+diff --git a/third_party/LMCache/tests/v1/distributed/test_l0_union_lookup.py b/third_party/LMCache/tests/v1/distributed/test_l0_union_lookup.py
+new file mode 100644
+index 0000000..85eda85
+--- /dev/null
++++ b/third_party/LMCache/tests/v1/distributed/test_l0_union_lookup.py
+@@ -0,0 +1,218 @@
++# SPDX-License-Identifier: Apache-2.0
++
++# Standard
++import threading
++
++# Third Party
++import pytest
++import torch
++
++pytest.importorskip("lmcache.lmcache_native")
++
++# First Party
++from lmcache.lmcache_native import Bitmap
++from lmcache.v1.distributed.api import (
++    AttnWindowDesc,
++    MemoryLayoutDesc,
++    ObjectKey,
++    PrefetchRequestSpec,
++    TrimPolicy,
++)
++from lmcache.v1.distributed.bitmap_ops import fold_unfold_ranked
++from lmcache.v1.distributed.error import L1Error
++from lmcache.v1.distributed.storage_manager import StorageManager
++
++
++class _EventBus:
++    def publish(self, _event) -> None:
++        pass
++
++
++class _FakeLocalManager:
++    def __init__(self, readable=()):
++        self.readable = set(readable)
++        self.locked: set[ObjectKey] = set()
++        self.finished: list[ObjectKey] = []
++        self.touched: list[ObjectKey] = []
++
++    @property
++    def enabled(self) -> bool:
++        return True
++
++    def reserve_read(self, keys, read_locks=1):
++        del read_locks
++        out = {}
++        for key in keys:
++            if key in self.readable:
++                self.locked.add(key)
++                out[key] = (L1Error.SUCCESS, object())
++            else:
++                out[key] = (L1Error.KEY_NOT_EXIST, None)
++        return out
++
++    def unsafe_read(self, keys):
++        return {
++            key: (
++                (L1Error.SUCCESS, object())
++                if key in self.locked
++                else (L1Error.KEY_NOT_READABLE, None)
++            )
++            for key in keys
++        }
++
++    def has_read_lock(self, key):
++        return key in self.locked
++
++    def finish_read(self, keys, read_locks=1):
++        del read_locks
++        out = {}
++        for key in keys:
++            if key in self.locked:
++                self.locked.remove(key)
++                self.finished.append(key)
++                out[key] = L1Error.SUCCESS
++            else:
++                out[key] = L1Error.KEY_IN_WRONG_STATE
++        return out
++
++    def touch_keys(self, keys) -> None:
++        self.touched.extend(key for key in keys if key in self.readable)
++
++
++class _FakePrefetchController:
++    def __init__(self):
++        self.spec = None
++        self.lookup_bitmap = None
++        self.final_bitmap = None
++
++    def submit_prefetch_request(self, spec):
++        self.spec = spec
++        return 17
++
++    def peek_lookup_result_bitmap(self, request_id):
++        assert request_id == 17
++        return self.lookup_bitmap
++
++    def query_prefetch_result(self, request_id):
++        assert request_id == 17
++        result = self.final_bitmap
++        self.final_bitmap = None
++        return result
++
++
++def _key(chunk: int, rank: int = 0) -> ObjectKey:
++    return ObjectKey(
++        chunk_hash=ObjectKey.IntHash2Bytes(chunk),
++        model_name="l0-union-test",
++        kv_rank=rank,
++    )
++
++
++def _spec(keys: list[ObjectKey], world_size: int = 1) -> PrefetchRequestSpec:
++    return PrefetchRequestSpec(
++        keys=keys,
++        group_layout_descs={
++            0: MemoryLayoutDesc(
++                shapes=[torch.Size([64])],
++                dtypes=[torch.uint8],
++            )
++        },
++        policy=TrimPolicy.PREFIX,
++        attn_desc=AttnWindowDesc(num_chunks_in_sw=[-1], world_size=world_size),
++    )
++
++
++def _storage_manager(l0_hits, l1_hits, *, with_l2: bool):
++    sm = StorageManager.__new__(StorageManager)
++    sm._l0_manager = _FakeLocalManager(l0_hits)
++    sm._l1_manager = _FakeLocalManager(l1_hits)
++    sm._event_bus = _EventBus()
++    sm._prefetch_controller = _FakePrefetchController()
++    sm._adapters_lock = threading.Lock()
++    sm._l2_adapters = {0: object()} if with_l2 else {}
++    return sm
++
++
++def _prefix_chunks(found: Bitmap, num_chunks: int, world_size: int = 1) -> int:
++    hit, _ = fold_unfold_ranked(
++        found,
++        num_chunks,
++        world_size,
++        [-1],
++    )
++    return hit
++
++
++def test_l0_l1_hole_truncates_global_prefix_and_releases_later_locks() -> None:
++    keys = [_key(i) for i in range(4)]
++    sm = _storage_manager(
++        l0_hits={keys[0], keys[3]},
++        l1_hits={keys[2]},
++        with_l2=False,
++    )
++
++    handle = sm._submit_prefix_l0_union(_spec(keys), "req", skip_l2=False)
++    assert handle.l1_hit_chunks == 1
++
++    found = sm.query_prefetch_status(handle)
++    assert found is not None
++    assert _prefix_chunks(found, 4) == 1
++    assert keys[3] in sm._l0_manager.finished
++    assert keys[2] in sm._l1_manager.finished
++    assert keys[0] in sm._l0_manager.locked
++
++
++def test_l0_l2_l1_l0_union_reports_full_prefix_before_l2_load_finishes() -> None:
++    keys = [_key(i) for i in range(4)]
++    sm = _storage_manager(
++        l0_hits={keys[0], keys[3]},
++        l1_hits={keys[2]},
++        with_l2=True,
++    )
++
++    handle = sm._submit_prefix_l0_union(_spec(keys), "req", skip_l2=False)
++    assert sm._prefetch_controller.spec is not None
++    assert sm._prefetch_controller.spec.policy is TrimPolicy.SPARSE
++    assert sm._prefetch_controller.spec.keys == [keys[1]]
++
++    lookup = Bitmap(1)
++    lookup.set(0)
++    sm._prefetch_controller.lookup_bitmap = lookup
++    assert sm.query_prefetch_lookup_hits(handle) == 4
++
++    # Model the completed L2 -> temporary-L1 staging before final status.
++    sm._l1_manager.readable.add(keys[1])
++    sm._l1_manager.locked.add(keys[1])
++    final = Bitmap(1)
++    final.set(0)
++    sm._prefetch_controller.final_bitmap = final
++
++    found = sm.query_prefetch_status(handle)
++    assert found is not None
++    assert _prefix_chunks(found, 4) == 4
++
++    result = sm._unsafe_read_prefetched(keys)
++    assert all(
++        err == L1Error.SUCCESS and obj is not None
++        for err, obj in result.values()
++    )
++
++
++def test_tp_asymmetry_is_a_logical_l0_miss() -> None:
++    # Flat order is chunk-major, then rank. Chunk 0 has only rank 0; chunk 1
++    # has both ranks. The missing rank-1 shard of chunk 0 must make the whole
++    # logical prefix miss rather than exposing a partial L0 hit.
++    keys = [_key(0, 0), _key(0, 1), _key(1, 0), _key(1, 1)]
++    sm = _storage_manager(
++        l0_hits={keys[0], keys[2], keys[3]},
++        l1_hits=set(),
++        with_l2=False,
++    )
++
++    handle = sm._submit_prefix_l0_union(
++        _spec(keys, world_size=2), "req", skip_l2=False
++    )
++    assert handle.l1_hit_chunks == 0
++    found = sm.query_prefetch_status(handle)
++    assert found is not None
++    assert _prefix_chunks(found, 2, world_size=2) == 0
