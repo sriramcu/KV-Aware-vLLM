@@ -1,0 +1,922 @@
+--- a/third_party/LMCache/lmcache/integration/vllm/lmcache_mp_connector.py
++++ b/third_party/LMCache/lmcache/integration/vllm/lmcache_mp_connector.py
+@@ -4,6 +4,7 @@
+ from collections.abc import Iterable
+ from typing import TYPE_CHECKING, Any
+ import math
++import os
+ import sys
+ import time
+ 
+@@ -513,6 +514,16 @@
+                 "lmcache.mp.starvation_fallback", True
+             )
+         )
++        # Optional research guard: a Stage-1 LOOKUP/PREFETCH may hold L1 read
++        # reservations from near the beginning of the lookup.  If Stage 1
++        # itself lasts close to or beyond the L1 read-lock TTL, admitting the
++        # completed hit into Stage 2 can immediately fail in unsafe_read().
++        # Keep this disabled by default for upstream-compatible behavior; the
++        # experiment launcher enables it explicitly.
++        self._stage1_result_freshness_guard_s = float(
++            os.getenv("LMCACHE_MP_STAGE1_FRESHNESS_GUARD_S", "0")
++        )
++        self._chthm_debug = os.getenv("LMCACHE_MP_CHTHM_DEBUG", "0") == "1"
+ 
+         # Multi-server: prefer lmcache.mp.server_urls (list or comma-separated
+         # string) over the single-server lmcache.mp.host / lmcache.mp.port.
+@@ -1104,11 +1115,56 @@
+         if ret is None:
+             return None, True
+         assert tracker.lookup_started_at is not None
+-        self._connector_stats.record_lookup(
+-            time.monotonic() - tracker.lookup_started_at
+-        )
++        lookup_age_s = time.monotonic() - tracker.lookup_started_at
++        self._connector_stats.record_lookup(lookup_age_s)
+         tracker.lookup_started_at = None
+ 
++        # Freshness gate before Stage-2 admission.  L1 read reservations are
++        # acquired during Stage 1 (including the initial L1 lock pass), so a
++        # very old completed lookup can already be unsafe to consume even
++        # though QUERY_PREFETCH_STATUS itself just returned successfully.
++        # Convert such a hit into an ordinary miss before vLLM allocates GPU
++        # destination blocks and enters WAITING_FOR_REMOTE_KVS.
++        if (
++            ret > 0
++            and self._stage1_result_freshness_guard_s > 0
++            and lookup_age_s >= self._stage1_result_freshness_guard_s
++        ):
++            logger.warning(
++                "[MP_STAGE1_FRESHNESS_GUARD] request=%s lookup_age_s=%.3f "
++                "guard_s=%.3f hit_tokens=%d action=recompute_before_stage2",
++                request.request_id,
++                lookup_age_s,
++                self._stage1_result_freshness_guard_s,
++                ret,
++            )
++            # Release every lookup/prefetch read reservation represented by
++            # this hit.  The RPC is asynchronous; no GPU destination blocks
++            # have been committed yet, so local recomputation is safe.
++            self.scheduler_adapter.free_lookup_locks(
++                token_ids=tracker.get_token_ids(),
++                start=0,
++                end=ret,
++                request_id=request.request_id,
++                cache_salt=tracker.cache_salt,
++                request_configs=tracker.request_configs,
++            )
++            self.scheduler_adapter.cleanup_lookup_result(request.request_id)
++            tracker.num_lmcache_hit_tokens = 0
++            tracker.state = LMCacheMPRequestState.BYPASS_LMCACHE
++            if self._chthm_debug:
++                logger.info(
++                    "[MP_CHTHM_ADMIT] request=%s decision=freshness_miss "
++                    "prompt_tokens=%d vllm_hit_tokens=%d lmcache_hit_tokens=%d "
++                    "external_load_tokens=0 lookup_age_s=%.3f",
++                    request.request_id,
++                    len(request.all_token_ids),
++                    num_computed_tokens,
++                    ret,
++                    lookup_age_s,
++                )
++            return 0, False
++
+         # Save the vLLM hit count even when LMCache misses. It is rounded
+         # down to a boundary aligned for every engine group (a full-prompt
+         # APC hit reports num_prompt_tokens - 1), so the retrieve-skip
+@@ -1120,6 +1176,16 @@
+         )
+ 
+         if ret == 0:
++            if self._chthm_debug:
++                logger.info(
++                    "[MP_CHTHM_ADMIT] request=%s decision=miss "
++                    "prompt_tokens=%d vllm_hit_tokens=%d lmcache_hit_tokens=0 "
++                    "external_load_tokens=0 lookup_age_s=%.3f",
++                    request.request_id,
++                    len(request.all_token_ids),
++                    tracker.num_vllm_hit_tokens,
++                    lookup_age_s,
++                )
+             return 0, False
+ 
+         assert ret % self.scheduler_adapter.lmcache_tokens_per_chunk == 0
+@@ -1141,6 +1207,18 @@
+         logger.debug(
+             "vLLM hit is: %d, Need to load is %d", num_computed_tokens, need_to_load
+         )
++        if self._chthm_debug:
++            logger.info(
++                "[MP_CHTHM_ADMIT] request=%s decision=admit "
++                "prompt_tokens=%d vllm_hit_tokens=%d lmcache_hit_tokens=%d "
++                "external_load_tokens=%d lookup_age_s=%.3f",
++                request.request_id,
++                len(request.all_token_ids),
++                tracker.num_vllm_hit_tokens,
++                ret,
++                need_to_load,
++                lookup_age_s,
++            )
+         return need_to_load, need_to_load > 0
+ 
+     def on_new_request(self, request: "Request") -> None:
+--- a/third_party/LMCache/lmcache/v1/multiprocess/modules/lookup.py
++++ b/third_party/LMCache/lmcache/v1/multiprocess/modules/lookup.py
+@@ -4,6 +4,7 @@
+ # Standard
+ from dataclasses import dataclass
+ from functools import partial
++import os
+ import threading
+ import time
+ 
+@@ -120,6 +121,7 @@
+         self._ctx = ctx
+         self._prefetch_jobs: dict[str, _PrefetchJob] = {}
+         self._prefetch_job_lock = threading.Lock()
++        self._chthm_debug = os.getenv("LMCACHE_MP_CHTHM_DEBUG", "0") == "1"
+         self._setup_metrics()
+ 
+     @property
+@@ -418,6 +420,19 @@
+                 l1_chunks = found_count
+             l2_chunks = found_count - l1_chunks
+ 
++        if self._chthm_debug:
++            logger.info(
++                "[MP_CHTHM_LOOKUP] request=%s requested_tokens=%d "
++                "total_hit_tokens=%d l1_hit_tokens=%d l2_hit_tokens=%d "
++                "l0_union=%s",
++                request_id,
++                job.requested_tokens,
++                found_count * self._ctx.chunk_size,
++                l1_chunks * self._ctx.chunk_size,
++                l2_chunks * self._ctx.chunk_size,
++                job.handle.l0_union_enabled,
++            )
++
+         self._ctx.event_bus.publish(
+             Event(
+                 event_type=EventType.MP_LOOKUP_PREFETCH_END,
+--- a/third_party/LMCache/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
++++ b/third_party/LMCache/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
+@@ -52,8 +52,10 @@
+ from operator import attrgetter
+ from typing import TYPE_CHECKING, Iterable
+ import enum
++import os
+ import select
+ import threading
++import time
+ 
+ # First Party
+ from lmcache.lmcache_native import Bitmap
+@@ -238,6 +240,13 @@
+     """Maps object_group_id to that group's layout (one ``MemoryLayoutDesc``
+     describes a single group's MemoryObj). Covers every object group."""
+ 
++    # Optional congestion diagnostics.  These timestamps are populated for
++    # every request (three float assignments) but are only logged when
++    # LMCACHE_MP_CONGESTION_DEBUG=1.
++    submitted_at: float = 0.0
++    lookup_started_at: float = 0.0
++    load_started_at: float = 0.0
++
+     def all_lookups_done(self) -> bool:
+         return len(self.pending_lookup_tasks) == 0
+ 
+@@ -293,6 +302,10 @@
+         }
+         self._policy = policy
+         self._max_in_flight = max_in_flight
++        self._congestion_debug = (
++            os.getenv("LMCACHE_MP_CONGESTION_DEBUG", "0") == "1"
++        )
++        self._debug_submit_times: dict[PrefetchRequestId, float] = {}
+ 
+         # Adapters that are being drained and will be removed after all
+         # the in-flight operations are done.
+@@ -437,6 +450,8 @@
+             request_id = self._next_request_id
+             self._next_request_id += 1
+             self._submission_queue.append((request_id, spec))
++            if self._congestion_debug:
++                self._debug_submit_times[request_id] = time.monotonic()
+         self._submission_efd.notify()
+         return request_id
+ 
+@@ -899,6 +914,8 @@
+     ) -> None:
+         """Read-lock L1-resident keys, then submit lookup_and_lock to all
+         live (non-draining) adapters for a new request."""
++        now = time.monotonic()
++        submitted_at = self._debug_submit_times.pop(request_id, now)
+         l1_readlocks = self._lock_l1_keys(
+             spec.keys, spec.num_kv_readers, spec.policy, spec.attn_desc
+         )
+@@ -912,8 +929,24 @@
+             mode=spec.mode,
+             group_layout_descs=spec.group_layout_descs,
+             l1_readlocks=l1_readlocks,
++            submitted_at=submitted_at,
++            lookup_started_at=now,
+         )
+ 
++        if self._congestion_debug:
++            logger.info(
++                "[MP_PREFETCH_ADMIT] request=%d queue_wait_s=%.6f keys=%d "
++                "pending_after=%d inflight_before=%d max_in_flight=%d "
++                "l1_locked_keys=%d",
++                request_id,
++                now - submitted_at,
++                len(spec.keys),
++                self._status_pending_count,
++                self._status_in_flight_count,
++                self._max_in_flight,
++                l1_readlocks.popcount(),
++            )
++
+         # Skip adapters being drained so a new request never locks keys on
+         # an adapter that is on its way out.
+         routing_adapters = {
+@@ -953,10 +986,25 @@
+     def _transition_to_load_phase(self, request: InFlightPrefetchRequest) -> None:
+         """Compute the L1 ∪ L2 load plan, reserve L1 buffers, and submit
+         load tasks."""
++        now = time.monotonic()
+         request.phase = PrefetchPhase.PLAN_AND_LOAD
++        request.load_started_at = now
+         self._status_lookup_phase_count -= 1
+         self._status_load_phase_count += 1
+ 
++        if self._congestion_debug:
++            logger.info(
++                "[MP_PREFETCH_PHASE] request=%d phase=lookup_done "
++                "lookup_s=%.6f total_s=%.6f pending=%d inflight=%d "
++                "l1_locked_keys=%d",
++                request.request_id,
++                now - request.lookup_started_at,
++                now - request.submitted_at,
++                self._status_pending_count,
++                self._status_in_flight_count,
++                request.l1_readlocks.popcount(),
++            )
++
+         num_keys = len(request.keys)
+ 
+         # Step 1 — generate what keys should be loaded from L2 to L1.
+@@ -1453,6 +1501,33 @@
+                 result_bitmap if request.policy is TrimPolicy.SPARSE else None,
+             )
+ 
++        if self._congestion_debug:
++            now = time.monotonic()
++            load_s = (
++                now - request.load_started_at
++                if request.load_started_at > 0
++                else 0.0
++            )
++            logger.info(
++                "[MP_PREFETCH_DONE] request=%d phase=%s total_s=%.6f "
++                "lookup_s=%.6f load_s=%.6f retained_keys=%d loaded_keys=%d "
++                "failed_keys=%d pending=%d inflight=%d",
++                request.request_id,
++                request.phase.name,
++                now - request.submitted_at,
++                (
++                    (request.load_started_at or now) - request.lookup_started_at
++                    if request.lookup_started_at > 0
++                    else 0.0
++                ),
++                load_s,
++                retained.popcount(),
++                len(loaded_keys),
++                len(failed_keys),
++                self._status_pending_count,
++                self._status_in_flight_count,
++            )
++
+         self._complete_request(request.request_id, retained)
+ 
+     # =========================================================================
+--- a/third_party/LMCache/lmcache/v1/distributed/storage_controllers/store_controller.py
++++ b/third_party/LMCache/lmcache/v1/distributed/storage_controllers/store_controller.py
+@@ -13,8 +13,10 @@
+ from collections import Counter, defaultdict
+ from dataclasses import dataclass
+ import enum
++import os
+ import select
+ import threading
++import time
+ 
+ # First Party
+ from lmcache.logging import init_logger
+@@ -189,6 +191,9 @@
+     l2_bytes_transferred: int = 0
+     """Bytes actually transferred by the adapter for this task."""
+ 
++    submitted_at: float = 0.0
++    """Monotonic submit timestamp for optional congestion diagnostics."""
++
+ 
+ # Main class
+ 
+@@ -239,6 +244,9 @@
+             desc.index: desc for desc in adapter_descriptors
+         }
+         self._policy = policy
++        self._congestion_debug = (
++            os.getenv("LMCACHE_MP_CONGESTION_DEBUG", "0") == "1"
++        )
+ 
+         # Adapters that are being drained and will be removed after all
+         # the in-flight operations are done.
+@@ -468,6 +476,14 @@
+                     if fd == listener_efd:
+                         keys = self._listener.pop_pending_keys()
+                         if keys:
++                            if self._congestion_debug:
++                                logger.info(
++                                    "[MP_STORE_ADMIT] keys=%d listener_pending_after=%d "
++                                    "inflight_before=%d",
++                                    len(keys),
++                                    self._listener.pending_count(),
++                                    self._status_in_flight_count,
++                                )
+                             self._process_new_keys(keys)
+                     else:
+                         adapter_idx = self._efd_to_adapter_index.get(fd)
+@@ -668,6 +684,7 @@
+                 adapter_index=adapter_index,
+                 keys=successful_keys,
+                 read_locked_keys=list(successful_keys),
++                submitted_at=time.monotonic(),
+             )
+             self._status_in_flight_count += 1
+ 
+@@ -697,6 +714,17 @@
+                 adapter_index,
+                 len(successful_keys),
+             )
++            if self._congestion_debug:
++                logger.info(
++                    "[MP_STORE_SUBMIT] adapter=%d task=%d keys=%d bytes=%d "
++                    "inflight_after=%d listener_pending=%d",
++                    adapter_index,
++                    task_id,
++                    len(successful_keys),
++                    total_bytes,
++                    self._status_in_flight_count,
++                    self._listener.pending_count(),
++                )
+ 
+     def _drain_l2_store_completions(self, signaled_adapters: set[int]) -> None:
+         """Deposit each signaled adapter's L2 outcomes onto their in-flight
+@@ -743,6 +771,20 @@
+         del self._in_flight_tasks[task_key]
+         self._status_in_flight_count -= 1
+ 
++        if self._congestion_debug:
++            logger.info(
++                "[MP_STORE_DONE] adapter=%d task=%d success=%s keys=%d "
++                "bytes=%d service_s=%.6f inflight_after=%d listener_pending=%d",
++                adapter_index,
++                task_id,
++                success,
++                len(task.keys),
++                task.l2_bytes_transferred,
++                time.monotonic() - task.submitted_at,
++                self._status_in_flight_count,
++                self._listener.pending_count(),
++            )
++
+         l2_name = self._adapter_descriptors[adapter_index].type_name
+         completion_meta: dict[str, object] = {
+             "adapter_index": adapter_index,
+--- a/third_party/LMCache/lmcache/v1/distributed/l2_adapters/native_connector_l2_adapter.py
++++ b/third_party/LMCache/lmcache/v1/distributed/l2_adapters/native_connector_l2_adapter.py
+@@ -23,8 +23,10 @@
+ # Standard
+ from collections import defaultdict
+ from typing import Any
++import os
+ import select
+ import threading
++import time
+ 
+ # First Party
+ from lmcache.lmcache_native import Bitmap
+@@ -114,6 +116,18 @@
+         self._client_fd: int = int(native_client.event_fd())
+         self._type_name: str = type_name or type(native_client).__name__
+         self._extra_status: dict[str, Any] = dict(extra_status or {})
++        self._congestion_debug = (
++            os.getenv("LMCACHE_MP_CONGESTION_DEBUG", "0") == "1"
++        )
++        self._congestion_log_every = max(
++            1, int(os.getenv("LMCACHE_MP_CONGESTION_LOG_EVERY", "25"))
++        )
++        self._congestion_slow_s = float(
++            os.getenv("LMCACHE_MP_CONGESTION_SLOW_S", "5")
++        )
++        self._debug_submit_at: dict[int, float] = {}
++        self._debug_submit_seq = 0
++        self._debug_complete_seq = 0
+ 
+         # 3 distinct cross-platform notifiers for the L2 adapter
+         # interface
+@@ -169,6 +183,42 @@
+         )
+         self._demux_thread.start()
+ 
++    def _pending_counts_locked(self) -> tuple[int, int, int, int]:
++        """Return pending (store, lookup, load, total) under ``self._lock``."""
++        stores = lookups = loads = 0
++        for op_type, *_rest in self._pending_ops.values():
++            if op_type == self._OP_STORE:
++                stores += 1
++            elif op_type == self._OP_LOOKUP:
++                lookups += 1
++            elif op_type == self._OP_LOAD:
++                loads += 1
++        return stores, lookups, loads, len(self._pending_ops)
++
++    def _debug_submit_locked(
++        self, future_id: int, op_type: str, task_id: int, num_keys: int
++    ) -> None:
++        if not self._congestion_debug:
++            return
++        self._debug_submit_at[future_id] = time.monotonic()
++        self._debug_submit_seq += 1
++        if self._debug_submit_seq % self._congestion_log_every != 0:
++            return
++        stores, lookups, loads, total = self._pending_counts_locked()
++        logger.info(
++            "[MP_NATIVE_IO_SUBMIT] type=%s op=%s task=%d future=%d keys=%d "
++            "pending_store=%d pending_lookup=%d pending_load=%d pending_total=%d",
++            self._type_name,
++            op_type,
++            task_id,
++            future_id,
++            num_keys,
++            stores,
++            lookups,
++            loads,
++            total,
++        )
++
+     # ---------------------------------------------------------------
+     # Event Fd Interface
+     # ---------------------------------------------------------------
+@@ -208,6 +258,9 @@
+                 None,
+             )
+             self._pending_store_sizes[future_id] = (list(keys), per_key_sizes)
++            self._debug_submit_locked(
++                future_id, self._OP_STORE, task_id, len(keys)
++            )
+ 
+         return task_id
+ 
+@@ -239,6 +292,9 @@
+                 len(keys),
+                 list(keys),
+             )
++            self._debug_submit_locked(
++                future_id, self._OP_LOOKUP, task_id, len(keys)
++            )
+ 
+         return task_id
+ 
+@@ -277,6 +333,9 @@
+                 len(keys),
+                 list(keys),
+             )
++            self._debug_submit_locked(
++                future_id, self._OP_LOAD, task_id, len(keys)
++            )
+ 
+         return task_id
+ 
+@@ -314,6 +373,9 @@
+                 len(keys),
+                 list(keys),
+             )
++            self._debug_submit_locked(
++                future_id, self._OP_DELETE, task_id, len(keys)
++            )
+             self._pending_delete_events[task_id] = done_event
+ 
+         # Block until demux thread signals completion
+@@ -449,6 +511,37 @@
+                         lookup_keys,
+                     ) = entry
+ 
++                    if self._congestion_debug:
++                        submitted_at = self._debug_submit_at.pop(fid, None)
++                        service_s = (
++                            time.monotonic() - submitted_at
++                            if submitted_at is not None
++                            else -1.0
++                        )
++                        self._debug_complete_seq += 1
++                        if (
++                            self._debug_complete_seq % self._congestion_log_every == 0
++                            or service_s >= self._congestion_slow_s
++                        ):
++                            stores, lookups, loads, total = self._pending_counts_locked()
++                            logger.info(
++                                "[MP_NATIVE_IO_DONE] type=%s op=%s task=%d "
++                                "future=%d keys=%d ok=%s service_s=%.6f "
++                                "pending_store=%d pending_lookup=%d "
++                                "pending_load=%d pending_total=%d",
++                                self._type_name,
++                                op_type,
++                                task_id,
++                                fid,
++                                num_keys,
++                                ok,
++                                service_s,
++                                stores,
++                                lookups,
++                                loads,
++                                total,
++                            )
++
+                     if op_type == self._OP_STORE:
+                         store_info = self._pending_store_sizes.pop(fid, None)
+                         task_bytes = 0
+--- a/scripts/run_h100_l0off_q650_l1_prefetch_grid_cleanall.sbatch
++++ b/scripts/run_h100_l0off_q650_l1_prefetch_grid_cleanall.sbatch
+@@ -113,6 +113,16 @@
+ export LMCACHE_PREFETCH_LIFETIME_DEBUG="${LMCACHE_PREFETCH_LIFETIME_DEBUG:-1}"
+ export LMCACHE_PREFETCH_LIFETIME_WARN_S="${LMCACHE_PREFETCH_LIFETIME_WARN_S:-30}"
+ 
++# Optional Stage-1 freshness guard and post-hoc research diagnostics added for
++# the 200-GiB PF sensitivity follow-up.  Keep them opt-in at script level so
++# historical invocations remain behavior-compatible; pass them via sbatch
++# --export for the new runs.
++export LMCACHE_MP_STAGE1_FRESHNESS_GUARD_S="${LMCACHE_MP_STAGE1_FRESHNESS_GUARD_S:-0}"
++export LMCACHE_MP_CONGESTION_DEBUG="${LMCACHE_MP_CONGESTION_DEBUG:-0}"
++export LMCACHE_MP_CONGESTION_LOG_EVERY="${LMCACHE_MP_CONGESTION_LOG_EVERY:-25}"
++export LMCACHE_MP_CONGESTION_SLOW_S="${LMCACHE_MP_CONGESTION_SLOW_S:-5}"
++export LMCACHE_MP_CHTHM_DEBUG="${LMCACHE_MP_CHTHM_DEBUG:-0}"
++
+ # This grid is explicitly the L0-OFF baseline.  The L0 server feature is
+ # disabled by default because this script never passes --l0-enable; also
+ # neutralize the temporary smoke-store environment flag if inherited.
+@@ -145,6 +155,18 @@
+         wait "${LMCACHE_PID}" 2>/dev/null || true
+     fi
+ 
++    if [[ -f "${REPO}/scripts/analyze_mp_congestion_chthm.py" ]] && \
++       { [[ "${LMCACHE_MP_CONGESTION_DEBUG:-0}" == "1" ]] || \
++         [[ "${LMCACHE_MP_CHTHM_DEBUG:-0}" == "1" ]]; }; then
++        echo "[$(date -Is)] writing post-hoc MP diagnostics"
++        python "${REPO}/scripts/analyze_mp_congestion_chthm.py" \
++            --lmcache-log "${LOG_DIR}/lmcache.log" \
++            --vllm-log "${LOG_DIR}/vllm.log" \
++            --results-dir "${RESULT_DIR}" \
++            --output "${RUN_DIR}/mp_diag_summary.json" \
++            > "${RUN_DIR}/mp_diag_summary.txt" 2>&1 || true
++    fi
++
+     echo "[$(date -Is)] cleanup finished"
+ }
+ trap cleanup EXIT
+@@ -252,6 +274,9 @@
+ echo "scratch cleanup:     FULL CLEAN of /scratch2/sriramc2 before run"
+ echo "grid label:          ${GRID_LABEL}"
+ echo "L0:                  OFF"
++echo "Stage1 freshness s:  ${LMCACHE_MP_STAGE1_FRESHNESS_GUARD_S}"
++echo "MP congestion debug: ${LMCACHE_MP_CONGESTION_DEBUG}"
++echo "MP CHTHM debug:      ${LMCACHE_MP_CHTHM_DEBUG}"
+ echo "============================================================"
+ 
+ # ============================================================================
+@@ -513,7 +538,12 @@
+ 
+ python -m py_compile \
+     experiments/mp_nognn_project.py \
+-    third_party/LMCache/lmcache/integration/vllm/lmcache_mp_connector.py
++    third_party/LMCache/lmcache/integration/vllm/lmcache_mp_connector.py \
++    third_party/LMCache/lmcache/v1/multiprocess/modules/lookup.py \
++    third_party/LMCache/lmcache/v1/distributed/storage_controllers/prefetch_controller.py \
++    third_party/LMCache/lmcache/v1/distributed/storage_controllers/store_controller.py \
++    third_party/LMCache/lmcache/v1/distributed/l2_adapters/native_connector_l2_adapter.py \
++    scripts/analyze_mp_congestion_chthm.py
+ 
+ CONNECTOR=third_party/LMCache/lmcache/integration/vllm/lmcache_mp_connector.py
+ 
+@@ -598,6 +628,11 @@
+   "gpu_memory_utilization": ${GPU_MEMORY_UTILIZATION},
+   "max_num_seqs": ${MAX_NUM_SEQS},
+   "lmcache_l2_prefetch_max_in_flight": ${LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT},
++  "lmcache_mp_stage1_freshness_guard_s": ${LMCACHE_MP_STAGE1_FRESHNESS_GUARD_S},
++  "lmcache_mp_congestion_debug": ${LMCACHE_MP_CONGESTION_DEBUG},
++  "lmcache_mp_congestion_log_every": ${LMCACHE_MP_CONGESTION_LOG_EVERY},
++  "lmcache_mp_congestion_slow_s": ${LMCACHE_MP_CONGESTION_SLOW_S},
++  "lmcache_mp_chthm_debug": ${LMCACHE_MP_CHTHM_DEBUG},
+   "enable_vpc": ${ENABLE_VPC},
+   "cuda_mps_bypass": true,
+   "cuda_mps_pipe_directory": "${CUDA_MPS_PIPE_DIRECTORY}",
+--- /dev/null
++++ b/scripts/analyze_mp_congestion_chthm.py
+@@ -0,0 +1,295 @@
++#!/usr/bin/env python3
++"""Post-hoc parser for KV-Aware LMCache MP research diagnostics.
++
++Consumes the opt-in log markers emitted by the Stage-1 freshness/congestion
++patch and, when benchmark result JSONL files are available, reports prompt-token
++CHTHM split by phase:
++
++  local_gpu_cache / external_l1 / external_l2 / local_compute
++
++For L0-off PREFIX experiments, L1 is a prefix and L2 extends it, so the useful
++external source split is the overlap of the scheduler-authorized external-load
++interval with the server-reported L1/L2 boundary.  This intentionally uses
++*consumed/admitted* external tokens rather than raw lookup hits.
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import math
++from pathlib import Path
++import re
++from typing import Iterable
++
++KV_LOOKUP_RE = re.compile(
++    r"\[MP_CHTHM_LOOKUP\] request=(\S+) requested_tokens=(\d+) "
++    r"total_hit_tokens=(\d+) l1_hit_tokens=(\d+) l2_hit_tokens=(\d+)"
++)
++KV_ADMIT_RE = re.compile(
++    r"\[MP_CHTHM_ADMIT\] request=(\S+) decision=(\S+) prompt_tokens=(\d+) "
++    r"vllm_hit_tokens=(\d+) lmcache_hit_tokens=(\d+) "
++    r"external_load_tokens=(\d+) lookup_age_s=([0-9.]+)"
++)
++FRESH_RE = re.compile(
++    r"\[MP_STAGE1_FRESHNESS_GUARD\] request=(\S+) lookup_age_s=([0-9.]+) "
++    r"guard_s=([0-9.]+) hit_tokens=(\d+)"
++)
++PREFETCH_ADMIT_RE = re.compile(
++    r"\[MP_PREFETCH_ADMIT\].*queue_wait_s=([0-9.]+).*pending_after=(\d+) "
++    r"inflight_before=(\d+) max_in_flight=(\d+)"
++)
++PREFETCH_PHASE_RE = re.compile(
++    r"\[MP_PREFETCH_PHASE\].*lookup_s=([0-9.]+).*pending=(\d+) inflight=(\d+)"
++)
++PREFETCH_DONE_RE = re.compile(
++    r"\[MP_PREFETCH_DONE\].*total_s=([0-9.]+).*lookup_s=([0-9.]+) "
++    r"load_s=([0-9.]+).*pending=(\d+) inflight=(\d+)"
++)
++STORE_DONE_RE = re.compile(
++    r"\[MP_STORE_DONE\].*service_s=([0-9.]+) inflight_after=(\d+) listener_pending=(\d+)"
++)
++NATIVE_DONE_RE = re.compile(
++    r"\[MP_NATIVE_IO_DONE\].*op=(\S+).*service_s=([0-9.]+) "
++    r"pending_store=(\d+) pending_lookup=(\d+) pending_load=(\d+) pending_total=(\d+)"
++)
++LIFETIME_RE = re.compile(
++    r"\[L1_READ_LIFETIME\] unsafe_read (missing|unlocked).*reserved_age_s=([-0-9.]+)"
++)
++RECOVERY_RE = re.compile(r"Recovered from KV load failure:\s*(\d+) request")
++STARVE_RE = re.compile(r"\[KV_STAGE1_STARVATION_FALLBACK\].*abandoning (\d+)")
++
++
++def pctile(values: list[float], p: float) -> float | None:
++    if not values:
++        return None
++    vals = sorted(values)
++    if len(vals) == 1:
++        return vals[0]
++    x = (len(vals) - 1) * p
++    lo = math.floor(x)
++    hi = math.ceil(x)
++    if lo == hi:
++        return vals[lo]
++    return vals[lo] * (hi - x) + vals[hi] * (x - lo)
++
++
++def dist(values: list[float]) -> dict[str, float | int | None]:
++    return {
++        "n": len(values),
++        "min": min(values) if values else None,
++        "p50": pctile(values, 0.50),
++        "p95": pctile(values, 0.95),
++        "p99": pctile(values, 0.99),
++        "max": max(values) if values else None,
++    }
++
++
++def iter_lines(path: Path | None) -> Iterable[str]:
++    if path is None or not path.exists():
++        return []
++    return path.open("r", errors="replace")
++
++
++def load_phase_map(results_dir: Path | None) -> dict[str, str]:
++    phases: dict[str, str] = {}
++    if results_dir is None or not results_dir.exists():
++        return phases
++    for path in results_dir.glob("*results*.jsonl"):
++        try:
++            with path.open("r", errors="replace") as f:
++                for line in f:
++                    try:
++                        row = json.loads(line)
++                    except json.JSONDecodeError:
++                        continue
++                    rid = row.get("request_id")
++                    phase = row.get("phase")
++                    if rid and phase:
++                        phases[str(rid)] = str(phase)
++        except OSError:
++            continue
++    return phases
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--lmcache-log", type=Path, required=True)
++    ap.add_argument("--vllm-log", type=Path, required=True)
++    ap.add_argument("--results-dir", type=Path)
++    ap.add_argument("--output", type=Path)
++    args = ap.parse_args()
++
++    lookup: dict[str, dict[str, int]] = {}
++    prefetch_queue_wait: list[float] = []
++    prefetch_lookup_s: list[float] = []
++    prefetch_total_s: list[float] = []
++    prefetch_load_s: list[float] = []
++    store_service_s: list[float] = []
++    native_service: dict[str, list[float]] = {}
++    native_pending_total: list[float] = []
++    native_pending_store: list[float] = []
++    native_pending_lookup: list[float] = []
++    native_pending_load: list[float] = []
++    lifetime_ages: list[float] = []
++
++    for line in iter_lines(args.lmcache_log):
++        if m := KV_LOOKUP_RE.search(line):
++            rid, requested, total, l1, l2 = m.groups()
++            lookup[rid] = {
++                "requested_tokens": int(requested),
++                "total_hit_tokens": int(total),
++                "l1_hit_tokens": int(l1),
++                "l2_hit_tokens": int(l2),
++            }
++        if m := PREFETCH_ADMIT_RE.search(line):
++            prefetch_queue_wait.append(float(m.group(1)))
++        if m := PREFETCH_PHASE_RE.search(line):
++            prefetch_lookup_s.append(float(m.group(1)))
++        if m := PREFETCH_DONE_RE.search(line):
++            prefetch_total_s.append(float(m.group(1)))
++            prefetch_load_s.append(float(m.group(3)))
++        if m := STORE_DONE_RE.search(line):
++            store_service_s.append(float(m.group(1)))
++        if m := NATIVE_DONE_RE.search(line):
++            op = m.group(1)
++            native_service.setdefault(op, []).append(float(m.group(2)))
++            native_pending_store.append(float(m.group(3)))
++            native_pending_lookup.append(float(m.group(4)))
++            native_pending_load.append(float(m.group(5)))
++            native_pending_total.append(float(m.group(6)))
++        if m := LIFETIME_RE.search(line):
++            age = float(m.group(2))
++            if age >= 0:
++                lifetime_ages.append(age)
++
++    admits: dict[str, dict[str, int | float | str]] = {}
++    freshness: list[float] = []
++    recoveries = 0
++    recovered_request_events = 0
++    starvation_abandoned = 0
++    for line in iter_lines(args.vllm_log):
++        if m := KV_ADMIT_RE.search(line):
++            rid, decision, prompt, vpc, lmhit, ext, age = m.groups()
++            # Keep the first initial admission. Recovery bypasses use a separate
++            # decision name and are not emitted by this patch as CHTHM inputs.
++            admits.setdefault(
++                rid,
++                {
++                    "decision": decision,
++                    "prompt_tokens": int(prompt),
++                    "vllm_hit_tokens": int(vpc),
++                    "lmcache_hit_tokens": int(lmhit),
++                    "external_load_tokens": int(ext),
++                    "lookup_age_s": float(age),
++                },
++            )
++        if m := FRESH_RE.search(line):
++            freshness.append(float(m.group(2)))
++        if m := RECOVERY_RE.search(line):
++            recoveries += 1
++            recovered_request_events += int(m.group(1))
++        if m := STARVE_RE.search(line):
++            starvation_abandoned += int(m.group(1))
++
++    phase_map = load_phase_map(args.results_dir)
++    chthm: dict[str, dict[str, int]] = {}
++    missing_source = 0
++    for rid, a in admits.items():
++        phase = phase_map.get(rid, "unknown")
++        bucket = chthm.setdefault(
++            phase,
++            {
++                "requests": 0,
++                "prompt_tokens": 0,
++                "local_gpu_cache_tokens": 0,
++                "external_l1_tokens": 0,
++                "external_l2_tokens": 0,
++                "external_unknown_tokens": 0,
++                "local_compute_tokens": 0,
++                "freshness_misses": 0,
++            },
++        )
++        prompt = int(a["prompt_tokens"])
++        vpc = min(prompt, int(a["vllm_hit_tokens"]))
++        ext = min(max(0, prompt - vpc), int(a["external_load_tokens"]))
++        l1_use = 0
++        l2_use = 0
++        unknown = 0
++        src = lookup.get(rid)
++        if ext > 0 and src is not None:
++            # External load covers [vpc, vpc + ext).  For this L0-off PREFIX
++            # experiment, server-reported L1 occupies [0, l1_hit_tokens) and
++            # L2 is the extension beyond that boundary.
++            l1_boundary = int(src["l1_hit_tokens"])
++            l1_use = max(0, min(vpc + ext, l1_boundary) - vpc)
++            l2_use = ext - l1_use
++        elif ext > 0:
++            unknown = ext
++            missing_source += 1
++
++        compute = max(0, prompt - vpc - ext)
++        bucket["requests"] += 1
++        bucket["prompt_tokens"] += prompt
++        bucket["local_gpu_cache_tokens"] += vpc
++        bucket["external_l1_tokens"] += l1_use
++        bucket["external_l2_tokens"] += l2_use
++        bucket["external_unknown_tokens"] += unknown
++        bucket["local_compute_tokens"] += compute
++        if a["decision"] == "freshness_miss":
++            bucket["freshness_misses"] += 1
++
++    chthm_with_pct: dict[str, dict[str, int | float]] = {}
++    for phase, b in chthm.items():
++        total = b["prompt_tokens"]
++        out: dict[str, int | float] = dict(b)
++        for name in (
++            "local_gpu_cache_tokens",
++            "external_l1_tokens",
++            "external_l2_tokens",
++            "external_unknown_tokens",
++            "local_compute_tokens",
++        ):
++            out[name.replace("_tokens", "_pct")] = (
++                100.0 * b[name] / total if total else 0.0
++            )
++        chthm_with_pct[phase] = out
++
++    result = {
++        "chthm": chthm_with_pct,
++        "chthm_requests_missing_server_source_log": missing_source,
++        "freshness_guard": {
++            "trigger_count": len(freshness),
++            "lookup_age_s": dist(freshness),
++        },
++        "failure_signals": {
++            "kv_recovery_waves": recoveries,
++            "cumulative_recovered_request_events": recovered_request_events,
++            "stage1_starvation_abandoned_requests": starvation_abandoned,
++            "unsafe_read_failure_age_s": dist(lifetime_ages),
++        },
++        "congestion": {
++            "prefetch_queue_wait_s": dist(prefetch_queue_wait),
++            "prefetch_lookup_s": dist(prefetch_lookup_s),
++            "prefetch_load_s": dist(prefetch_load_s),
++            "prefetch_total_s": dist(prefetch_total_s),
++            "store_service_s": dist(store_service_s),
++            "native_service_s_by_op": {
++                op: dist(vals) for op, vals in sorted(native_service.items())
++            },
++            "native_pending_total": dist(native_pending_total),
++            "native_pending_store": dist(native_pending_store),
++            "native_pending_lookup": dist(native_pending_lookup),
++            "native_pending_load": dist(native_pending_load),
++        },
++    }
++
++    rendered = json.dumps(result, indent=2, sort_keys=True)
++    print(rendered)
++    if args.output is not None:
++        args.output.parent.mkdir(parents=True, exist_ok=True)
++        args.output.write_text(rendered + "\n")
++
++
++if __name__ == "__main__":
++    main()

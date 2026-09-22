@@ -113,6 +113,16 @@ export LMCACHE_KV_ACCOUNTING_DEBUG="${LMCACHE_KV_ACCOUNTING_DEBUG:-1}"
 export LMCACHE_PREFETCH_LIFETIME_DEBUG="${LMCACHE_PREFETCH_LIFETIME_DEBUG:-1}"
 export LMCACHE_PREFETCH_LIFETIME_WARN_S="${LMCACHE_PREFETCH_LIFETIME_WARN_S:-30}"
 
+# Optional Stage-1 freshness guard and post-hoc research diagnostics added for
+# the 200-GiB PF sensitivity follow-up.  Keep them opt-in at script level so
+# historical invocations remain behavior-compatible; pass them via sbatch
+# --export for the new runs.
+export LMCACHE_MP_STAGE1_FRESHNESS_GUARD_S="${LMCACHE_MP_STAGE1_FRESHNESS_GUARD_S:-0}"
+export LMCACHE_MP_CONGESTION_DEBUG="${LMCACHE_MP_CONGESTION_DEBUG:-0}"
+export LMCACHE_MP_CONGESTION_LOG_EVERY="${LMCACHE_MP_CONGESTION_LOG_EVERY:-25}"
+export LMCACHE_MP_CONGESTION_SLOW_S="${LMCACHE_MP_CONGESTION_SLOW_S:-5}"
+export LMCACHE_MP_CHTHM_DEBUG="${LMCACHE_MP_CHTHM_DEBUG:-0}"
+
 # This grid is explicitly the L0-OFF baseline.  The L0 server feature is
 # disabled by default because this script never passes --l0-enable; also
 # neutralize the temporary smoke-store environment flag if inherited.
@@ -143,6 +153,18 @@ cleanup() {
         done
         kill -KILL "${LMCACHE_PID}" 2>/dev/null || true
         wait "${LMCACHE_PID}" 2>/dev/null || true
+    fi
+
+    if [[ -f "${REPO}/scripts/analyze_mp_congestion_chthm.py" ]] && \
+       { [[ "${LMCACHE_MP_CONGESTION_DEBUG:-0}" == "1" ]] || \
+         [[ "${LMCACHE_MP_CHTHM_DEBUG:-0}" == "1" ]]; }; then
+        echo "[$(date -Is)] writing post-hoc MP diagnostics"
+        python "${REPO}/scripts/analyze_mp_congestion_chthm.py" \
+            --lmcache-log "${LOG_DIR}/lmcache.log" \
+            --vllm-log "${LOG_DIR}/vllm.log" \
+            --results-dir "${RESULT_DIR}" \
+            --output "${RUN_DIR}/mp_diag_summary.json" \
+            > "${RUN_DIR}/mp_diag_summary.txt" 2>&1 || true
     fi
 
     echo "[$(date -Is)] cleanup finished"
@@ -252,6 +274,9 @@ echo "LMCache L2 dir:      ${LMCACHE_L2_DIR}"
 echo "scratch cleanup:     FULL CLEAN of /scratch2/sriramc2 before run"
 echo "grid label:          ${GRID_LABEL}"
 echo "L0:                  OFF"
+echo "Stage1 freshness s:  ${LMCACHE_MP_STAGE1_FRESHNESS_GUARD_S}"
+echo "MP congestion debug: ${LMCACHE_MP_CONGESTION_DEBUG}"
+echo "MP CHTHM debug:      ${LMCACHE_MP_CHTHM_DEBUG}"
 echo "============================================================"
 
 # ============================================================================
@@ -513,7 +538,12 @@ echo "===== PREFLIGHT: SOURCE COMPATIBILITY ====="
 
 python -m py_compile \
     experiments/mp_nognn_project.py \
-    third_party/LMCache/lmcache/integration/vllm/lmcache_mp_connector.py
+    third_party/LMCache/lmcache/integration/vllm/lmcache_mp_connector.py \
+    third_party/LMCache/lmcache/v1/multiprocess/modules/lookup.py \
+    third_party/LMCache/lmcache/v1/distributed/storage_controllers/prefetch_controller.py \
+    third_party/LMCache/lmcache/v1/distributed/storage_controllers/store_controller.py \
+    third_party/LMCache/lmcache/v1/distributed/l2_adapters/native_connector_l2_adapter.py \
+    scripts/analyze_mp_congestion_chthm.py
 
 CONNECTOR=third_party/LMCache/lmcache/integration/vllm/lmcache_mp_connector.py
 
@@ -598,6 +628,11 @@ cat > "${RUN_DIR}/run_config.json" <<EOF
   "gpu_memory_utilization": ${GPU_MEMORY_UTILIZATION},
   "max_num_seqs": ${MAX_NUM_SEQS},
   "lmcache_l2_prefetch_max_in_flight": ${LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT},
+  "lmcache_mp_stage1_freshness_guard_s": ${LMCACHE_MP_STAGE1_FRESHNESS_GUARD_S},
+  "lmcache_mp_congestion_debug": ${LMCACHE_MP_CONGESTION_DEBUG},
+  "lmcache_mp_congestion_log_every": ${LMCACHE_MP_CONGESTION_LOG_EVERY},
+  "lmcache_mp_congestion_slow_s": ${LMCACHE_MP_CONGESTION_SLOW_S},
+  "lmcache_mp_chthm_debug": ${LMCACHE_MP_CHTHM_DEBUG},
   "enable_vpc": ${ENABLE_VPC},
   "cuda_mps_bypass": true,
   "cuda_mps_pipe_directory": "${CUDA_MPS_PIPE_DIRECTORY}",

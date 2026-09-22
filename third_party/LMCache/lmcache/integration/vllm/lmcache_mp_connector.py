@@ -4,6 +4,7 @@
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 import math
+import os
 import sys
 import time
 
@@ -513,6 +514,16 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 "lmcache.mp.starvation_fallback", True
             )
         )
+        # Optional research guard: a Stage-1 LOOKUP/PREFETCH may hold L1 read
+        # reservations from near the beginning of the lookup.  If Stage 1
+        # itself lasts close to or beyond the L1 read-lock TTL, admitting the
+        # completed hit into Stage 2 can immediately fail in unsafe_read().
+        # Keep this disabled by default for upstream-compatible behavior; the
+        # experiment launcher enables it explicitly.
+        self._stage1_result_freshness_guard_s = float(
+            os.getenv("LMCACHE_MP_STAGE1_FRESHNESS_GUARD_S", "0")
+        )
+        self._chthm_debug = os.getenv("LMCACHE_MP_CHTHM_DEBUG", "0") == "1"
 
         # Multi-server: prefer lmcache.mp.server_urls (list or comma-separated
         # string) over the single-server lmcache.mp.host / lmcache.mp.port.
@@ -1104,10 +1115,55 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         if ret is None:
             return None, True
         assert tracker.lookup_started_at is not None
-        self._connector_stats.record_lookup(
-            time.monotonic() - tracker.lookup_started_at
-        )
+        lookup_age_s = time.monotonic() - tracker.lookup_started_at
+        self._connector_stats.record_lookup(lookup_age_s)
         tracker.lookup_started_at = None
+
+        # Freshness gate before Stage-2 admission.  L1 read reservations are
+        # acquired during Stage 1 (including the initial L1 lock pass), so a
+        # very old completed lookup can already be unsafe to consume even
+        # though QUERY_PREFETCH_STATUS itself just returned successfully.
+        # Convert such a hit into an ordinary miss before vLLM allocates GPU
+        # destination blocks and enters WAITING_FOR_REMOTE_KVS.
+        if (
+            ret > 0
+            and self._stage1_result_freshness_guard_s > 0
+            and lookup_age_s >= self._stage1_result_freshness_guard_s
+        ):
+            logger.warning(
+                "[MP_STAGE1_FRESHNESS_GUARD] request=%s lookup_age_s=%.3f "
+                "guard_s=%.3f hit_tokens=%d action=recompute_before_stage2",
+                request.request_id,
+                lookup_age_s,
+                self._stage1_result_freshness_guard_s,
+                ret,
+            )
+            # Release every lookup/prefetch read reservation represented by
+            # this hit.  The RPC is asynchronous; no GPU destination blocks
+            # have been committed yet, so local recomputation is safe.
+            self.scheduler_adapter.free_lookup_locks(
+                token_ids=tracker.get_token_ids(),
+                start=0,
+                end=ret,
+                request_id=request.request_id,
+                cache_salt=tracker.cache_salt,
+                request_configs=tracker.request_configs,
+            )
+            self.scheduler_adapter.cleanup_lookup_result(request.request_id)
+            tracker.num_lmcache_hit_tokens = 0
+            tracker.state = LMCacheMPRequestState.BYPASS_LMCACHE
+            if self._chthm_debug:
+                logger.info(
+                    "[MP_CHTHM_ADMIT] request=%s decision=freshness_miss "
+                    "prompt_tokens=%d vllm_hit_tokens=%d lmcache_hit_tokens=%d "
+                    "external_load_tokens=0 lookup_age_s=%.3f",
+                    request.request_id,
+                    len(request.all_token_ids),
+                    num_computed_tokens,
+                    ret,
+                    lookup_age_s,
+                )
+            return 0, False
 
         # Save the vLLM hit count even when LMCache misses. It is rounded
         # down to a boundary aligned for every engine group (a full-prompt
@@ -1120,6 +1176,16 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         )
 
         if ret == 0:
+            if self._chthm_debug:
+                logger.info(
+                    "[MP_CHTHM_ADMIT] request=%s decision=miss "
+                    "prompt_tokens=%d vllm_hit_tokens=%d lmcache_hit_tokens=0 "
+                    "external_load_tokens=0 lookup_age_s=%.3f",
+                    request.request_id,
+                    len(request.all_token_ids),
+                    tracker.num_vllm_hit_tokens,
+                    lookup_age_s,
+                )
             return 0, False
 
         assert ret % self.scheduler_adapter.lmcache_tokens_per_chunk == 0
@@ -1141,6 +1207,18 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         logger.debug(
             "vLLM hit is: %d, Need to load is %d", num_computed_tokens, need_to_load
         )
+        if self._chthm_debug:
+            logger.info(
+                "[MP_CHTHM_ADMIT] request=%s decision=admit "
+                "prompt_tokens=%d vllm_hit_tokens=%d lmcache_hit_tokens=%d "
+                "external_load_tokens=%d lookup_age_s=%.3f",
+                request.request_id,
+                len(request.all_token_ids),
+                tracker.num_vllm_hit_tokens,
+                ret,
+                need_to_load,
+                lookup_age_s,
+            )
         return need_to_load, need_to_load > 0
 
     def on_new_request(self, request: "Request") -> None:

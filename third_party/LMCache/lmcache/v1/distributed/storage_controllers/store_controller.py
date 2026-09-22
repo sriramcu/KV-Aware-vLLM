@@ -13,8 +13,10 @@ The controller runs a background thread with an event-driven loop that:
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 import enum
+import os
 import select
 import threading
+import time
 
 # First Party
 from lmcache.logging import init_logger
@@ -189,6 +191,9 @@ class InFlightStoreTask:
     l2_bytes_transferred: int = 0
     """Bytes actually transferred by the adapter for this task."""
 
+    submitted_at: float = 0.0
+    """Monotonic submit timestamp for optional congestion diagnostics."""
+
 
 # Main class
 
@@ -239,6 +244,9 @@ class StoreController(StorageControllerInterface):
             desc.index: desc for desc in adapter_descriptors
         }
         self._policy = policy
+        self._congestion_debug = (
+            os.getenv("LMCACHE_MP_CONGESTION_DEBUG", "0") == "1"
+        )
 
         # Adapters that are being drained and will be removed after all
         # the in-flight operations are done.
@@ -468,6 +476,14 @@ class StoreController(StorageControllerInterface):
                     if fd == listener_efd:
                         keys = self._listener.pop_pending_keys()
                         if keys:
+                            if self._congestion_debug:
+                                logger.info(
+                                    "[MP_STORE_ADMIT] keys=%d listener_pending_after=%d "
+                                    "inflight_before=%d",
+                                    len(keys),
+                                    self._listener.pending_count(),
+                                    self._status_in_flight_count,
+                                )
                             self._process_new_keys(keys)
                     else:
                         adapter_idx = self._efd_to_adapter_index.get(fd)
@@ -668,6 +684,7 @@ class StoreController(StorageControllerInterface):
                 adapter_index=adapter_index,
                 keys=successful_keys,
                 read_locked_keys=list(successful_keys),
+                submitted_at=time.monotonic(),
             )
             self._status_in_flight_count += 1
 
@@ -697,6 +714,17 @@ class StoreController(StorageControllerInterface):
                 adapter_index,
                 len(successful_keys),
             )
+            if self._congestion_debug:
+                logger.info(
+                    "[MP_STORE_SUBMIT] adapter=%d task=%d keys=%d bytes=%d "
+                    "inflight_after=%d listener_pending=%d",
+                    adapter_index,
+                    task_id,
+                    len(successful_keys),
+                    total_bytes,
+                    self._status_in_flight_count,
+                    self._listener.pending_count(),
+                )
 
     def _drain_l2_store_completions(self, signaled_adapters: set[int]) -> None:
         """Deposit each signaled adapter's L2 outcomes onto their in-flight
@@ -742,6 +770,20 @@ class StoreController(StorageControllerInterface):
         l1_mgr.finish_read(task.read_locked_keys)
         del self._in_flight_tasks[task_key]
         self._status_in_flight_count -= 1
+
+        if self._congestion_debug:
+            logger.info(
+                "[MP_STORE_DONE] adapter=%d task=%d success=%s keys=%d "
+                "bytes=%d service_s=%.6f inflight_after=%d listener_pending=%d",
+                adapter_index,
+                task_id,
+                success,
+                len(task.keys),
+                task.l2_bytes_transferred,
+                time.monotonic() - task.submitted_at,
+                self._status_in_flight_count,
+                self._listener.pending_count(),
+            )
 
         l2_name = self._adapter_descriptors[adapter_index].type_name
         completion_meta: dict[str, object] = {

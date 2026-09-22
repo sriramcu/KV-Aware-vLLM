@@ -52,8 +52,10 @@ from itertools import groupby
 from operator import attrgetter
 from typing import TYPE_CHECKING, Iterable
 import enum
+import os
 import select
 import threading
+import time
 
 # First Party
 from lmcache.lmcache_native import Bitmap
@@ -238,6 +240,13 @@ class InFlightPrefetchRequest:
     """Maps object_group_id to that group's layout (one ``MemoryLayoutDesc``
     describes a single group's MemoryObj). Covers every object group."""
 
+    # Optional congestion diagnostics.  These timestamps are populated for
+    # every request (three float assignments) but are only logged when
+    # LMCACHE_MP_CONGESTION_DEBUG=1.
+    submitted_at: float = 0.0
+    lookup_started_at: float = 0.0
+    load_started_at: float = 0.0
+
     def all_lookups_done(self) -> bool:
         return len(self.pending_lookup_tasks) == 0
 
@@ -293,6 +302,10 @@ class PrefetchController(StorageControllerInterface):
         }
         self._policy = policy
         self._max_in_flight = max_in_flight
+        self._congestion_debug = (
+            os.getenv("LMCACHE_MP_CONGESTION_DEBUG", "0") == "1"
+        )
+        self._debug_submit_times: dict[PrefetchRequestId, float] = {}
 
         # Adapters that are being drained and will be removed after all
         # the in-flight operations are done.
@@ -437,6 +450,8 @@ class PrefetchController(StorageControllerInterface):
             request_id = self._next_request_id
             self._next_request_id += 1
             self._submission_queue.append((request_id, spec))
+            if self._congestion_debug:
+                self._debug_submit_times[request_id] = time.monotonic()
         self._submission_efd.notify()
         return request_id
 
@@ -899,6 +914,8 @@ class PrefetchController(StorageControllerInterface):
     ) -> None:
         """Read-lock L1-resident keys, then submit lookup_and_lock to all
         live (non-draining) adapters for a new request."""
+        now = time.monotonic()
+        submitted_at = self._debug_submit_times.pop(request_id, now)
         l1_readlocks = self._lock_l1_keys(
             spec.keys, spec.num_kv_readers, spec.policy, spec.attn_desc
         )
@@ -912,7 +929,23 @@ class PrefetchController(StorageControllerInterface):
             mode=spec.mode,
             group_layout_descs=spec.group_layout_descs,
             l1_readlocks=l1_readlocks,
+            submitted_at=submitted_at,
+            lookup_started_at=now,
         )
+
+        if self._congestion_debug:
+            logger.info(
+                "[MP_PREFETCH_ADMIT] request=%d queue_wait_s=%.6f keys=%d "
+                "pending_after=%d inflight_before=%d max_in_flight=%d "
+                "l1_locked_keys=%d",
+                request_id,
+                now - submitted_at,
+                len(spec.keys),
+                self._status_pending_count,
+                self._status_in_flight_count,
+                self._max_in_flight,
+                l1_readlocks.popcount(),
+            )
 
         # Skip adapters being drained so a new request never locks keys on
         # an adapter that is on its way out.
@@ -953,9 +986,24 @@ class PrefetchController(StorageControllerInterface):
     def _transition_to_load_phase(self, request: InFlightPrefetchRequest) -> None:
         """Compute the L1 ∪ L2 load plan, reserve L1 buffers, and submit
         load tasks."""
+        now = time.monotonic()
         request.phase = PrefetchPhase.PLAN_AND_LOAD
+        request.load_started_at = now
         self._status_lookup_phase_count -= 1
         self._status_load_phase_count += 1
+
+        if self._congestion_debug:
+            logger.info(
+                "[MP_PREFETCH_PHASE] request=%d phase=lookup_done "
+                "lookup_s=%.6f total_s=%.6f pending=%d inflight=%d "
+                "l1_locked_keys=%d",
+                request.request_id,
+                now - request.lookup_started_at,
+                now - request.submitted_at,
+                self._status_pending_count,
+                self._status_in_flight_count,
+                request.l1_readlocks.popcount(),
+            )
 
         num_keys = len(request.keys)
 
@@ -1451,6 +1499,33 @@ class PrefetchController(StorageControllerInterface):
                 request,
                 hit_length,
                 result_bitmap if request.policy is TrimPolicy.SPARSE else None,
+            )
+
+        if self._congestion_debug:
+            now = time.monotonic()
+            load_s = (
+                now - request.load_started_at
+                if request.load_started_at > 0
+                else 0.0
+            )
+            logger.info(
+                "[MP_PREFETCH_DONE] request=%d phase=%s total_s=%.6f "
+                "lookup_s=%.6f load_s=%.6f retained_keys=%d loaded_keys=%d "
+                "failed_keys=%d pending=%d inflight=%d",
+                request.request_id,
+                request.phase.name,
+                now - request.submitted_at,
+                (
+                    (request.load_started_at or now) - request.lookup_started_at
+                    if request.lookup_started_at > 0
+                    else 0.0
+                ),
+                load_s,
+                retained.popcount(),
+                len(loaded_keys),
+                len(failed_keys),
+                self._status_pending_count,
+                self._status_in_flight_count,
             )
 
         self._complete_request(request.request_id, retained)

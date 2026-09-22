@@ -4,6 +4,7 @@
 # Standard
 from dataclasses import dataclass
 from functools import partial
+import os
 import threading
 import time
 
@@ -120,6 +121,7 @@ class LookupModule:
         self._ctx = ctx
         self._prefetch_jobs: dict[str, _PrefetchJob] = {}
         self._prefetch_job_lock = threading.Lock()
+        self._chthm_debug = os.getenv("LMCACHE_MP_CHTHM_DEBUG", "0") == "1"
         self._setup_metrics()
 
     @property
@@ -417,6 +419,19 @@ class LookupModule:
                 )
                 l1_chunks = found_count
             l2_chunks = found_count - l1_chunks
+
+        if self._chthm_debug:
+            logger.info(
+                "[MP_CHTHM_LOOKUP] request=%s requested_tokens=%d "
+                "total_hit_tokens=%d l1_hit_tokens=%d l2_hit_tokens=%d "
+                "l0_union=%s",
+                request_id,
+                job.requested_tokens,
+                found_count * self._ctx.chunk_size,
+                l1_chunks * self._ctx.chunk_size,
+                l2_chunks * self._ctx.chunk_size,
+                job.handle.l0_union_enabled,
+            )
 
         self._ctx.event_bus.publish(
             Event(

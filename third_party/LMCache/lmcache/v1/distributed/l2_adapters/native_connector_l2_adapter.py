@@ -23,8 +23,10 @@ from __future__ import annotations
 # Standard
 from collections import defaultdict
 from typing import Any
+import os
 import select
 import threading
+import time
 
 # First Party
 from lmcache.lmcache_native import Bitmap
@@ -114,6 +116,18 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         self._client_fd: int = int(native_client.event_fd())
         self._type_name: str = type_name or type(native_client).__name__
         self._extra_status: dict[str, Any] = dict(extra_status or {})
+        self._congestion_debug = (
+            os.getenv("LMCACHE_MP_CONGESTION_DEBUG", "0") == "1"
+        )
+        self._congestion_log_every = max(
+            1, int(os.getenv("LMCACHE_MP_CONGESTION_LOG_EVERY", "25"))
+        )
+        self._congestion_slow_s = float(
+            os.getenv("LMCACHE_MP_CONGESTION_SLOW_S", "5")
+        )
+        self._debug_submit_at: dict[int, float] = {}
+        self._debug_submit_seq = 0
+        self._debug_complete_seq = 0
 
         # 3 distinct cross-platform notifiers for the L2 adapter
         # interface
@@ -169,6 +183,42 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         )
         self._demux_thread.start()
 
+    def _pending_counts_locked(self) -> tuple[int, int, int, int]:
+        """Return pending (store, lookup, load, total) under ``self._lock``."""
+        stores = lookups = loads = 0
+        for op_type, *_rest in self._pending_ops.values():
+            if op_type == self._OP_STORE:
+                stores += 1
+            elif op_type == self._OP_LOOKUP:
+                lookups += 1
+            elif op_type == self._OP_LOAD:
+                loads += 1
+        return stores, lookups, loads, len(self._pending_ops)
+
+    def _debug_submit_locked(
+        self, future_id: int, op_type: str, task_id: int, num_keys: int
+    ) -> None:
+        if not self._congestion_debug:
+            return
+        self._debug_submit_at[future_id] = time.monotonic()
+        self._debug_submit_seq += 1
+        if self._debug_submit_seq % self._congestion_log_every != 0:
+            return
+        stores, lookups, loads, total = self._pending_counts_locked()
+        logger.info(
+            "[MP_NATIVE_IO_SUBMIT] type=%s op=%s task=%d future=%d keys=%d "
+            "pending_store=%d pending_lookup=%d pending_load=%d pending_total=%d",
+            self._type_name,
+            op_type,
+            task_id,
+            future_id,
+            num_keys,
+            stores,
+            lookups,
+            loads,
+            total,
+        )
+
     # ---------------------------------------------------------------
     # Event Fd Interface
     # ---------------------------------------------------------------
@@ -208,6 +258,9 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                 None,
             )
             self._pending_store_sizes[future_id] = (list(keys), per_key_sizes)
+            self._debug_submit_locked(
+                future_id, self._OP_STORE, task_id, len(keys)
+            )
 
         return task_id
 
@@ -238,6 +291,9 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                 task_id,
                 len(keys),
                 list(keys),
+            )
+            self._debug_submit_locked(
+                future_id, self._OP_LOOKUP, task_id, len(keys)
             )
 
         return task_id
@@ -277,6 +333,9 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                 len(keys),
                 list(keys),
             )
+            self._debug_submit_locked(
+                future_id, self._OP_LOAD, task_id, len(keys)
+            )
 
         return task_id
 
@@ -313,6 +372,9 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                 task_id,
                 len(keys),
                 list(keys),
+            )
+            self._debug_submit_locked(
+                future_id, self._OP_DELETE, task_id, len(keys)
             )
             self._pending_delete_events[task_id] = done_event
 
@@ -448,6 +510,37 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                         num_keys,
                         lookup_keys,
                     ) = entry
+
+                    if self._congestion_debug:
+                        submitted_at = self._debug_submit_at.pop(fid, None)
+                        service_s = (
+                            time.monotonic() - submitted_at
+                            if submitted_at is not None
+                            else -1.0
+                        )
+                        self._debug_complete_seq += 1
+                        if (
+                            self._debug_complete_seq % self._congestion_log_every == 0
+                            or service_s >= self._congestion_slow_s
+                        ):
+                            stores, lookups, loads, total = self._pending_counts_locked()
+                            logger.info(
+                                "[MP_NATIVE_IO_DONE] type=%s op=%s task=%d "
+                                "future=%d keys=%d ok=%s service_s=%.6f "
+                                "pending_store=%d pending_lookup=%d "
+                                "pending_load=%d pending_total=%d",
+                                self._type_name,
+                                op_type,
+                                task_id,
+                                fid,
+                                num_keys,
+                                ok,
+                                service_s,
+                                stores,
+                                lookups,
+                                loads,
+                                total,
+                            )
 
                     if op_type == self._OP_STORE:
                         store_info = self._pending_store_sizes.pop(fid, None)
