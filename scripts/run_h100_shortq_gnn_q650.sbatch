@@ -5,7 +5,7 @@
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=16
-#SBATCH --time=08:00:00
+#SBATCH --time=06:00:00
 #SBATCH --output=/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/logs/%x_%j.out
 #SBATCH --error=/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/logs/%x_%j.err
 set -Eeuo pipefail

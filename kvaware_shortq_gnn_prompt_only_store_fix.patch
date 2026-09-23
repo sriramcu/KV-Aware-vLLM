@@ -1,0 +1,117 @@
+diff --git a/scripts/run_shortq_gnn_exclusive_common.sh b/scripts/run_shortq_gnn_exclusive_common.sh
+index 5fe5795..46fd33a 100755
+--- a/scripts/run_shortq_gnn_exclusive_common.sh
++++ b/scripts/run_shortq_gnn_exclusive_common.sh
+@@ -167,6 +167,7 @@ r=pathlib.Path(sys.argv[1]); p=json.load(open(sys.argv[2])); logs=pathlib.Path(s
+ s=json.load(open(r/'summary.json')); assert s['cold']['successful']==s['cold']['requests']; assert s['warm']['successful']==s['warm']['requests']
+ lm=(logs/'lmcache.log').read_text(errors='replace'); vl=(logs/'vllm.log').read_text(errors='replace')
+ assert '[GNN_EXCLUSIVE_STORE]' in lm, 'no GNN exclusive store marker'; assert '[MP_CHTHM_RAW]' in lm, 'no raw CHTHM marker'; assert '[MP_CHTHM_ADMIT]' in vl, 'no useful CHTHM marker'
++assert '[GNN_PLACEMENT_METADATA_MISS]' not in lm, 'prompt placement metadata miss detected; GNN benchmark is not clean'
+ for tier,n in p['unique_runtime_tier_counts'].items():
+     if n: print('runtime_tier_hashes',tier,n)
+ if profile.endswith('_smoke'):
+diff --git a/third_party/LMCache/lmcache/integration/vllm/lmcache_mp_connector.py b/third_party/LMCache/lmcache/integration/vllm/lmcache_mp_connector.py
+index 13fa22d..cf2d836 100644
+--- a/third_party/LMCache/lmcache/integration/vllm/lmcache_mp_connector.py
++++ b/third_party/LMCache/lmcache/integration/vllm/lmcache_mp_connector.py
+@@ -524,6 +524,20 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+             os.getenv("LMCACHE_MP_STAGE1_FRESHNESS_GUARD_S", "0")
+         )
+         self._chthm_debug = os.getenv("LMCACHE_MP_CHTHM_DEBUG", "0") == "1"
++        # GNN exclusive placement is a prompt-KV placement experiment. The
++        # GNN sidecar contains decisions only for chunks that are complete in
++        # the original prompt, so do not allow decode tokens to complete a
++        # partial prompt-tail chunk and turn it into an unpredicted store.
++        self._gnn_prompt_only_store = (
++            os.getenv("LMCACHE_GNN_EXCLUSIVE_PLACEMENT", "0").strip().lower()
++            in {"1", "true", "yes", "on"}
++        )
++        if self._gnn_prompt_only_store and self.role == KVConnectorRole.SCHEDULER:
++            logger.info(
++                "GNN exclusive placement: persistence is capped at complete "
++                "original-prompt LMCache chunks; decode-completed tail chunks "
++                "will not be stored"
++            )
+ 
+         # Multi-server: prefer lmcache.mp.server_urls (list or comma-separated
+         # string) over the single-server lmcache.mp.host / lmcache.mp.port.
+@@ -1564,6 +1578,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+                 request_tracker,
+                 lmcache_tokens_per_chunk,
+                 self._group_tokens_per_block,
++                prompt_only=self._gnn_prompt_only_store,
+             )
+             if r_meta is not None:
+                 # In lazy_offload mode, add to pending queue instead of immediate store
+@@ -1597,6 +1612,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+                 request_tracker,
+                 lmcache_tokens_per_chunk,
+                 self._group_tokens_per_block,
++                prompt_only=self._gnn_prompt_only_store,
+             )
+ 
+             if r_meta is not None:
+diff --git a/third_party/LMCache/lmcache/integration/vllm/lmcache_mp_metadata.py b/third_party/LMCache/lmcache/integration/vllm/lmcache_mp_metadata.py
+index 2508dae..851764b 100644
+--- a/third_party/LMCache/lmcache/integration/vllm/lmcache_mp_metadata.py
++++ b/third_party/LMCache/lmcache/integration/vllm/lmcache_mp_metadata.py
+@@ -56,6 +56,12 @@ class LMCacheMPRequestTracker:
+     # during generation. Keyed by engine_group_idx; non-HMA models use 0.
+     allocated_block_ids: dict[int, list[int]] = field(default_factory=dict)
+ 
++    # Original prompt length captured when the tracker is created. Unlike
++    # all_token_ids, this does not grow during decode. Placement experiments
++    # can use it to prevent a prompt-tail chunk that becomes complete only
++    # after generated tokens are appended from being persisted.
++    num_prompt_tokens: int = 0
++
+     # Number of scheduled tokens in this request. We keep tracking this to
+     # avoid saving tokens whose KV has not been computed yet.
+     num_scheduled_tokens: int = 0
+@@ -88,6 +94,7 @@ class LMCacheMPRequestTracker:
+         )
+         self.lookup_started_at = None
+         self.all_token_ids = request.all_token_ids
++        self.num_prompt_tokens = len(request.prompt_token_ids)
+         self.allocated_block_ids = {}
+         self.num_stored_tokens = 0
+         self.num_vllm_hit_tokens = 0
+@@ -195,6 +202,8 @@ class LMCacheMPRequestMetadata:
+         tracker: LMCacheMPRequestTracker,
+         lmcache_tokens_per_chunk: int,
+         group_tokens_per_block: list[int],
++        *,
++        prompt_only: bool = False,
+     ) -> "LMCacheMPRequestMetadata | None":
+         """
+         Generate the store metadata for the current request tracker.
+@@ -206,6 +215,10 @@ class LMCacheMPRequestMetadata:
+                 paged chunk (one block ID) of that group, i.e. the group's
+                 KV cache spec ``block_size``. Must each divide
+                 ``lmcache_tokens_per_chunk`` (hybrid models can mix different values).
++            prompt_only: if True, never store beyond the last LMCache chunk
++                that was already complete in the original prompt. This keeps
++                generated tokens from completing and persisting a previously
++                partial prompt-tail chunk.
+         """
+         num_engine_groups = len(group_tokens_per_block)
+         # NOTE: the invariant here is that `num_stored_tokens` should
+@@ -251,6 +264,18 @@ class LMCacheMPRequestMetadata:
+             allocated_tokens,
+             computed_tokens,
+         )
++        if prompt_only:
++            # Only persist chunks whose full token content was present in the
++            # original prompt. Example: a 5,545-token prompt contains ten
++            # complete 512-token chunks plus a 425-token tail. Decode may later
++            # make that tail reach 512 tokens, but that new hash necessarily
++            # includes generated tokens and has no prompt-time GNN placement.
++            prompt_full_chunk_tokens = (
++                tracker.num_prompt_tokens // lmcache_tokens_per_chunk
++            ) * lmcache_tokens_per_chunk
++            min_available_tokens = min(
++                min_available_tokens, prompt_full_chunk_tokens
++            )
+         if tracker.max_offload_tokens is not None:
+             min_available_tokens = min(min_available_tokens, tracker.max_offload_tokens)
+         num_staging_tokens = min_available_tokens - tracker.num_stored_tokens

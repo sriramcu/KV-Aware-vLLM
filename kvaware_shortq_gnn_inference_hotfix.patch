@@ -1,0 +1,56 @@
+diff --git a/experiments/precompute_shortq_placements.py b/experiments/precompute_shortq_placements.py
+index 73b5fa4..9c16c62 100755
+--- a/experiments/precompute_shortq_placements.py
++++ b/experiments/precompute_shortq_placements.py
+@@ -126,7 +126,7 @@ def _load_graph(import_root: Path, dataset: str, device: torch.device):
+         if emb is None:
+             emb = entity_emb.get(name)
+         if emb is not None:
+-            node_features[i] = torch.as_tensor(np.asarray(emb, dtype=np.float32))
++            node_features[i] = torch.from_numpy(np.array(emb, dtype=np.float32, copy=True))
+ 
+     src: list[int] = []
+     dst: list[int] = []
+@@ -295,6 +295,8 @@ def main() -> None:
+     model_setup_started = time.monotonic()
+     feature_tok, feature_model = _load_feature_model(args.feature_model, device)
+     ranker, cfg = load_ranker_from_checkpoint(args.checkpoint, device)
++    ranker.eval()
++    ranker.requires_grad_(False)
+     block_size = int(cfg.get("block_size", 16))
+     if block_size != 16:
+         raise ValueError(f"first integration expects 16-token Short-Q blocks, checkpoint has {block_size}")
+@@ -309,9 +311,10 @@ def main() -> None:
+     graph_load_seconds = time.monotonic() - graph_load_started
+     if node_features.shape[1] != int(cfg["node_dim"]):
+         raise ValueError(f"graph node dim {node_features.shape[1]} != checkpoint node dim {cfg['node_dim']}")
+-    node_repr, graph_encode_seconds = _timed(
+-        device, lambda: ranker.encode_graph(node_features, edge_index, edge_weight)
+-    )
++    with torch.inference_mode():
++        node_repr, graph_encode_seconds = _timed(
++            device, lambda: ranker.encode_graph(node_features, edge_index, edge_weight)
++        )
+     model_setup_seconds = time.monotonic() - model_setup_started
+ 
+     hasher = TokenHasher(chunk_size=args.chunk_size, hash_algorithm="blake3")
+@@ -360,12 +363,13 @@ def main() -> None:
+             dtype=torch.long,
+             device=device,
+         )
+-        (class_logits, rank_scores), gnn_forward_seconds = _timed(
+-            device,
+-            lambda: ranker.forward_blocks(
+-                block_features, block_mask, recency, passage_ids, node_repr, retrieved
+-            ),
+-        )
++        with torch.inference_mode():
++            (class_logits, rank_scores), gnn_forward_seconds = _timed(
++                device,
++                lambda: ranker.forward_blocks(
++                    block_features, block_mask, recency, passage_ids, node_repr, retrieved
++                ),
++            )
+ 
+         post_t0 = time.perf_counter()
+         valid_blocks = int(block_mask[0].sum().item())

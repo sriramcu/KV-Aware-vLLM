@@ -524,6 +524,20 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             os.getenv("LMCACHE_MP_STAGE1_FRESHNESS_GUARD_S", "0")
         )
         self._chthm_debug = os.getenv("LMCACHE_MP_CHTHM_DEBUG", "0") == "1"
+        # GNN exclusive placement is a prompt-KV placement experiment. The
+        # GNN sidecar contains decisions only for chunks that are complete in
+        # the original prompt, so do not allow decode tokens to complete a
+        # partial prompt-tail chunk and turn it into an unpredicted store.
+        self._gnn_prompt_only_store = (
+            os.getenv("LMCACHE_GNN_EXCLUSIVE_PLACEMENT", "0").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        if self._gnn_prompt_only_store and self.role == KVConnectorRole.SCHEDULER:
+            logger.info(
+                "GNN exclusive placement: persistence is capped at complete "
+                "original-prompt LMCache chunks; decode-completed tail chunks "
+                "will not be stored"
+            )
 
         # Multi-server: prefer lmcache.mp.server_urls (list or comma-separated
         # string) over the single-server lmcache.mp.host / lmcache.mp.port.
@@ -1564,6 +1578,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 request_tracker,
                 lmcache_tokens_per_chunk,
                 self._group_tokens_per_block,
+                prompt_only=self._gnn_prompt_only_store,
             )
             if r_meta is not None:
                 # In lazy_offload mode, add to pending queue instead of immediate store
@@ -1597,6 +1612,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 request_tracker,
                 lmcache_tokens_per_chunk,
                 self._group_tokens_per_block,
+                prompt_only=self._gnn_prompt_only_store,
             )
 
             if r_meta is not None:

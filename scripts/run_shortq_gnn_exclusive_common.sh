@@ -167,6 +167,7 @@ r=pathlib.Path(sys.argv[1]); p=json.load(open(sys.argv[2])); logs=pathlib.Path(s
 s=json.load(open(r/'summary.json')); assert s['cold']['successful']==s['cold']['requests']; assert s['warm']['successful']==s['warm']['requests']
 lm=(logs/'lmcache.log').read_text(errors='replace'); vl=(logs/'vllm.log').read_text(errors='replace')
 assert '[GNN_EXCLUSIVE_STORE]' in lm, 'no GNN exclusive store marker'; assert '[MP_CHTHM_RAW]' in lm, 'no raw CHTHM marker'; assert '[MP_CHTHM_ADMIT]' in vl, 'no useful CHTHM marker'
+assert '[GNN_PLACEMENT_METADATA_MISS]' not in lm, 'prompt placement metadata miss detected; GNN benchmark is not clean'
 for tier,n in p['unique_runtime_tier_counts'].items():
     if n: print('runtime_tier_hashes',tier,n)
 if profile.endswith('_smoke'):

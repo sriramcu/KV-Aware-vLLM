@@ -56,6 +56,12 @@ class LMCacheMPRequestTracker:
     # during generation. Keyed by engine_group_idx; non-HMA models use 0.
     allocated_block_ids: dict[int, list[int]] = field(default_factory=dict)
 
+    # Original prompt length captured when the tracker is created. Unlike
+    # all_token_ids, this does not grow during decode. Placement experiments
+    # can use it to prevent a prompt-tail chunk that becomes complete only
+    # after generated tokens are appended from being persisted.
+    num_prompt_tokens: int = 0
+
     # Number of scheduled tokens in this request. We keep tracking this to
     # avoid saving tokens whose KV has not been computed yet.
     num_scheduled_tokens: int = 0
@@ -88,6 +94,7 @@ class LMCacheMPRequestTracker:
         )
         self.lookup_started_at = None
         self.all_token_ids = request.all_token_ids
+        self.num_prompt_tokens = len(request.prompt_token_ids)
         self.allocated_block_ids = {}
         self.num_stored_tokens = 0
         self.num_vllm_hit_tokens = 0
@@ -195,6 +202,8 @@ class LMCacheMPRequestMetadata:
         tracker: LMCacheMPRequestTracker,
         lmcache_tokens_per_chunk: int,
         group_tokens_per_block: list[int],
+        *,
+        prompt_only: bool = False,
     ) -> "LMCacheMPRequestMetadata | None":
         """
         Generate the store metadata for the current request tracker.
@@ -206,6 +215,10 @@ class LMCacheMPRequestMetadata:
                 paged chunk (one block ID) of that group, i.e. the group's
                 KV cache spec ``block_size``. Must each divide
                 ``lmcache_tokens_per_chunk`` (hybrid models can mix different values).
+            prompt_only: if True, never store beyond the last LMCache chunk
+                that was already complete in the original prompt. This keeps
+                generated tokens from completing and persisting a previously
+                partial prompt-tail chunk.
         """
         num_engine_groups = len(group_tokens_per_block)
         # NOTE: the invariant here is that `num_stored_tokens` should
@@ -251,6 +264,18 @@ class LMCacheMPRequestMetadata:
             allocated_tokens,
             computed_tokens,
         )
+        if prompt_only:
+            # Only persist chunks whose full token content was present in the
+            # original prompt. Example: a 5,545-token prompt contains ten
+            # complete 512-token chunks plus a 425-token tail. Decode may later
+            # make that tail reach 512 tokens, but that new hash necessarily
+            # includes generated tokens and has no prompt-time GNN placement.
+            prompt_full_chunk_tokens = (
+                tracker.num_prompt_tokens // lmcache_tokens_per_chunk
+            ) * lmcache_tokens_per_chunk
+            min_available_tokens = min(
+                min_available_tokens, prompt_full_chunk_tokens
+            )
         if tracker.max_offload_tokens is not None:
             min_available_tokens = min(min_available_tokens, tracker.max_offload_tokens)
         num_staging_tokens = min_available_tokens - tracker.num_stored_tokens
