@@ -7,6 +7,7 @@ Distributed multi-tier storage manager for MP mode
 from contextlib import contextmanager
 from dataclasses import replace
 from typing import Iterator, Literal, Optional
+import os
 import threading
 import time
 
@@ -808,6 +809,9 @@ class StorageManager:
             total_requested_keys=len(keys),
             submit_time=submit_time,
             l2_orig_indices=l2_orig_indices,
+            num_kv_readers=spec.num_kv_readers,
+            attn_desc=spec.attn_desc,
+            original_keys=tuple(keys),
         )
 
     def _combine_found(
@@ -962,6 +966,59 @@ class StorageManager:
         # non-contiguous policies (SEGMENTED_PREFIX / SPARSE) too.
         total_hits = found.popcount()
         elapsed_ms = (time.monotonic() - handle.submit_time) * 1000
+
+        if os.getenv("LMCACHE_MP_CHTHM_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}:
+            stride = handle.attn_desc.num_object_groups * handle.attn_desc.world_size
+            requested_chunks = handle.total_requested_keys // max(stride, 1)
+            if requested_chunks > 0:
+                source_tiers: list[str] = []
+                hit_chunks, retain = fold_unfold_ranked(
+                    found, requested_chunks, handle.attn_desc.world_size,
+                    handle.attn_desc.num_chunks_in_sw,
+                )
+                retained = retain.get_indices_set()
+                l0_set = set(handle.l0_found_indices)
+                l1_set = set(handle.l1_found_indices)
+                l2_set: set[int] = set()
+                if l2_r is not None:
+                    l2_local = l2_r.get_indices_list()
+                    l2_set = {
+                        handle.l2_orig_indices[i]
+                        for i in l2_local
+                        if i < len(handle.l2_orig_indices)
+                    }
+                for chunk_idx in range(hit_chunks):
+                    lo = chunk_idx * stride
+                    hi = lo + stride
+                    required = {i for i in retained if lo <= i < hi}
+                    # CHTHM is hierarchical: a chunk is an L0/GPU hit only
+                    # when every required shard is available from L0. If L1
+                    # is needed to complete it, count it at L1; if L2 is
+                    # needed to complete it, count it at L2.
+                    if required and required <= l0_set:
+                        source_tiers.append("L0")
+                    elif required and required <= (l0_set | l1_set):
+                        source_tiers.append("L1")
+                    elif required and required <= (l0_set | l1_set | l2_set):
+                        source_tiers.append("L2")
+                    else:
+                        logger.warning(
+                            "[MP_CHTHM_RAW_INCOMPLETE_SOURCE] request=%s chunk=%d "
+                            "required=%d l0=%d l1=%d l2=%d",
+                            handle.external_request_id, chunk_idx, len(required),
+                            len(required & l0_set), len(required & l1_set),
+                            len(required & l2_set),
+                        )
+                        break
+                logger.info(
+                    "[MP_CHTHM_RAW] request=%s chunk_size=%d requested_chunks=%d "
+                    "total_hit_chunks=%d l0_hit_chunks=%d l1_hit_chunks=%d l2_hit_chunks=%d "
+                    "source_tiers=%s",
+                    handle.external_request_id, int(os.getenv("LMCACHE_CHUNK_SIZE", "512")),
+                    requested_chunks, len(source_tiers), source_tiers.count("L0"),
+                    source_tiers.count("L1"), source_tiers.count("L2"),
+                    ",".join(source_tiers) or "-",
+                )
 
         if total_hits > 0:
             l0_hits = len(handle.l0_found_indices)

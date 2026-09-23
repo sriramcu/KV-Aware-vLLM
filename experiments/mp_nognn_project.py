@@ -758,6 +758,11 @@ def parse_arguments():
         default=2.0,
     )
     parser.add_argument("--output_dir", required=True)
+    parser.add_argument(
+        "--metrics_after_cold_path",
+        default="",
+        help="Optional path for a Prometheus /metrics snapshot immediately after cold.",
+    )
 
     return parser.parse_args()
 
@@ -953,6 +958,15 @@ def main():
         cold_results,
         cold_elapsed,
     )
+
+    if args.metrics_after_cold_path:
+        metrics_url = args.server_url.rstrip("/") + "/metrics"
+        response = requests.get(metrics_url, timeout=30.0)
+        response.raise_for_status()
+        metrics_path = Path(args.metrics_after_cold_path)
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        metrics_path.write_text(response.text, encoding="utf-8")
+        print(f"[SC_METRICS_AFTER_COLD] path={metrics_path}", flush=True)
 
     if args.between_phases_seconds > 0:
         print(

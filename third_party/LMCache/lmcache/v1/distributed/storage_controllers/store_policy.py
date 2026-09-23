@@ -12,11 +12,14 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 # First Party
+from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.distributed.l2_adapters.config import (
     L2AdapterConfigBase,
     get_type_name_for_config,
 )
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -211,3 +214,32 @@ class BufferOnlyStorePolicy(DefaultStorePolicy):
 
 register_store_policy("default", DefaultStorePolicy)
 register_store_policy("skip_l1", BufferOnlyStorePolicy)
+
+
+class GNNExclusiveStorePolicy(StorePolicy):
+    """Keep L1-selected keys in L1 and use L1 only as staging for L2 keys."""
+
+    def select_store_targets(
+        self,
+        keys: list[ObjectKey],
+        adapters: list[AdapterDescriptor],
+    ) -> dict[int, list[ObjectKey]]:
+        # Local import keeps the default path independent of experimental code.
+        from lmcache.v1.distributed.placement_metadata import get_chunk_placement
+
+        l2_keys = [key for key in keys if get_chunk_placement(key.chunk_hash) == "L2"]
+        l1_keys = len(keys) - len(l2_keys)
+        logger.info(
+            "[GNN_EXCLUSIVE_L2_POLICY] candidates=%d persistent_l1=%d l2_targets=%d adapters=%d",
+            len(keys), l1_keys, len(l2_keys), len(adapters),
+        )
+        return {ad.index: list(l2_keys) for ad in adapters if l2_keys}
+
+    def select_l1_deletions(self, keys: list[ObjectKey]) -> list[ObjectKey]:
+        # StoreController calls this only with keys that successfully reached L2.
+        if keys:
+            logger.info("[GNN_EXCLUSIVE_L2_COMMIT] l2_keys=%d delete_l1_staging=%d", len(keys), len(keys))
+        return list(keys)
+
+
+register_store_policy("gnn_exclusive", GNNExclusiveStorePolicy)
