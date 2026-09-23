@@ -60,6 +60,8 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 
 _L0_SMOKE_STORE_ENABLED = _env_flag("LMCACHE_L0_SMOKE_STORE")
+_L0_VPC_IMITATION_ENABLED = _env_flag("LMCACHE_L0_VPC_IMITATION")
+_L0_ROUTE_MODE = os.getenv("LMCACHE_L0_ROUTE_MODE", "all").strip().lower()
 _L0_SMOKE_MOD = int(os.getenv("LMCACHE_L0_SMOKE_MOD", "4"))
 _L0_SMOKE_TAKE = int(os.getenv("LMCACHE_L0_SMOKE_TAKE", "2"))
 if _L0_SMOKE_MOD <= 0:
@@ -67,6 +69,17 @@ if _L0_SMOKE_MOD <= 0:
 if not 0 <= _L0_SMOKE_TAKE <= _L0_SMOKE_MOD:
     raise ValueError(
         "LMCACHE_L0_SMOKE_TAKE must be between 0 and LMCACHE_L0_SMOKE_MOD"
+    )
+if _L0_VPC_IMITATION_ENABLED and _L0_SMOKE_STORE_ENABLED:
+    raise ValueError(
+        "LMCACHE_L0_VPC_IMITATION and LMCACHE_L0_SMOKE_STORE are mutually "
+        "exclusive; imitation mode already supports smoke routing via "
+        "LMCACHE_L0_ROUTE_MODE=smoke"
+    )
+if _L0_VPC_IMITATION_ENABLED and _L0_ROUTE_MODE not in {"all", "smoke"}:
+    raise ValueError(
+        "LMCACHE_L0_ROUTE_MODE must be one of: all, smoke "
+        "(more routing modes can be added here later)"
     )
 
 
@@ -78,6 +91,21 @@ def _l0_smoke_select_chunk(global_chunk_idx: int) -> bool:
     partial STORE ranges because it uses the request-global chunk index.
     """
     return (global_chunk_idx % _L0_SMOKE_MOD) < _L0_SMOKE_TAKE
+
+
+def _l0_imitation_select_chunk(global_chunk_idx: int) -> bool:
+    """Select which normal MP stores also receive a persistent L0 mirror.
+
+    Imitation mode is intentionally separate from the routing policy so the
+    same VPC-off + write-through hierarchy can later compare all/smoke/random/
+    GNN routing without changing the backing L1/L2 semantics.  Only the two
+    simple routing modes needed today are implemented here.
+    """
+    if _L0_ROUTE_MODE == "all":
+        return True
+    if _L0_ROUTE_MODE == "smoke":
+        return _l0_smoke_select_chunk(global_chunk_idx)
+    return False  # guarded by module-level validation above
 
 
 def get_layout_desc(
@@ -727,6 +755,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             total_bytes: int = 0
             store_succeeded = False
             smoke_l0 = _L0_SMOKE_STORE_ENABLED and self._ctx.storage_manager.l0_enabled
+            imitation_l0 = (
+                _L0_VPC_IMITATION_ENABLED and self._ctx.storage_manager.l0_enabled
+            )
             global_start_chunk = key.start // self._ctx.chunk_size
 
             if _L0_SMOKE_STORE_ENABLED and not self._ctx.storage_manager.l0_enabled:
@@ -734,8 +765,13 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     "LMCACHE_L0_SMOKE_STORE is enabled but L0 itself is disabled; "
                     "falling back to the legacy L1/L2 store path"
                 )
+            if _L0_VPC_IMITATION_ENABLED and not self._ctx.storage_manager.l0_enabled:
+                logger.warning(
+                    "LMCACHE_L0_VPC_IMITATION is enabled but L0 itself is disabled; "
+                    "falling back to the normal L1/L2 store path"
+                )
 
-            if smoke_l0 and num_chunks:
+            if (smoke_l0 or imitation_l0) and num_chunks:
                 first_keys = obj_keys_per_obj_group[0]
                 if first_keys:
                     group_layout_descs = {
@@ -753,9 +789,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     )
                     if not prepared:
                         logger.error(
-                            "[L0_SMOKE_STORE] failed to prepare L0 arena for "
+                            "[L0_STORE] failed to prepare L0 arena for "
                             "request_id=%s kv_rank=%d; selected chunks will not "
-                            "be stored",
+                            "receive an L0 copy",
                             key.request_id,
                             first_keys[0].kv_rank,
                         )
@@ -770,7 +806,69 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         object_group_id=obj_group_id,
                     )
 
-                    if smoke_l0:
+                    if imitation_l0:
+                        # VPC-imitation mode is write-through: preserve the
+                        # ordinary L1/L2 store for every eligible chunk, then
+                        # mirror only router-selected chunks into persistent L0.
+                        # This keeps backing-storage behavior invariant while
+                        # allowing the routing decision to change independently.
+                        keys_to_reserve = [
+                            k for i, k in enumerate(obj_keys) if not skip_mask[i]
+                        ]
+                        reserved_dict = self._ctx.storage_manager.reserve_write(
+                            keys_to_reserve, layout_desc, "new"
+                        )
+                        all_l1_dict.update(reserved_dict)
+                        if reserved_dict:
+                            total_bytes += next(
+                                iter(reserved_dict.values())
+                            ).get_size() * len(reserved_dict)
+
+                        l1_memory_objs: list[MemoryObj | None] = [
+                            reserved_dict.get(obj_key) for obj_key in obj_keys
+                        ]
+                        if reserved_dict:
+                            transfer_kv_per_object_group(
+                                cache_context,
+                                block_ids_per_group_gpu,
+                                l1_memory_objs,
+                                object_group_id=obj_group_id,
+                                batch_size=1,
+                                skip_first_n_tokens=0,
+                                direction=lmcache_native.TransferDirection.D2H,
+                                transfer_key=transfer_key,
+                            )
+
+                        l0_selected = [
+                            (not skip_mask[i])
+                            and _l0_imitation_select_chunk(global_start_chunk + i)
+                            for i in range(len(obj_keys))
+                        ]
+                        l0_keys = [
+                            k for i, k in enumerate(obj_keys) if l0_selected[i]
+                        ]
+                        l0_reserved = self._ctx.storage_manager.reserve_l0_write(
+                            l0_keys, layout_desc
+                        )
+                        all_l0_dict.update(l0_reserved)
+                        if l0_reserved:
+                            total_bytes += next(
+                                iter(l0_reserved.values())
+                            ).get_size() * len(l0_reserved)
+                            l0_memory_objs: list[MemoryObj | None] = [
+                                l0_reserved.get(obj_key) for obj_key in obj_keys
+                            ]
+                            transfer_kv_per_object_group(
+                                cache_context,
+                                block_ids_per_group_gpu,
+                                l0_memory_objs,
+                                object_group_id=obj_group_id,
+                                batch_size=1,
+                                skip_first_n_tokens=0,
+                                direction=lmcache_native.TransferDirection.D2H,
+                                transfer_key=transfer_key,
+                            )
+                    elif smoke_l0:
                         l0_selected = [
                             (not skip_mask[i])
                             and _l0_smoke_select_chunk(global_start_chunk + i)
@@ -870,8 +968,15 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 # point. On a failed smoke L0 store, release unpublished GPU pages
                 # at the same stream point instead of freeing them while a D2D may
                 # still be in flight.
+                # Count logical stored objects, not physical tier copies.
+                # In imitation mode the same ObjectKey may be present in both
+                # L1 and L0 by design; counting the union preserves historical
+                # MP_STORE_END semantics while total_bytes still reflects the
+                # actual copy traffic submitted to both tiers.
                 stored_count = (
-                    len(all_l1_dict) + len(all_l0_dict) if store_succeeded else 0
+                    len(set(all_l1_dict) | set(all_l0_dict))
+                    if store_succeeded
+                    else 0
                 )
                 if store_succeeded:
                     if all_l1_dict:
@@ -906,6 +1011,21 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         global_start_chunk + num_chunks,
                         len(all_l0_dict),
                         len(all_l1_dict),
+                        store_succeeded,
+                    )
+                if imitation_l0:
+                    logger.info(
+                        "[L0_VPC_IMITATION_STORE] request_id=%s worker=%s "
+                        "route=%s global_chunks=[%d,%d) L0_reserved=%d "
+                        "L1_reserved=%d logical_stored=%d success=%s",
+                        key.request_id,
+                        key.worker_id,
+                        _L0_ROUTE_MODE,
+                        global_start_chunk,
+                        global_start_chunk + num_chunks,
+                        len(all_l0_dict),
+                        len(all_l1_dict),
+                        stored_count,
                         store_succeeded,
                     )
                 num_tokens = num_chunks * self._ctx.chunk_size if stored_count else 0
