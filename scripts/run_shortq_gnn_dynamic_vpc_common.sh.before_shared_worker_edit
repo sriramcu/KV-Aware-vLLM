@@ -14,6 +14,7 @@ WARM_ORDER=reverse
 LMCACHE_CHUNK_SIZE=512
 LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT="${LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT:-2}"
 LMCACHE_MAX_WORKERS="${LMCACHE_MAX_WORKERS:-8}"
+L2_WORKERS="${L2_WORKERS:-8}"
 LMCACHE_MP_TIMEOUT=30
 FEATURE_MODEL=meta-llama/Llama-3.1-8B-Instruct
 CHECKPOINT="${REPO}/Hierarchical_KV/shortq_placement/model.pt"
@@ -35,18 +36,10 @@ KV_STAGE1_OCCUPANCY_LOW_FRACTION="${KV_STAGE1_OCCUPANCY_LOW_FRACTION:-0.50}"
 KV_STAGE1_OCCUPANCY_TARGET_FRACTION="${KV_STAGE1_OCCUPANCY_TARGET_FRACTION:-0.875}"
 KV_STAGE1_OCCUPANCY_GRACE_S="${KV_STAGE1_OCCUPANCY_GRACE_S:-2.0}"
 KV_FS_PER_OP_WORKERS="${KV_FS_PER_OP_WORKERS:-0}"
-
-# num_workers is the shared/fallback pool once dedicated lanes exist.
-if [[ "$KV_FS_PER_OP_WORKERS" == "1" ]]; then
-  KV_FS_SHARED_WORKERS="${KV_FS_SHARED_WORKERS:-3}"
-else
-  KV_FS_SHARED_WORKERS="${KV_FS_SHARED_WORKERS:-8}"
-fi
-
-KV_FS_LOOKUP_WORKERS="${KV_FS_LOOKUP_WORKERS:-1}"
+KV_FS_LOOKUP_WORKERS="${KV_FS_LOOKUP_WORKERS:-2}"
 KV_FS_RETRIEVE_WORKERS="${KV_FS_RETRIEVE_WORKERS:-4}"
-KV_FS_STORE_WORKERS="${KV_FS_STORE_WORKERS:-0}"
-KV_FS_DELETE_WORKERS="${KV_FS_DELETE_WORKERS:-0}"
+KV_FS_STORE_WORKERS="${KV_FS_STORE_WORKERS:-2}"
+KV_FS_DELETE_WORKERS="${KV_FS_DELETE_WORKERS:-1}"
 
 for name in KV_GNN_AWARE_VPC KV_GNN_L1_BACKING \
   KV_VPC_SUFFICIENT_BYPASS KV_STAGE1_STARVATION_FALLBACK \
@@ -60,16 +53,14 @@ done
 
 python - "$KV_STAGE1_OCCUPANCY_LOW_FRACTION" \
   "$KV_STAGE1_OCCUPANCY_TARGET_FRACTION" "$KV_STAGE1_OCCUPANCY_GRACE_S" \
-  "$KV_FS_SHARED_WORKERS" "$KV_FS_LOOKUP_WORKERS" "$KV_FS_RETRIEVE_WORKERS" \
+  "$KV_FS_LOOKUP_WORKERS" "$KV_FS_RETRIEVE_WORKERS" \
   "$KV_FS_STORE_WORKERS" "$KV_FS_DELETE_WORKERS" <<'PY'
 import sys
 low, target, grace = map(float, sys.argv[1:4])
-shared = int(sys.argv[4])
-workers = list(map(int, sys.argv[5:]))
+workers = list(map(int, sys.argv[4:]))
 assert 0 <= low < target <= 1, (low, target)
 assert grace >= 0, grace
-assert shared > 0, shared
-assert all(x >= 0 for x in workers), workers
+assert all(x > 0 for x in workers), workers
 PY
 
 case "$PROFILE" in
@@ -258,7 +249,6 @@ cat > "${RUN_DIR}/run_config.json" <<JSON
   "stage1_occupancy_target_fraction": $KV_STAGE1_OCCUPANCY_TARGET_FRACTION,
   "stage1_occupancy_grace_s": $KV_STAGE1_OCCUPANCY_GRACE_S,
   "fs_per_op_workers": $KV_FS_PER_OP_WORKERS,
-  "fs_shared_workers": $KV_FS_SHARED_WORKERS,
   "fs_lookup_workers": $KV_FS_LOOKUP_WORKERS,
   "fs_retrieve_workers": $KV_FS_RETRIEVE_WORKERS,
   "fs_store_workers": $KV_FS_STORE_WORKERS,
@@ -298,7 +288,7 @@ print('tier_counts', summary['unique_runtime_tier_counts'])
 print('vpc_sidecar_requests', len(sidecar))
 PY
 
-L2_JSON=$(python - "$L2_DIR" "$KV_FS_SHARED_WORKERS" "$KV_FS_PER_OP_WORKERS" \
+L2_JSON=$(python - "$L2_DIR" "$L2_WORKERS" "$KV_FS_PER_OP_WORKERS" \
   "$KV_FS_LOOKUP_WORKERS" "$KV_FS_RETRIEVE_WORKERS" \
   "$KV_FS_STORE_WORKERS" "$KV_FS_DELETE_WORKERS" <<'PY'
 import json,sys
@@ -309,11 +299,12 @@ spec = {
     'use_odirect': False,
 }
 if int(sys.argv[3]):
-    names = ('lookup', 'retrieve', 'store', 'delete')
-    counts = map(int, sys.argv[4:8])
-    per_op = {name: count for name, count in zip(names, counts) if count > 0}
-    if per_op:
-        spec['per_op_workers'] = per_op
+    spec['per_op_workers'] = {
+        'lookup': int(sys.argv[4]),
+        'retrieve': int(sys.argv[5]),
+        'store': int(sys.argv[6]),
+        'delete': int(sys.argv[7]),
+    }
 print(json.dumps(spec))
 PY
 )

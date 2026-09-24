@@ -63,3 +63,42 @@ class TestFSNativeCapacityHelpText:
         # read as an enforced cap; it must name the eviction requirement.
         assert "eviction" in help_text
         assert "max L2 capacity" not in help_text
+
+
+class TestFSNativePerOpWorkers:
+    def test_per_op_workers_parse(self):
+        cfg, warnings = _from_dict(
+            per_op_workers={
+                "lookup": 2,
+                "retrieve": 4,
+                "store": 2,
+                "delete": 1,
+            }
+        )
+        assert cfg.per_op_workers == {
+            "lookup": 2,
+            "retrieve": 4,
+            "store": 2,
+            "delete": 1,
+        }
+        assert warnings == []
+
+    def test_per_op_workers_reject_unknown_lane(self):
+        try:
+            FSNativeL2AdapterConfig.from_dict(
+                {**BASE, "per_op_workers": {"read": 4}}
+            )
+        except ValueError as exc:
+            assert "unsupported fs_native lane" in str(exc)
+        else:
+            raise AssertionError("unknown worker lane was accepted")
+
+    def test_per_op_workers_reject_nonpositive(self):
+        try:
+            FSNativeL2AdapterConfig.from_dict(
+                {**BASE, "per_op_workers": {"retrieve": 0}}
+            )
+        except ValueError as exc:
+            assert "positive integer" in str(exc)
+        else:
+            raise AssertionError("nonpositive worker count was accepted")

@@ -1,0 +1,746 @@
+diff --git a/scripts/run_shortq_gnn_dynamic_vpc_common.sh b/scripts/run_shortq_gnn_dynamic_vpc_common.sh
+index 7fe81ea..a17f86f 100755
+--- a/scripts/run_shortq_gnn_dynamic_vpc_common.sh
++++ b/scripts/run_shortq_gnn_dynamic_vpc_common.sh
+@@ -13,7 +13,8 @@ REQUEST_ORDER_SEED=0
+ WARM_ORDER=reverse
+ LMCACHE_CHUNK_SIZE=512
+ LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT="${LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT:-2}"
+-LMCACHE_MAX_WORKERS=8
++LMCACHE_MAX_WORKERS="${LMCACHE_MAX_WORKERS:-8}"
++L2_WORKERS="${L2_WORKERS:-8}"
+ LMCACHE_MP_TIMEOUT=30
+ FEATURE_MODEL=meta-llama/Llama-3.1-8B-Instruct
+ CHECKPOINT="${REPO}/Hierarchical_KV/shortq_placement/model.pt"
+@@ -25,7 +26,24 @@ KV_GNN_AWARE_VPC="${KV_GNN_AWARE_VPC:-1}"
+ KV_GNN_L1_BACKING="${KV_GNN_L1_BACKING:-1}"
+ VLLM_GNN_AWARE_VPC_WINDOW="${VLLM_GNN_AWARE_VPC_WINDOW:-256}"
+ 
+-for name in KV_GNN_AWARE_VPC KV_GNN_L1_BACKING; do
++# Three independently gated scheduler/storage fixes. Defaults preserve the
++# pre-patch dynamic-VPC experiment except for the historical starvation
++# fallback, which was already enabled.
++KV_VPC_SUFFICIENT_BYPASS="${KV_VPC_SUFFICIENT_BYPASS:-0}"
++KV_STAGE1_STARVATION_FALLBACK="${KV_STAGE1_STARVATION_FALLBACK:-1}"
++KV_STAGE1_OCCUPANCY_FALLBACK="${KV_STAGE1_OCCUPANCY_FALLBACK:-0}"
++KV_STAGE1_OCCUPANCY_LOW_FRACTION="${KV_STAGE1_OCCUPANCY_LOW_FRACTION:-0.50}"
++KV_STAGE1_OCCUPANCY_TARGET_FRACTION="${KV_STAGE1_OCCUPANCY_TARGET_FRACTION:-0.875}"
++KV_STAGE1_OCCUPANCY_GRACE_S="${KV_STAGE1_OCCUPANCY_GRACE_S:-2.0}"
++KV_FS_PER_OP_WORKERS="${KV_FS_PER_OP_WORKERS:-0}"
++KV_FS_LOOKUP_WORKERS="${KV_FS_LOOKUP_WORKERS:-2}"
++KV_FS_RETRIEVE_WORKERS="${KV_FS_RETRIEVE_WORKERS:-4}"
++KV_FS_STORE_WORKERS="${KV_FS_STORE_WORKERS:-2}"
++KV_FS_DELETE_WORKERS="${KV_FS_DELETE_WORKERS:-1}"
++
++for name in KV_GNN_AWARE_VPC KV_GNN_L1_BACKING \
++  KV_VPC_SUFFICIENT_BYPASS KV_STAGE1_STARVATION_FALLBACK \
++  KV_STAGE1_OCCUPANCY_FALLBACK KV_FS_PER_OP_WORKERS; do
+   value="${!name}"
+   [[ "$value" == "0" || "$value" == "1" ]] || {
+     echo "ERROR: $name must be 0 or 1, got $value" >&2
+@@ -33,12 +51,24 @@ for name in KV_GNN_AWARE_VPC KV_GNN_L1_BACKING; do
+   }
+ done
+ 
++python - "$KV_STAGE1_OCCUPANCY_LOW_FRACTION" \
++  "$KV_STAGE1_OCCUPANCY_TARGET_FRACTION" "$KV_STAGE1_OCCUPANCY_GRACE_S" \
++  "$KV_FS_LOOKUP_WORKERS" "$KV_FS_RETRIEVE_WORKERS" \
++  "$KV_FS_STORE_WORKERS" "$KV_FS_DELETE_WORKERS" <<'PY'
++import sys
++low, target, grace = map(float, sys.argv[1:4])
++workers = list(map(int, sys.argv[4:]))
++assert 0 <= low < target <= 1, (low, target)
++assert grace >= 0, grace
++assert all(x > 0 for x in workers), workers
++PY
++
+ case "$PROFILE" in
+   h100_smoke)
+     CUDA_HOME=/usr/local/cuda-13.1
+     MODEL=meta-llama/Llama-3.3-70B-Instruct
+     TP=2; QUANTIZATION=fp8; GPU_UTIL=0.65; MAX_SEQS=16
+-    L1_GB=200; L2_WORKERS=8
++    L1_GB=200
+     NUM_QUESTIONS="${NUM_QUESTIONS:-96}"
+     SUBMISSION_BATCH_SIZE="${SUBMISSION_BATCH_SIZE:-$NUM_QUESTIONS}"
+     MIN_TOKENS="${MIN_TOKENS:-32}"; MAX_TOKENS="${MAX_TOKENS:-128}"
+@@ -50,7 +80,7 @@ case "$PROFILE" in
+     CUDA_HOME=/usr/local/cuda-13.1
+     MODEL=meta-llama/Llama-3.3-70B-Instruct
+     TP=2; QUANTIZATION=fp8; GPU_UTIL=0.65; MAX_SEQS=16
+-    L1_GB=200; L2_WORKERS=8
++    L1_GB=200
+     NUM_QUESTIONS=650; SUBMISSION_BATCH_SIZE=650
+     MIN_TOKENS=128; MAX_TOKENS=512
+     RUN_LABEL=h100_shortq_gnn_dynamic_vpc_q650
+@@ -212,6 +242,17 @@ cat > "${RUN_DIR}/run_config.json" <<JSON
+   "vpc": true,
+   "gnn_aware_vpc": $KV_GNN_AWARE_VPC,
+   "gnn_aware_vpc_window": $VLLM_GNN_AWARE_VPC_WINDOW,
++  "vpc_sufficient_bypass": $KV_VPC_SUFFICIENT_BYPASS,
++  "stage1_starvation_fallback": $KV_STAGE1_STARVATION_FALLBACK,
++  "stage1_occupancy_fallback": $KV_STAGE1_OCCUPANCY_FALLBACK,
++  "stage1_occupancy_low_fraction": $KV_STAGE1_OCCUPANCY_LOW_FRACTION,
++  "stage1_occupancy_target_fraction": $KV_STAGE1_OCCUPANCY_TARGET_FRACTION,
++  "stage1_occupancy_grace_s": $KV_STAGE1_OCCUPANCY_GRACE_S,
++  "fs_per_op_workers": $KV_FS_PER_OP_WORKERS,
++  "fs_lookup_workers": $KV_FS_LOOKUP_WORKERS,
++  "fs_retrieve_workers": $KV_FS_RETRIEVE_WORKERS,
++  "fs_store_workers": $KV_FS_STORE_WORKERS,
++  "fs_delete_workers": $KV_FS_DELETE_WORKERS,
+   "gnn_l1_backing": $KV_GNN_L1_BACKING,
+   "placement": "shortq_dynamic_vpc_plus_lower_backing",
+   "chunk_vote_policy": "$GNN_CHUNK_VOTE_POLICY",
+@@ -247,11 +288,27 @@ print('tier_counts', summary['unique_runtime_tier_counts'])
+ print('vpc_sidecar_requests', len(sidecar))
+ PY
+ 
+-L2_JSON=$(python - "$L2_DIR" "$L2_WORKERS" <<'PY'
++L2_JSON=$(python - "$L2_DIR" "$L2_WORKERS" "$KV_FS_PER_OP_WORKERS" \
++  "$KV_FS_LOOKUP_WORKERS" "$KV_FS_RETRIEVE_WORKERS" \
++  "$KV_FS_STORE_WORKERS" "$KV_FS_DELETE_WORKERS" <<'PY'
+ import json,sys
+-print(json.dumps({'type':'fs_native','base_path':sys.argv[1],'num_workers':int(sys.argv[2]),'use_odirect':False}))
++spec = {
++    'type': 'fs_native',
++    'base_path': sys.argv[1],
++    'num_workers': int(sys.argv[2]),
++    'use_odirect': False,
++}
++if int(sys.argv[3]):
++    spec['per_op_workers'] = {
++        'lookup': int(sys.argv[4]),
++        'retrieve': int(sys.argv[5]),
++        'store': int(sys.argv[6]),
++        'delete': int(sys.argv[7]),
++    }
++print(json.dumps(spec))
+ PY
+ )
++echo "fs_native adapter: $L2_JSON"
+ 
+ echo "===== START LMCACHE (L0 OFF) ====="
+ lmcache server --host localhost --port 5556 --chunk-size "$LMCACHE_CHUNK_SIZE" \
+@@ -263,7 +320,10 @@ LMCACHE_PID=$!
+ wait_tcp 5556 "$LMCACHE_PID" 240 || { tail -200 "${LOG_DIR}/lmcache.log"; exit 30; }
+ curl -sf http://127.0.0.1:8080/metrics > "${RUN_DIR}/lmcache_metrics_before.txt" || true
+ 
+-KV_CONFIG=$(python - "$LMCACHE_MP_TIMEOUT" <<'PY'
++KV_CONFIG=$(python - "$LMCACHE_MP_TIMEOUT" "$KV_STAGE1_STARVATION_FALLBACK" \
++  "$KV_STAGE1_OCCUPANCY_FALLBACK" "$KV_STAGE1_OCCUPANCY_LOW_FRACTION" \
++  "$KV_STAGE1_OCCUPANCY_TARGET_FRACTION" "$KV_STAGE1_OCCUPANCY_GRACE_S" \
++  "$KV_VPC_SUFFICIENT_BYPASS" <<'PY'
+ import json,sys
+ timeout=float(sys.argv[1])
+ print(json.dumps({
+@@ -276,7 +336,12 @@ print(json.dumps({
+     'lmcache.mp.port':5556,
+     'lmcache.mp.mq_timeout':timeout,
+     'lmcache.mp.lookup_timeout':0.0,
+-    'lmcache.mp.starvation_fallback':True,
++    'lmcache.mp.starvation_fallback':bool(int(sys.argv[2])),
++    'lmcache.mp.occupancy_fallback':bool(int(sys.argv[3])),
++    'lmcache.mp.occupancy_low_fraction':float(sys.argv[4]),
++    'lmcache.mp.occupancy_target_fraction':float(sys.argv[5]),
++    'lmcache.mp.occupancy_grace_s':float(sys.argv[6]),
++    'lmcache.mp.vpc_sufficient_bypass':bool(int(sys.argv[7])),
+   },
+ }))
+ PY
+diff --git a/third_party/LMCache/csrc/storage_backends/fs/connector.cpp b/third_party/LMCache/csrc/storage_backends/fs/connector.cpp
+index a072b63..04abac3 100644
+--- a/third_party/LMCache/csrc/storage_backends/fs/connector.cpp
++++ b/third_party/LMCache/csrc/storage_backends/fs/connector.cpp
+@@ -6,6 +6,7 @@
+ #include <cstdio>
+ #include <stdexcept>
+ #include <string>
++#include <utility>
+ 
+ namespace lmcache {
+ namespace connector {
+@@ -148,8 +149,9 @@ static bool try_enable_odirect(int& flags, const void* buf, size_t len,
+ 
+ FSConnector::FSConnector(std::string base_path, int num_workers,
+                          std::string relative_tmp_dir, bool use_odirect,
+-                         size_t read_ahead_size)
+-    : ConnectorBase(num_workers),
++                         size_t read_ahead_size,
++                         WorkerPoolConfig worker_pool_config)
++    : ConnectorBase(num_workers, std::move(worker_pool_config)),
+       base_path_(std::move(base_path)),
+       relative_tmp_dir_(std::move(relative_tmp_dir)),
+       use_odirect_(use_odirect),
+diff --git a/third_party/LMCache/csrc/storage_backends/fs/connector.h b/third_party/LMCache/csrc/storage_backends/fs/connector.h
+index 03b7b9c..0379143 100644
+--- a/third_party/LMCache/csrc/storage_backends/fs/connector.h
++++ b/third_party/LMCache/csrc/storage_backends/fs/connector.h
+@@ -36,7 +36,8 @@ class FSConnector : public ConnectorBase<WorkerFSConn> {
+  public:
+   FSConnector(std::string base_path, int num_workers,
+               std::string relative_tmp_dir = "", bool use_odirect = false,
+-              size_t read_ahead_size = 0);
++              size_t read_ahead_size = 0,
++              WorkerPoolConfig worker_pool_config = {});
+   ~FSConnector() override;
+ 
+  protected:
+diff --git a/third_party/LMCache/csrc/storage_backends/fs/pybind.cpp b/third_party/LMCache/csrc/storage_backends/fs/pybind.cpp
+index 5fd53ce..83ac6bd 100644
+--- a/third_party/LMCache/csrc/storage_backends/fs/pybind.cpp
++++ b/third_party/LMCache/csrc/storage_backends/fs/pybind.cpp
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: Apache-2.0
+ #include <pybind11/pybind11.h>
++#include <utility>
+ #include "../connector_pybind_utils.h"
+ #include "connector.h"
+ 
+@@ -7,9 +8,18 @@ namespace py = pybind11;
+ 
+ PYBIND11_MODULE(lmcache_fs, m) {
+   py::class_<lmcache::connector::FSConnector>(m, "LMCacheFSClient")
+-      .def(py::init<std::string, int, std::string, bool, size_t>(),
++      .def(py::init([](std::string base_path, int num_workers,
++                       std::string relative_tmp_dir, bool use_odirect,
++                       size_t read_ahead_size, py::object per_op_workers) {
++             return new lmcache::connector::FSConnector(
++                 std::move(base_path), num_workers,
++                 std::move(relative_tmp_dir), use_odirect, read_ahead_size,
++                 lmcache::connector::pybind_utils::parse_per_op_workers(
++                     per_op_workers));
++           }),
+            py::arg("base_path"), py::arg("num_workers"),
+            py::arg("relative_tmp_dir") = "", py::arg("use_odirect") = false,
+-           py::arg("read_ahead_size") = 0)
++           py::arg("read_ahead_size") = 0,
++           py::arg("per_op_workers") = py::none())
+           LMCACHE_BIND_CONNECTOR_METHODS(lmcache::connector::FSConnector);
+ }
+diff --git a/third_party/LMCache/lmcache/integration/vllm/lmcache_mp_connector.py b/third_party/LMCache/lmcache/integration/vllm/lmcache_mp_connector.py
+index aaf4ae3..7bf384e 100644
+--- a/third_party/LMCache/lmcache/integration/vllm/lmcache_mp_connector.py
++++ b/third_party/LMCache/lmcache/integration/vllm/lmcache_mp_connector.py
+@@ -470,6 +470,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+       seconds. The patched adapter defaults this to 0.0 (disabled).
+     - lmcache.mp.starvation_fallback: expose the project scheduler's Stage-1
+       starvation fallback. Enabled by default in this research branch.
++    - lmcache.mp.occupancy_fallback: allow the scheduler's Stage-1 occupancy
++      watchdog to abandon old lookups when execution slots stay under-filled.
++    - lmcache.mp.vpc_sufficient_bypass: skip Stage-1 entirely when vLLM's
++      local prefix is already at least as long as the largest full LMCache
++      chunk prefix that could exist for the request.
+     - lmcache.mp.eager_prefetch: submit the LMCache lookup when a request
+       enters vLLM's waiting queue. Disabled by default.
+     """
+@@ -514,6 +519,24 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+                 "lmcache.mp.starvation_fallback", True
+             )
+         )
++        self._stage1_occupancy_fallback_enabled: bool = bool(
++            vllm_config.kv_transfer_config.get_from_extra_config(
++                "lmcache.mp.occupancy_fallback", False
++            )
++        )
++        self._vpc_sufficient_bypass_enabled: bool = bool(
++            vllm_config.kv_transfer_config.get_from_extra_config(
++                "lmcache.mp.vpc_sufficient_bypass", False
++            )
++        )
++        if self.role == KVConnectorRole.SCHEDULER:
++            logger.info(
++                "[MP_STAGE1_POLICY_CONFIG] starvation=%s occupancy=%s "
++                "vpc_sufficient_bypass=%s",
++                self._stage1_starvation_fallback_enabled,
++                self._stage1_occupancy_fallback_enabled,
++                self._vpc_sufficient_bypass_enabled,
++            )
+         # Optional research guard: a Stage-1 LOOKUP/PREFETCH may hold L1 read
+         # reservations from near the beginning of the lookup.  If Stage 1
+         # itself lasts close to or beyond the L1 read-lock TTL, admitting the
+@@ -1046,7 +1069,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+         """
+         if self.role != KVConnectorRole.SCHEDULER:
+             return False
+-        if not self._stage1_starvation_fallback_enabled:
++        if not (
++            self._stage1_starvation_fallback_enabled
++            or self._stage1_occupancy_fallback_enabled
++        ):
+             return False
+         return self.scheduler_adapter.abandon_stage1_lookup(request_id)
+ 
+@@ -1121,6 +1147,45 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+             tracker.state = LMCacheMPRequestState.BYPASS_LMCACHE
+             return 0, False
+ 
++        # Optional fast-path for dynamic VPC experiments. LMCache persists
++        # complete ``lmcache_tokens_per_chunk`` prompt chunks. If the local
++        # vLLM/VPC prefix already reaches the last complete LMCache chunk
++        # boundary, an external lookup cannot extend the usable prefix and
++        # would only add controller/storage work. This check intentionally
++        # runs before maybe_submit_lookup_request(). The experiment launcher
++        # keeps eager_prefetch disabled, so no daemon-side work exists yet.
++        if self._vpc_sufficient_bypass_enabled and tracker.lookup_started_at is None:
++            chunk_tokens = self.scheduler_adapter.lmcache_tokens_per_chunk
++            max_lmcache_prefix = (
++                tracker.num_prompt_tokens // chunk_tokens
++            ) * chunk_tokens
++            if num_computed_tokens >= max_lmcache_prefix:
++                tracker.num_vllm_hit_tokens = (
++                    num_computed_tokens
++                    // self._hit_alignment_tokens
++                    * self._hit_alignment_tokens
++                )
++                tracker.num_lmcache_hit_tokens = 0
++                logger.info(
++                    "[MP_VPC_SUFFICIENT_BYPASS] request=%s prompt_tokens=%d "
++                    "vllm_hit_tokens=%d max_lmcache_prefix_tokens=%d",
++                    request.request_id,
++                    tracker.num_prompt_tokens,
++                    tracker.num_vllm_hit_tokens,
++                    max_lmcache_prefix,
++                )
++                if self._chthm_debug:
++                    logger.info(
++                        "[MP_CHTHM_ADMIT] request=%s decision=vpc_sufficient "
++                        "prompt_tokens=%d vllm_hit_tokens=%d "
++                        "lmcache_hit_tokens=0 external_load_tokens=0 "
++                        "lookup_age_s=0.000",
++                        request.request_id,
++                        tracker.num_prompt_tokens,
++                        tracker.num_vllm_hit_tokens,
++                    )
++                return 0, False
++
+         if tracker.lookup_started_at is None:
+             tracker.lookup_started_at = time.monotonic()
+         self.scheduler_adapter.maybe_submit_lookup_request(
+diff --git a/third_party/LMCache/lmcache/v1/distributed/l2_adapters/fs_native_l2_adapter.py b/third_party/LMCache/lmcache/v1/distributed/l2_adapters/fs_native_l2_adapter.py
+index f77f0d3..2c8b94f 100644
+--- a/third_party/LMCache/lmcache/v1/distributed/l2_adapters/fs_native_l2_adapter.py
++++ b/third_party/LMCache/lmcache/v1/distributed/l2_adapters/fs_native_l2_adapter.py
+@@ -40,7 +40,11 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
+ 
+     Fields:
+     - base_path: directory for storing KV cache files.
+-    - num_workers: C++ worker threads for I/O (default 4).
++    - num_workers: shared C++ worker threads for operations without a dedicated
++      lane (default 4).
++    - per_op_workers: optional dedicated worker counts keyed by ``lookup``,
++      ``retrieve``, ``store``, or ``delete``. Configured operations bypass the
++      shared queue and use their own worker lane.
+     - relative_tmp_dir: relative sub-dir for temp files.
+     - use_odirect: bypass page cache via O_DIRECT.
+     - read_ahead_size: trigger filesystem readahead by
+@@ -61,9 +65,13 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
+         use_odirect: bool = False,
+         read_ahead_size: Optional[int] = None,
+         max_capacity_gb: float = 0,
++        per_op_workers: dict[str, int] | None = None,
+     ):
+         self.base_path = base_path
+         self.num_workers = num_workers
++        self.per_op_workers = L2AdapterConfigBase._validate_per_op_workers(
++            per_op_workers
++        )
+         self.relative_tmp_dir = relative_tmp_dir
+         self.use_odirect = use_odirect
+         self.read_ahead_size = read_ahead_size
+@@ -78,6 +86,18 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
+         num_workers = d.get("num_workers", 4)
+         if not isinstance(num_workers, int) or num_workers <= 0:
+             raise ValueError("num_workers must be a positive integer")
++        per_op_workers = L2AdapterConfigBase._parse_per_op_workers_from_dict(d)
++        per_op_workers = L2AdapterConfigBase._validate_per_op_workers(
++            per_op_workers
++        )
++        allowed_lanes = {"lookup", "retrieve", "store", "delete"}
++        if per_op_workers is not None:
++            unknown = set(per_op_workers) - allowed_lanes
++            if unknown:
++                raise ValueError(
++                    "per_op_workers contains unsupported fs_native lane(s): "
++                    + ", ".join(sorted(unknown))
++                )
+ 
+         relative_tmp_dir = d.get("relative_tmp_dir", "")
+         if not isinstance(relative_tmp_dir, str):
+@@ -109,6 +129,7 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
+         return cls(
+             base_path=base_path,
+             num_workers=num_workers,
++            per_op_workers=per_op_workers,
+             relative_tmp_dir=str(relative_tmp_dir),
+             use_odirect=use_odirect,
+             read_ahead_size=read_ahead_size,
+@@ -121,8 +142,10 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
+             "FS native L2 adapter config fields:\n"
+             "- base_path (str): directory for KV "
+             "cache files (required)\n"
+-            "- num_workers (int): C++ worker threads "
+-            "for I/O (default 4, >0)\n"
++            "- num_workers (int): shared C++ worker threads "
++            "for operations without dedicated lanes (default 4, >0)\n"
++            "- per_op_workers (dict[str, int]): optional dedicated workers "
++            "for lookup/retrieve/store/delete lanes\n"
+             "- relative_tmp_dir (str): relative "
+             "sub-dir for temp files (default empty)\n"
+             "- use_odirect (bool): bypass page cache "
+@@ -167,11 +190,14 @@ def _create_fs_native_l2_adapter(
+         config.relative_tmp_dir,
+         config.use_odirect,
+         config.read_ahead_size or 0,
++        config.per_op_workers,
+     )
+     logger.info(
+-        "Created FS native L2 adapter: %s (workers=%d, odirect=%s, read_ahead=%s)",
++        "Created FS native L2 adapter: %s "
++        "(shared_workers=%d, per_op_workers=%s, odirect=%s, read_ahead=%s)",
+         config.base_path,
+         config.num_workers,
++        config.per_op_workers,
+         config.use_odirect,
+         config.read_ahead_size,
+     )
+@@ -183,6 +209,7 @@ def _create_fs_native_l2_adapter(
+             "base_path": config.base_path,
+             "use_odirect": config.use_odirect,
+             "num_workers": config.num_workers,
++            "per_op_workers": config.per_op_workers,
+             "read_ahead_size": config.read_ahead_size,
+         },
+     )
+diff --git a/third_party/LMCache/tests/v1/distributed/test_fs_native_l2_adapter_config.py b/third_party/LMCache/tests/v1/distributed/test_fs_native_l2_adapter_config.py
+index d278cb0..d055aad 100644
+--- a/third_party/LMCache/tests/v1/distributed/test_fs_native_l2_adapter_config.py
++++ b/third_party/LMCache/tests/v1/distributed/test_fs_native_l2_adapter_config.py
+@@ -63,3 +63,42 @@ class TestFSNativeCapacityHelpText:
+         # read as an enforced cap; it must name the eviction requirement.
+         assert "eviction" in help_text
+         assert "max L2 capacity" not in help_text
++
++
++class TestFSNativePerOpWorkers:
++    def test_per_op_workers_parse(self):
++        cfg, warnings = _from_dict(
++            per_op_workers={
++                "lookup": 2,
++                "retrieve": 4,
++                "store": 2,
++                "delete": 1,
++            }
++        )
++        assert cfg.per_op_workers == {
++            "lookup": 2,
++            "retrieve": 4,
++            "store": 2,
++            "delete": 1,
++        }
++        assert warnings == []
++
++    def test_per_op_workers_reject_unknown_lane(self):
++        try:
++            FSNativeL2AdapterConfig.from_dict(
++                {**BASE, "per_op_workers": {"read": 4}}
++            )
++        except ValueError as exc:
++            assert "unsupported fs_native lane" in str(exc)
++        else:
++            raise AssertionError("unknown worker lane was accepted")
++
++    def test_per_op_workers_reject_nonpositive(self):
++        try:
++            FSNativeL2AdapterConfig.from_dict(
++                {**BASE, "per_op_workers": {"retrieve": 0}}
++            )
++        except ValueError as exc:
++            assert "positive integer" in str(exc)
++        else:
++            raise AssertionError("nonpositive worker count was accepted")
+diff --git a/third_party/LMCache/tests/v1/distributed/test_l2_adapter_factory.py b/third_party/LMCache/tests/v1/distributed/test_l2_adapter_factory.py
+index acd8e0d..432a2d3 100644
+--- a/third_party/LMCache/tests/v1/distributed/test_l2_adapter_factory.py
++++ b/third_party/LMCache/tests/v1/distributed/test_l2_adapter_factory.py
+@@ -882,12 +882,14 @@ class _FakeLMCacheFSClient:
+         relative_tmp_dir="",
+         use_odirect=False,
+         read_ahead_size=0,
++        per_op_workers=None,
+     ):
+         self.base_path = base_path
+         self.num_workers = num_workers
+         self.relative_tmp_dir = relative_tmp_dir
+         self.use_odirect = use_odirect
+         self.read_ahead_size = read_ahead_size
++        self.per_op_workers = per_op_workers
+         self._efd = create_event_notifier()
+         self._closed = False
+ 
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 1d81d07..6459c04 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
++import math
+ import os
+ import time
+ from collections import defaultdict, deque
+@@ -389,11 +390,67 @@ class Scheduler(SchedulerInterface):
+         # async KV loads). Their remaining-block reservation gates async loads.
+         self._inflight_prefills: set[Request] = set()
+ 
+-        # Project Stage-1 starvation fallback. A single no-progress sweep is
+-        # treated as transient; fallback is eligible only after two consecutive
+-        # full WAITING sweeps with empty execution slots and no model work
+-        # scheduled.
++        # Project Stage-1 fallback controls. The historical starvation path
++        # reacts only to complete scheduler stalls. The optional occupancy
++        # watchdog is complementary: it reacts when Stage-1 lookups leave too
++        # many execution slots idle for a bounded grace interval, even while
++        # some already-running requests continue to make progress. Both are
++        # independently gated and may be enabled in the same run.
+         self._stage1_starvation_scan_streak = 0
++        self._stage1_occupancy_underfilled_since: float | None = None
++        self._stage1_starvation_fallback_enabled = False
++        self._stage1_occupancy_fallback_enabled = False
++        self._stage1_occupancy_low_fraction = 0.50
++        self._stage1_occupancy_target_fraction = 0.875
++        self._stage1_occupancy_grace_s = 2.0
++        if kv_transfer_config is not None:
++            self._stage1_starvation_fallback_enabled = bool(
++                kv_transfer_config.get_from_extra_config(
++                    "lmcache.mp.starvation_fallback", True
++                )
++            )
++            self._stage1_occupancy_fallback_enabled = bool(
++                kv_transfer_config.get_from_extra_config(
++                    "lmcache.mp.occupancy_fallback", False
++                )
++            )
++            self._stage1_occupancy_low_fraction = float(
++                kv_transfer_config.get_from_extra_config(
++                    "lmcache.mp.occupancy_low_fraction", 0.50
++                )
++            )
++            self._stage1_occupancy_target_fraction = float(
++                kv_transfer_config.get_from_extra_config(
++                    "lmcache.mp.occupancy_target_fraction", 0.875
++                )
++            )
++            self._stage1_occupancy_grace_s = float(
++                kv_transfer_config.get_from_extra_config(
++                    "lmcache.mp.occupancy_grace_s", 2.0
++                )
++            )
++        if not 0.0 <= self._stage1_occupancy_low_fraction < 1.0:
++            raise ValueError("lmcache.mp.occupancy_low_fraction must be in [0, 1)")
++        if not (
++            self._stage1_occupancy_low_fraction
++            < self._stage1_occupancy_target_fraction
++            <= 1.0
++        ):
++            raise ValueError(
++                "lmcache.mp.occupancy_target_fraction must be in "
++                "(occupancy_low_fraction, 1]"
++            )
++        if self._stage1_occupancy_grace_s < 0.0:
++            raise ValueError("lmcache.mp.occupancy_grace_s must be >= 0")
++        if self._stage1_occupancy_fallback_enabled:
++            logger.info(
++                "[KV_STAGE1_OCCUPANCY_CONFIG] low_fraction=%.3f "
++                "target_fraction=%.3f grace_s=%.3f max_num_seqs=%d",
++                self._stage1_occupancy_low_fraction,
++                self._stage1_occupancy_target_fraction,
++                self._stage1_occupancy_grace_s,
++                self.max_num_running_reqs,
++            )
+ 
+     def _mamba_block_aligned_split(
+         self,
+@@ -1220,12 +1277,10 @@ class Scheduler(SchedulerInterface):
+                         if self.ec_connector is not None:
+                             self.ec_connector.update_state_after_alloc(request, i)
+ 
+-            # A full no-progress sweep means every persistent waiting queue
+-            # entry was examined (anything skipped now lives in the temporary
+-            # step_skipped_waiting queue). Count two consecutive sweeps before
+-            # acting so a single transient empty iteration does not trigger
+-            # recomputation. Stage 2 (WAITING_FOR_REMOTE_KVS) is never a
+-            # candidate here.
++            # Stage-1 requests have not committed GPU destination blocks yet,
++            # so either fallback below may safely convert them to local
++            # recomputation. Stage 2 (WAITING_FOR_REMOTE_KVS) is deliberately
++            # excluded.
+             waiting_scan_exhausted = not self.waiting and not self.skipped_waiting
+             num_running_for_slots = (
+                 len(self.running) + self.num_waiting_for_streaming_input
+@@ -1233,54 +1288,126 @@ class Scheduler(SchedulerInterface):
+             available_slots = max(
+                 0, self.max_num_running_reqs - num_running_for_slots
+             )
++            unique_candidates = {
++                req.request_id: req for req in stage1_kv_pending_requests
++            }
++            candidates = sorted(
++                unique_candidates.values(), key=lambda req: req.arrival_time
++            )
++            abandon_stage1 = (
++                getattr(self.connector, "abandon_stage1_lookup", None)
++                if self.connector is not None
++                else None
++            )
++
++            def abandon_oldest_stage1(limit: int) -> list[str]:
++                if limit <= 0 or not callable(abandon_stage1):
++                    return []
++                abandoned_ids: list[str] = []
++                for candidate in candidates:
++                    if len(abandoned_ids) >= limit:
++                        break
++                    if abandon_stage1(candidate.request_id):
++                        abandoned_ids.append(candidate.request_id)
++                return abandoned_ids
++
++            # Existing hard-starvation fallback: two complete WAITING scans
++            # with no model scheduling progress. Keep this behavior independent
++            # of the occupancy watchdog so both can be enabled together.
+             stage1_starved = (
+-                waiting_scan_exhausted
++                self._stage1_starvation_fallback_enabled
++                and waiting_scan_exhausted
+                 and available_slots > 0
+                 and not num_scheduled_tokens
+-                and bool(stage1_kv_pending_requests)
++                and bool(candidates)
+                 and self.connector is not None
+             )
+-
+             if stage1_starved:
+                 self._stage1_starvation_scan_streak += 1
+             else:
+                 self._stage1_starvation_scan_streak = 0
+ 
++            released_by_starvation: list[str] = []
+             if stage1_starved and self._stage1_starvation_scan_streak >= 2:
+-                abandon_stage1 = getattr(
+-                    self.connector, "abandon_stage1_lookup", None
+-                )
+-                if callable(abandon_stage1):
+-                    # Oldest first. Keep going if a candidate completed between
+-                    # the scan and this final nonblocking recheck; only actual
+-                    # abandonments consume an execution slot.
+-                    unique_candidates = {
+-                        req.request_id: req for req in stage1_kv_pending_requests
+-                    }
+-                    candidates = sorted(
+-                        unique_candidates.values(), key=lambda req: req.arrival_time
++                released_by_starvation = abandon_oldest_stage1(available_slots)
++                if released_by_starvation:
++                    logger.warning(
++                        "[KV_STAGE1_STARVATION_FALLBACK] two consecutive "
++                        "full WAITING scans made no scheduling progress; "
++                        "logically abandoning %d Stage-1 KV lookup(s) to "
++                        "fill %d available execution slot(s). "
++                        "stage1_pending_seen=%d request_ids=%s",
++                        len(released_by_starvation),
++                        available_slots,
++                        len(unique_candidates),
++                        released_by_starvation,
+                     )
+-                    abandoned_ids: list[str] = []
+-                    for candidate in candidates:
+-                        if len(abandoned_ids) >= available_slots:
+-                            break
+-                        if abandon_stage1(candidate.request_id):
+-                            abandoned_ids.append(candidate.request_id)
++                # Require two new no-progress scans before another release wave.
++                self._stage1_starvation_scan_streak = 0
+ 
+-                    if abandoned_ids:
++            # Occupancy-aware fallback: partial scheduler progress must not keep
++            # resetting the liveness policy while half of max_num_seqs sits
++            # unused behind Stage-1 lookups. After a bounded grace interval,
++            # abandon only enough oldest Stage-1 requests to refill toward the
++            # configured target occupancy. A hard-starvation release in this
++            # same step takes precedence and resets this watchdog.
++            low_running = int(
++                self.max_num_running_reqs * self._stage1_occupancy_low_fraction
++            )
++            target_running = min(
++                self.max_num_running_reqs,
++                max(
++                    low_running + 1,
++                    math.ceil(
++                        self.max_num_running_reqs
++                        * self._stage1_occupancy_target_fraction
++                    ),
++                ),
++            )
++            occupancy_underfilled = (
++                self._stage1_occupancy_fallback_enabled
++                and available_slots > 0
++                and num_running_for_slots <= low_running
++                and bool(candidates)
++                and self.connector is not None
++            )
++            now = time.monotonic()
++            if released_by_starvation:
++                self._stage1_occupancy_underfilled_since = None
++            elif occupancy_underfilled:
++                if self._stage1_occupancy_underfilled_since is None:
++                    self._stage1_occupancy_underfilled_since = now
++                underfilled_age_s = (
++                    now - self._stage1_occupancy_underfilled_since
++                )
++                if underfilled_age_s >= self._stage1_occupancy_grace_s:
++                    release_budget = min(
++                        available_slots,
++                        max(0, target_running - num_running_for_slots),
++                    )
++                    released_by_occupancy = abandon_oldest_stage1(release_budget)
++                    if released_by_occupancy:
+                         logger.warning(
+-                            "[KV_STAGE1_STARVATION_FALLBACK] two consecutive "
+-                            "full WAITING scans made no scheduling progress; "
+-                            "logically abandoning %d Stage-1 KV lookup(s) to "
+-                            "fill %d available execution slot(s). "
+-                            "stage1_pending_seen=%d request_ids=%s",
+-                            len(abandoned_ids),
++                            "[KV_STAGE1_OCCUPANCY_FALLBACK] execution occupancy "
++                            "stayed low for %.3fs; running=%d max=%d low=%d "
++                            "target=%d available_slots=%d stage1_pending_seen=%d "
++                            "abandoned=%d request_ids=%s",
++                            underfilled_age_s,
++                            num_running_for_slots,
++                            self.max_num_running_reqs,
++                            low_running,
++                            target_running,
+                             available_slots,
+                             len(unique_candidates),
+-                            abandoned_ids,
++                            len(released_by_occupancy),
++                            released_by_occupancy,
+                         )
+-                # Require two new no-progress scans before another release wave.
+-                self._stage1_starvation_scan_streak = 0
++                    # Whether candidates completed during the final recheck or
++                    # were abandoned, require another full grace interval before
++                    # the next occupancy release wave.
++                    self._stage1_occupancy_underfilled_since = None
++            else:
++                self._stage1_occupancy_underfilled_since = None
+ 
+             # re-queue requests skipped in this pass ahead of older skipped items.
+             if step_skipped_waiting:
+@@ -1293,6 +1420,7 @@ class Scheduler(SchedulerInterface):
+ 
+         if preempted_reqs or self._pause_state != PauseState.UNPAUSED:
+             self._stage1_starvation_scan_streak = 0
++            self._stage1_occupancy_underfilled_since = None
+ 
+         # Check if the scheduling constraints are satisfied.
+         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())

@@ -40,7 +40,11 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
 
     Fields:
     - base_path: directory for storing KV cache files.
-    - num_workers: C++ worker threads for I/O (default 4).
+    - num_workers: shared C++ worker threads for operations without a dedicated
+      lane (default 4).
+    - per_op_workers: optional dedicated worker counts keyed by ``lookup``,
+      ``retrieve``, ``store``, or ``delete``. Configured operations bypass the
+      shared queue and use their own worker lane.
     - relative_tmp_dir: relative sub-dir for temp files.
     - use_odirect: bypass page cache via O_DIRECT.
     - read_ahead_size: trigger filesystem readahead by
@@ -61,9 +65,13 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
         use_odirect: bool = False,
         read_ahead_size: Optional[int] = None,
         max_capacity_gb: float = 0,
+        per_op_workers: dict[str, int] | None = None,
     ):
         self.base_path = base_path
         self.num_workers = num_workers
+        self.per_op_workers = L2AdapterConfigBase._validate_per_op_workers(
+            per_op_workers
+        )
         self.relative_tmp_dir = relative_tmp_dir
         self.use_odirect = use_odirect
         self.read_ahead_size = read_ahead_size
@@ -78,6 +86,18 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
         num_workers = d.get("num_workers", 4)
         if not isinstance(num_workers, int) or num_workers <= 0:
             raise ValueError("num_workers must be a positive integer")
+        per_op_workers = L2AdapterConfigBase._parse_per_op_workers_from_dict(d)
+        per_op_workers = L2AdapterConfigBase._validate_per_op_workers(
+            per_op_workers
+        )
+        allowed_lanes = {"lookup", "retrieve", "store", "delete"}
+        if per_op_workers is not None:
+            unknown = set(per_op_workers) - allowed_lanes
+            if unknown:
+                raise ValueError(
+                    "per_op_workers contains unsupported fs_native lane(s): "
+                    + ", ".join(sorted(unknown))
+                )
 
         relative_tmp_dir = d.get("relative_tmp_dir", "")
         if not isinstance(relative_tmp_dir, str):
@@ -109,6 +129,7 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
         return cls(
             base_path=base_path,
             num_workers=num_workers,
+            per_op_workers=per_op_workers,
             relative_tmp_dir=str(relative_tmp_dir),
             use_odirect=use_odirect,
             read_ahead_size=read_ahead_size,
@@ -121,8 +142,10 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
             "FS native L2 adapter config fields:\n"
             "- base_path (str): directory for KV "
             "cache files (required)\n"
-            "- num_workers (int): C++ worker threads "
-            "for I/O (default 4, >0)\n"
+            "- num_workers (int): shared C++ worker threads "
+            "for operations without dedicated lanes (default 4, >0)\n"
+            "- per_op_workers (dict[str, int]): optional dedicated workers "
+            "for lookup/retrieve/store/delete lanes\n"
             "- relative_tmp_dir (str): relative "
             "sub-dir for temp files (default empty)\n"
             "- use_odirect (bool): bypass page cache "
@@ -167,11 +190,14 @@ def _create_fs_native_l2_adapter(
         config.relative_tmp_dir,
         config.use_odirect,
         config.read_ahead_size or 0,
+        config.per_op_workers,
     )
     logger.info(
-        "Created FS native L2 adapter: %s (workers=%d, odirect=%s, read_ahead=%s)",
+        "Created FS native L2 adapter: %s "
+        "(shared_workers=%d, per_op_workers=%s, odirect=%s, read_ahead=%s)",
         config.base_path,
         config.num_workers,
+        config.per_op_workers,
         config.use_odirect,
         config.read_ahead_size,
     )
@@ -183,6 +209,7 @@ def _create_fs_native_l2_adapter(
             "base_path": config.base_path,
             "use_odirect": config.use_odirect,
             "num_workers": config.num_workers,
+            "per_op_workers": config.per_op_workers,
             "read_ahead_size": config.read_ahead_size,
         },
     )

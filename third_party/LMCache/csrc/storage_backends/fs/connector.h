@@ -36,7 +36,8 @@ class FSConnector : public ConnectorBase<WorkerFSConn> {
  public:
   FSConnector(std::string base_path, int num_workers,
               std::string relative_tmp_dir = "", bool use_odirect = false,
-              size_t read_ahead_size = 0);
+              size_t read_ahead_size = 0,
+              WorkerPoolConfig worker_pool_config = {});
   ~FSConnector() override;
 
  protected:

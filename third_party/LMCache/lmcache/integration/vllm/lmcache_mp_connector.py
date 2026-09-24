@@ -470,6 +470,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
       seconds. The patched adapter defaults this to 0.0 (disabled).
     - lmcache.mp.starvation_fallback: expose the project scheduler's Stage-1
       starvation fallback. Enabled by default in this research branch.
+    - lmcache.mp.occupancy_fallback: allow the scheduler's Stage-1 occupancy
+      watchdog to abandon old lookups when execution slots stay under-filled.
+    - lmcache.mp.vpc_sufficient_bypass: skip Stage-1 entirely when vLLM's
+      local prefix is already at least as long as the largest full LMCache
+      chunk prefix that could exist for the request.
     - lmcache.mp.eager_prefetch: submit the LMCache lookup when a request
       enters vLLM's waiting queue. Disabled by default.
     """
@@ -514,6 +519,24 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 "lmcache.mp.starvation_fallback", True
             )
         )
+        self._stage1_occupancy_fallback_enabled: bool = bool(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "lmcache.mp.occupancy_fallback", False
+            )
+        )
+        self._vpc_sufficient_bypass_enabled: bool = bool(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "lmcache.mp.vpc_sufficient_bypass", False
+            )
+        )
+        if self.role == KVConnectorRole.SCHEDULER:
+            logger.info(
+                "[MP_STAGE1_POLICY_CONFIG] starvation=%s occupancy=%s "
+                "vpc_sufficient_bypass=%s",
+                self._stage1_starvation_fallback_enabled,
+                self._stage1_occupancy_fallback_enabled,
+                self._vpc_sufficient_bypass_enabled,
+            )
         # Optional research guard: a Stage-1 LOOKUP/PREFETCH may hold L1 read
         # reservations from near the beginning of the lookup.  If Stage 1
         # itself lasts close to or beyond the L1 read-lock TTL, admitting the
@@ -1046,7 +1069,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         """
         if self.role != KVConnectorRole.SCHEDULER:
             return False
-        if not self._stage1_starvation_fallback_enabled:
+        if not (
+            self._stage1_starvation_fallback_enabled
+            or self._stage1_occupancy_fallback_enabled
+        ):
             return False
         return self.scheduler_adapter.abandon_stage1_lookup(request_id)
 
@@ -1120,6 +1146,45 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             tracker.num_lmcache_hit_tokens = 0
             tracker.state = LMCacheMPRequestState.BYPASS_LMCACHE
             return 0, False
+
+        # Optional fast-path for dynamic VPC experiments. LMCache persists
+        # complete ``lmcache_tokens_per_chunk`` prompt chunks. If the local
+        # vLLM/VPC prefix already reaches the last complete LMCache chunk
+        # boundary, an external lookup cannot extend the usable prefix and
+        # would only add controller/storage work. This check intentionally
+        # runs before maybe_submit_lookup_request(). The experiment launcher
+        # keeps eager_prefetch disabled, so no daemon-side work exists yet.
+        if self._vpc_sufficient_bypass_enabled and tracker.lookup_started_at is None:
+            chunk_tokens = self.scheduler_adapter.lmcache_tokens_per_chunk
+            max_lmcache_prefix = (
+                tracker.num_prompt_tokens // chunk_tokens
+            ) * chunk_tokens
+            if num_computed_tokens >= max_lmcache_prefix:
+                tracker.num_vllm_hit_tokens = (
+                    num_computed_tokens
+                    // self._hit_alignment_tokens
+                    * self._hit_alignment_tokens
+                )
+                tracker.num_lmcache_hit_tokens = 0
+                logger.info(
+                    "[MP_VPC_SUFFICIENT_BYPASS] request=%s prompt_tokens=%d "
+                    "vllm_hit_tokens=%d max_lmcache_prefix_tokens=%d",
+                    request.request_id,
+                    tracker.num_prompt_tokens,
+                    tracker.num_vllm_hit_tokens,
+                    max_lmcache_prefix,
+                )
+                if self._chthm_debug:
+                    logger.info(
+                        "[MP_CHTHM_ADMIT] request=%s decision=vpc_sufficient "
+                        "prompt_tokens=%d vllm_hit_tokens=%d "
+                        "lmcache_hit_tokens=0 external_load_tokens=0 "
+                        "lookup_age_s=0.000",
+                        request.request_id,
+                        tracker.num_prompt_tokens,
+                        tracker.num_vllm_hit_tokens,
+                    )
+                return 0, False
 
         if tracker.lookup_started_at is None:
             tracker.lookup_started_at = time.monotonic()
