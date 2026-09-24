@@ -80,6 +80,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     p.add_argument("--inference_batch_size", type=int, default=1)
     p.add_argument("--runtime_metadata", required=True)
+    p.add_argument(
+        "--vpc_importance_sidecar",
+        default="",
+        help=(
+            "Optional JSON output mapping reordered request index to native "
+            "16-token block importance tiers for GNN-aware vLLM VPC."
+        ),
+    )
     p.add_argument("--placement_trace", required=True)
     p.add_argument("--hash_prediction_trace", required=True)
     p.add_argument("--timing_trace", required=True)
@@ -246,6 +254,40 @@ def _dist(values: list[float]) -> dict[str, float | int | None]:
         "p95": float(pct(0.95)),
         "max": float(vals[-1]),
     }
+
+
+
+
+def _write_vpc_importance_sidecar(
+    path: str | Path,
+    occurrences: list[dict[str, Any]],
+    blocks_per_chunk: int,
+) -> None:
+    """Write stable per-request native-block labels for vLLM prefix caching.
+
+    Short-Q votes at 512-token LMCache chunk granularity. vLLM's physical APC
+    blocks remain 16 tokens, so every full logical chunk contributes the same
+    label to ``blocks_per_chunk`` consecutive native blocks. The final resolved
+    runtime tier is used so shared hashes have stable semantics across requests.
+    """
+    tier_to_importance = {"L0": "gpu", "L1": "cpu", "L2": "disk"}
+    per_request: dict[str, dict[str, str]] = {}
+    for row in occurrences:
+        request_idx = str(int(row["request_order_index"]))
+        chunk_idx = int(row["chunk_index"])
+        tier = str(row["runtime_tier"])
+        importance = tier_to_importance[tier]
+        request_map = per_request.setdefault(request_idx, {})
+        start = chunk_idx * blocks_per_chunk
+        for block_idx in range(start, start + blocks_per_chunk):
+            request_map[str(block_idx)] = importance
+
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(
+        json.dumps(per_request, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _force_smoke_tier_coverage(
@@ -628,6 +670,10 @@ def main() -> None:
     timing_path = Path(args.timing_trace)
     summary_path = Path(args.summary)
     write_runtime_metadata(runtime_path, runtime)
+    if args.vpc_importance_sidecar:
+        _write_vpc_importance_sidecar(
+            args.vpc_importance_sidecar, occurrences, blocks_per_chunk
+        )
 
     for path, rows in (
         (trace_path, occurrences),
@@ -687,6 +733,7 @@ def main() -> None:
         "smoke_force_min_unique_per_tier": args.smoke_force_min_unique_per_tier,
         "smoke_runtime_overrides": smoke_overrides,
         "runtime_metadata": str(runtime_path),
+        "vpc_importance_sidecar": args.vpc_importance_sidecar or None,
         "placement_trace": str(trace_path),
         "hash_prediction_trace": str(hash_trace_path),
         "timing_trace": str(timing_path),

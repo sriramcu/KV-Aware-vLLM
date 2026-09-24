@@ -63,6 +63,8 @@ def _env_flag(name: str, default: bool = False) -> bool:
 _L0_SMOKE_STORE_ENABLED = _env_flag("LMCACHE_L0_SMOKE_STORE")
 _L0_VPC_IMITATION_ENABLED = _env_flag("LMCACHE_L0_VPC_IMITATION")
 _GNN_EXCLUSIVE_ENABLED = _env_flag("LMCACHE_GNN_EXCLUSIVE_PLACEMENT")
+_GNN_DYNAMIC_STORE_ENABLED = _env_flag("LMCACHE_GNN_DYNAMIC_STORE")
+_GNN_L1_BACKING_ENABLED = _env_flag("LMCACHE_GNN_L1_BACKING")
 _L0_ROUTE_MODE = os.getenv("LMCACHE_L0_ROUTE_MODE", "all").strip().lower()
 _L0_SMOKE_MOD = int(os.getenv("LMCACHE_L0_SMOKE_MOD", "4"))
 _L0_SMOKE_TAKE = int(os.getenv("LMCACHE_L0_SMOKE_TAKE", "2"))
@@ -72,10 +74,23 @@ if not 0 <= _L0_SMOKE_TAKE <= _L0_SMOKE_MOD:
     raise ValueError(
         "LMCACHE_L0_SMOKE_TAKE must be between 0 and LMCACHE_L0_SMOKE_MOD"
     )
-if sum(bool(x) for x in (_L0_VPC_IMITATION_ENABLED, _L0_SMOKE_STORE_ENABLED, _GNN_EXCLUSIVE_ENABLED)) > 1:
+if sum(
+    bool(x)
+    for x in (
+        _L0_VPC_IMITATION_ENABLED,
+        _L0_SMOKE_STORE_ENABLED,
+        _GNN_EXCLUSIVE_ENABLED,
+        _GNN_DYNAMIC_STORE_ENABLED,
+    )
+) > 1:
     raise ValueError(
-        "LMCACHE_L0_VPC_IMITATION, LMCACHE_L0_SMOKE_STORE, and "
-        "LMCACHE_GNN_EXCLUSIVE_PLACEMENT are mutually exclusive"
+        "LMCACHE_L0_VPC_IMITATION, LMCACHE_L0_SMOKE_STORE, "
+        "LMCACHE_GNN_EXCLUSIVE_PLACEMENT, and LMCACHE_GNN_DYNAMIC_STORE "
+        "are mutually exclusive"
+    )
+if _GNN_L1_BACKING_ENABLED and not _GNN_DYNAMIC_STORE_ENABLED:
+    raise ValueError(
+        "LMCACHE_GNN_L1_BACKING requires LMCACHE_GNN_DYNAMIC_STORE=1"
     )
 if _L0_VPC_IMITATION_ENABLED and _L0_ROUTE_MODE not in {"all", "smoke"}:
     raise ValueError(
@@ -760,7 +775,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 _L0_VPC_IMITATION_ENABLED and self._ctx.storage_manager.l0_enabled
             )
             gnn_exclusive = _GNN_EXCLUSIVE_ENABLED
+            gnn_dynamic = _GNN_DYNAMIC_STORE_ENABLED
             gnn_target_counts = {"L0": 0, "L1": 0, "L2": 0}
+            gnn_host_reserved_counts = {"L0": 0, "L1": 0, "L2": 0}
             global_start_chunk = key.start // self._ctx.chunk_size
 
             if _L0_SMOKE_STORE_ENABLED and not self._ctx.storage_manager.l0_enabled:
@@ -813,7 +830,62 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         object_group_id=obj_group_id,
                     )
 
-                    if gnn_exclusive:
+                    if gnn_dynamic:
+                        target_tiers = [
+                            get_chunk_placement(k.chunk_hash) if not skip_mask[i] else "SKIP"
+                            for i, k in enumerate(obj_keys)
+                        ]
+                        if obj_group_id == 0:
+                            for tier in ("L0", "L1", "L2"):
+                                gnn_target_counts[tier] = sum(
+                                    1 for x in target_tiers if x == tier
+                                )
+
+                        # Dynamic VPC owns GPU residency. LMCache only supplies
+                        # lower-tier persistence. L1 backing independently adds
+                        # logical GPU/L0 chunks to the host-store set.
+                        host_tiers = {"L1", "L2"}
+                        if _GNN_L1_BACKING_ENABLED:
+                            host_tiers.add("L0")
+                        host_keys = [
+                            k
+                            for i, k in enumerate(obj_keys)
+                            if not skip_mask[i] and target_tiers[i] in host_tiers
+                        ]
+                        reserved_dict = self._ctx.storage_manager.reserve_write(
+                            host_keys, layout_desc, "new"
+                        )
+                        if obj_group_id == 0:
+                            tier_by_key = {
+                                k: target_tiers[i] for i, k in enumerate(obj_keys)
+                            }
+                            for reserved_key in reserved_dict:
+                                reserved_tier = tier_by_key[reserved_key]
+                                if reserved_tier in gnn_host_reserved_counts:
+                                    gnn_host_reserved_counts[reserved_tier] += 1
+                        all_l1_dict.update(reserved_dict)
+                        if reserved_dict:
+                            total_bytes += (
+                                next(iter(reserved_dict.values())).get_size()
+                                * len(reserved_dict)
+                            )
+
+                        host_memory_objs: list[MemoryObj | None] = [
+                            reserved_dict.get(obj_key) for obj_key in obj_keys
+                        ]
+                        if reserved_dict:
+                            transfer_kv_per_object_group(
+                                cache_context,
+                                block_ids_per_group_gpu,
+                                host_memory_objs,
+                                object_group_id=obj_group_id,
+                                batch_size=1,
+                                skip_first_n_tokens=0,
+                                direction=lmcache_native.TransferDirection.D2H,
+                                transfer_key=transfer_key,
+                            )
+
+                    elif gnn_exclusive:
                         target_tiers = [
                             get_chunk_placement(k.chunk_hash) if not skip_mask[i] else "SKIP"
                             for i, k in enumerate(obj_keys)
@@ -1071,6 +1143,29 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         len(all_l1_dict),
                         store_succeeded,
                     )
+                if gnn_dynamic:
+                    logger.info(
+                        "[GNN_DYNAMIC_STORE] request_id=%s worker=%s "
+                        "global_chunks=[%d,%d) target_gpu=%d target_cpu=%d "
+                        "target_disk=%d l1_backing=%s host_reserved=%d "
+                        "reserved_gpu=%d reserved_cpu=%d reserved_disk=%d "
+                        "host_bytes=%d logical_stored=%d success=%s",
+                        key.request_id,
+                        key.worker_id,
+                        global_start_chunk,
+                        global_start_chunk + num_chunks,
+                        gnn_target_counts["L0"],
+                        gnn_target_counts["L1"],
+                        gnn_target_counts["L2"],
+                        _GNN_L1_BACKING_ENABLED,
+                        len(all_l1_dict),
+                        gnn_host_reserved_counts["L0"],
+                        gnn_host_reserved_counts["L1"],
+                        gnn_host_reserved_counts["L2"],
+                        sum(obj.get_size() for obj in all_l1_dict.values()),
+                        stored_count,
+                        store_succeeded,
+                    )
                 if gnn_exclusive:
                     logger.info(
                         "[GNN_EXCLUSIVE_STORE] request_id=%s worker=%s "
@@ -1100,7 +1195,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         stored_count,
                         store_succeeded,
                     )
-                num_tokens = num_chunks * self._ctx.chunk_size if stored_count else 0
+                num_tokens = (
+                    stored_count * self._ctx.chunk_size
+                    if gnn_dynamic
+                    else num_chunks * self._ctx.chunk_size if stored_count else 0
+                )
                 self._ctx.event_bus.publish_on_stream(
                     cache_context.cupy_stream,
                     Event(

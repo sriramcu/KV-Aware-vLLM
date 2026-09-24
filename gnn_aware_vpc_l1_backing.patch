@@ -1,0 +1,1087 @@
+diff --git a/experiments/mp_nognn_project.py b/experiments/mp_nognn_project.py
+index 376932d..f021dee 100755
+--- a/experiments/mp_nognn_project.py
++++ b/experiments/mp_nognn_project.py
+@@ -366,6 +366,7 @@ def one_completion(
+     top_p: float,
+     timeout_s: float,
+     payload_extras: dict[str, Any],
++    request_headers: dict[str, str] | None = None,
+ ) -> dict[str, Any]:
+     payload: dict[str, Any] = {
+         "model": model,
+@@ -384,6 +385,7 @@ def one_completion(
+         resp = requests.post(
+             endpoint,
+             json=payload,
++            headers=request_headers,
+             timeout=timeout_s,
+         )
+         elapsed = time.monotonic() - mono_start
+@@ -454,6 +456,7 @@ def generate_in_submission_batches_http(
+     phase_name: str,
+     policy: RequestPolicy,
+     result_file,
++    deterministic_request_ids: bool = False,
+ ) -> tuple[list[dict[str, Any]], float]:
+     """
+     Match the legacy bounded-wave behavior.
+@@ -494,6 +497,14 @@ def generate_in_submission_batches_http(
+                     prompt_record=record.prompt_record,
+                 )
+ 
++                request_headers = None
++                if deterministic_request_ids:
++                    request_headers = {
++                        "X-Request-Id": (
++                            f"kvaware-{phase_name}-{record.source_index:06d}"
++                        )
++                    }
++
+                 future = pool.submit(
+                     one_completion,
+                     endpoint=endpoint,
+@@ -505,6 +516,7 @@ def generate_in_submission_batches_http(
+                     top_p=top_p,
+                     timeout_s=request_timeout_s,
+                     payload_extras=extras,
++                    request_headers=request_headers,
+                 )
+                 future_to_position[future] = pos
+ 
+@@ -763,6 +775,14 @@ def parse_arguments():
+         default="",
+         help="Optional path for a Prometheus /metrics snapshot immediately after cold.",
+     )
++    parser.add_argument(
++        "--deterministic_request_ids",
++        action="store_true",
++        help=(
++            "Send X-Request-Id=kvaware-{phase}-{reordered_source_index}; "
++            "used by GNN-aware VPC sidecar lookup."
++        ),
++    )
+ 
+     return parser.parse_args()
+ 
+@@ -798,6 +818,7 @@ def main():
+                 "server_url": args.server_url,
+                 "policy": "none",
+                 "gnn_enabled": False,
++                "deterministic_request_ids": args.deterministic_request_ids,
+                 "cuda_visible_devices": os.environ.get(
+                     "CUDA_VISIBLE_DEVICES"
+                 ),
+@@ -946,6 +967,7 @@ def main():
+                 phase_name="cold",
+                 policy=policy,
+                 result_file=f,
++                deterministic_request_ids=args.deterministic_request_ids,
+             )
+         )
+ 
+@@ -996,6 +1018,7 @@ def main():
+                 phase_name="warm",
+                 policy=policy,
+                 result_file=f,
++                deterministic_request_ids=args.deterministic_request_ids,
+             )
+         )
+ 
+diff --git a/experiments/precompute_shortq_placements.py b/experiments/precompute_shortq_placements.py
+index 49d1d28..9528636 100755
+--- a/experiments/precompute_shortq_placements.py
++++ b/experiments/precompute_shortq_placements.py
+@@ -80,6 +80,14 @@ def parse_args() -> argparse.Namespace:
+     p.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
+     p.add_argument("--inference_batch_size", type=int, default=1)
+     p.add_argument("--runtime_metadata", required=True)
++    p.add_argument(
++        "--vpc_importance_sidecar",
++        default="",
++        help=(
++            "Optional JSON output mapping reordered request index to native "
++            "16-token block importance tiers for GNN-aware vLLM VPC."
++        ),
++    )
+     p.add_argument("--placement_trace", required=True)
+     p.add_argument("--hash_prediction_trace", required=True)
+     p.add_argument("--timing_trace", required=True)
+@@ -248,6 +256,40 @@ def _dist(values: list[float]) -> dict[str, float | int | None]:
+     }
+ 
+ 
++
++
++def _write_vpc_importance_sidecar(
++    path: str | Path,
++    occurrences: list[dict[str, Any]],
++    blocks_per_chunk: int,
++) -> None:
++    """Write stable per-request native-block labels for vLLM prefix caching.
++
++    Short-Q votes at 512-token LMCache chunk granularity. vLLM's physical APC
++    blocks remain 16 tokens, so every full logical chunk contributes the same
++    label to ``blocks_per_chunk`` consecutive native blocks. The final resolved
++    runtime tier is used so shared hashes have stable semantics across requests.
++    """
++    tier_to_importance = {"L0": "gpu", "L1": "cpu", "L2": "disk"}
++    per_request: dict[str, dict[str, str]] = {}
++    for row in occurrences:
++        request_idx = str(int(row["request_order_index"]))
++        chunk_idx = int(row["chunk_index"])
++        tier = str(row["runtime_tier"])
++        importance = tier_to_importance[tier]
++        request_map = per_request.setdefault(request_idx, {})
++        start = chunk_idx * blocks_per_chunk
++        for block_idx in range(start, start + blocks_per_chunk):
++            request_map[str(block_idx)] = importance
++
++    out = Path(path)
++    out.parent.mkdir(parents=True, exist_ok=True)
++    out.write_text(
++        json.dumps(per_request, indent=2, sort_keys=True) + "\n",
++        encoding="utf-8",
++    )
++
++
+ def _force_smoke_tier_coverage(
+     runtime: dict[str, str], min_unique_per_tier: int
+ ) -> list[dict[str, str]]:
+@@ -628,6 +670,10 @@ def main() -> None:
+     timing_path = Path(args.timing_trace)
+     summary_path = Path(args.summary)
+     write_runtime_metadata(runtime_path, runtime)
++    if args.vpc_importance_sidecar:
++        _write_vpc_importance_sidecar(
++            args.vpc_importance_sidecar, occurrences, blocks_per_chunk
++        )
+ 
+     for path, rows in (
+         (trace_path, occurrences),
+@@ -687,6 +733,7 @@ def main() -> None:
+         "smoke_force_min_unique_per_tier": args.smoke_force_min_unique_per_tier,
+         "smoke_runtime_overrides": smoke_overrides,
+         "runtime_metadata": str(runtime_path),
++        "vpc_importance_sidecar": args.vpc_importance_sidecar or None,
+         "placement_trace": str(trace_path),
+         "hash_prediction_trace": str(hash_trace_path),
+         "timing_trace": str(timing_path),
+diff --git a/scripts/run_h100_shortq_gnn_dynamic_vpc_q650.sbatch b/scripts/run_h100_shortq_gnn_dynamic_vpc_q650.sbatch
+new file mode 100755
+index 0000000..1fb2be3
+--- /dev/null
++++ b/scripts/run_h100_shortq_gnn_dynamic_vpc_q650.sbatch
+@@ -0,0 +1,14 @@
++#!/usr/bin/env bash
++#SBATCH --job-name=kvaware-gnn-vpc-q650
++#SBATCH --partition=gpu-h100-dchen
++#SBATCH --nodes=1
++#SBATCH --ntasks=1
++#SBATCH --cpus-per-task=16
++#SBATCH --gres=gpu:2
++#SBATCH --time=06:00:00
++#SBATCH --output=/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/logs/%x_%j.out
++#SBATCH --error=/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/logs/%x_%j.err
++
++set -Eeuo pipefail
++export KV_GNN_DYNAMIC_PROFILE=h100_q650
++exec bash /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM/scripts/run_shortq_gnn_dynamic_vpc_common.sh
+diff --git a/scripts/run_h100_shortq_gnn_dynamic_vpc_smoke.sbatch b/scripts/run_h100_shortq_gnn_dynamic_vpc_smoke.sbatch
+new file mode 100755
+index 0000000..e76754c
+--- /dev/null
++++ b/scripts/run_h100_shortq_gnn_dynamic_vpc_smoke.sbatch
+@@ -0,0 +1,14 @@
++#!/usr/bin/env bash
++#SBATCH --job-name=kvaware-gnn-vpc-smoke
++#SBATCH --partition=gpu-h100-dchen
++#SBATCH --nodes=1
++#SBATCH --ntasks=1
++#SBATCH --cpus-per-task=16
++#SBATCH --gres=gpu:2
++#SBATCH --time=04:00:00
++#SBATCH --output=/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/logs/%x_%j.out
++#SBATCH --error=/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/logs/%x_%j.err
++
++set -Eeuo pipefail
++export KV_GNN_DYNAMIC_PROFILE=h100_smoke
++exec bash /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM/scripts/run_shortq_gnn_dynamic_vpc_common.sh
+diff --git a/scripts/run_shortq_gnn_dynamic_vpc_common.sh b/scripts/run_shortq_gnn_dynamic_vpc_common.sh
+new file mode 100755
+index 0000000..7fe81ea
+--- /dev/null
++++ b/scripts/run_shortq_gnn_dynamic_vpc_common.sh
+@@ -0,0 +1,369 @@
++#!/usr/bin/env bash
++set -Eeuo pipefail
++
++PROFILE="${KV_GNN_DYNAMIC_PROFILE:?wrapper must set KV_GNN_DYNAMIC_PROFILE}"
++REPO=/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
++VENV=/mnt/shared/gpfs/home/sriramc2/venvs/kvaware-vllm029
++RUN_ROOT=/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro
++DATASET_NAME=medical
++RETRIEVAL_TOP_K=5
++REQUEST_ORDER=legacy_prefix_hash
++PREFIX_SORT_DEPTH=2
++REQUEST_ORDER_SEED=0
++WARM_ORDER=reverse
++LMCACHE_CHUNK_SIZE=512
++LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT="${LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT:-2}"
++LMCACHE_MAX_WORKERS=8
++LMCACHE_MP_TIMEOUT=30
++FEATURE_MODEL=meta-llama/Llama-3.1-8B-Instruct
++CHECKPOINT="${REPO}/Hierarchical_KV/shortq_placement/model.pt"
++GNN_INFERENCE_BATCH_SIZE="${GNN_INFERENCE_BATCH_SIZE:-1}"
++
++# Independent ablation knobs. Standard vLLM prefix caching remains ON even when
++# KV_GNN_AWARE_VPC=0; only the learned retention bias is disabled.
++KV_GNN_AWARE_VPC="${KV_GNN_AWARE_VPC:-1}"
++KV_GNN_L1_BACKING="${KV_GNN_L1_BACKING:-1}"
++VLLM_GNN_AWARE_VPC_WINDOW="${VLLM_GNN_AWARE_VPC_WINDOW:-256}"
++
++for name in KV_GNN_AWARE_VPC KV_GNN_L1_BACKING; do
++  value="${!name}"
++  [[ "$value" == "0" || "$value" == "1" ]] || {
++    echo "ERROR: $name must be 0 or 1, got $value" >&2
++    exit 2
++  }
++done
++
++case "$PROFILE" in
++  h100_smoke)
++    CUDA_HOME=/usr/local/cuda-13.1
++    MODEL=meta-llama/Llama-3.3-70B-Instruct
++    TP=2; QUANTIZATION=fp8; GPU_UTIL=0.65; MAX_SEQS=16
++    L1_GB=200; L2_WORKERS=8
++    NUM_QUESTIONS="${NUM_QUESTIONS:-96}"
++    SUBMISSION_BATCH_SIZE="${SUBMISSION_BATCH_SIZE:-$NUM_QUESTIONS}"
++    MIN_TOKENS="${MIN_TOKENS:-32}"; MAX_TOKENS="${MAX_TOKENS:-128}"
++    RUN_LABEL=h100_shortq_gnn_dynamic_vpc_smoke
++    L2_DIR="/scratch2/sriramc2/lmcache_mp_l2/gnn_dynamic_vpc_smoke_${SLURM_JOB_ID}"
++    SMOKE_FORCE_MIN_UNIQUE_PER_TIER="${SMOKE_FORCE_MIN_UNIQUE_PER_TIER:-2}"
++    ;;
++  h100_q650)
++    CUDA_HOME=/usr/local/cuda-13.1
++    MODEL=meta-llama/Llama-3.3-70B-Instruct
++    TP=2; QUANTIZATION=fp8; GPU_UTIL=0.65; MAX_SEQS=16
++    L1_GB=200; L2_WORKERS=8
++    NUM_QUESTIONS=650; SUBMISSION_BATCH_SIZE=650
++    MIN_TOKENS=128; MAX_TOKENS=512
++    RUN_LABEL=h100_shortq_gnn_dynamic_vpc_q650
++    L2_DIR="/scratch2/sriramc2/lmcache_mp_l2/gnn_dynamic_vpc_q650_${SLURM_JOB_ID}"
++    SMOKE_FORCE_MIN_UNIQUE_PER_TIER=0
++    ;;
++  *)
++    echo "unknown KV_GNN_DYNAMIC_PROFILE=$PROFILE" >&2
++    exit 2
++    ;;
++esac
++
++RUN_DIR="${RUN_ROOT}/${RUN_LABEL}_${SLURM_JOB_ID}"
++LOG_DIR="${RUN_DIR}/logs"
++RESULT_DIR="${RUN_DIR}/results"
++PLACEMENT_DIR="${RUN_DIR}/placement"
++RUNTIME_METADATA="${PLACEMENT_DIR}/runtime_hash_to_tier.json"
++VPC_IMPORTANCE_SIDECAR="${PLACEMENT_DIR}/vpc_importance_by_request.json"
++PLACEMENT_TRACE="${PLACEMENT_DIR}/gnn_chunk_placements.jsonl"
++HASH_PREDICTION_TRACE="${PLACEMENT_DIR}/gnn_hash_prediction_occurrences.jsonl"
++GNN_TIMING_TRACE="${PLACEMENT_DIR}/gnn_prediction_timing.jsonl"
++PLACEMENT_SUMMARY="${PLACEMENT_DIR}/gnn_placement_summary.json"
++CLEAN_OLD_LMCACHE="${CLEAN_OLD_LMCACHE:-1}"
++FOREIGN_MPS_MAX_MIB="${FOREIGN_MPS_MAX_MIB:-64}"
++
++clean_old_lmcache() {
++  if [[ "$CLEAN_OLD_LMCACHE" != "1" ]]; then
++    echo "Skipping old LMCache cleanup: CLEAN_OLD_LMCACHE=$CLEAN_OLD_LMCACHE"
++    return
++  fi
++  local root=/scratch2/sriramc2
++  [[ "$root" == "/scratch2/sriramc2" ]] || exit 12
++  echo "WARNING: deleting EVERYTHING under $root"
++  mkdir -p "$root"
++  find "$root" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
++}
++
++clean_old_lmcache
++mkdir -p "$LOG_DIR" "$RESULT_DIR" "$PLACEMENT_DIR" "$L2_DIR"
++
++cd "$REPO"
++source "${VENV}/bin/activate"
++export CUDA_HOME PATH="${CUDA_HOME}/bin:${PATH}" LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
++export CUDA_MPS_PIPE_DIRECTORY="/tmp/kvaware-no-mps-${USER}-${SLURM_JOB_ID}-DO-NOT-CREATE"
++export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false
++export HF_HOME=/mnt/shared/gpfs/home/sriramc2/.cache/huggingface
++
++check_gpu_exclusivity() {
++  local current_job="${SLURM_JOB_ID:-}"
++  [[ -n "$current_job" ]] || { echo "ERROR: SLURM_JOB_ID is not set"; return 1; }
++  [[ ! -e "$CUDA_MPS_PIPE_DIRECTORY" ]] || {
++    echo "ERROR: MPS bypass path unexpectedly exists: $CUDA_MPS_PIPE_DIRECTORY"
++    return 44
++  }
++
++  local bad=0
++  while IFS=',' read -r pid process gpu_uuid used_mem; do
++    pid="$(xargs <<<"$pid")"; process="$(xargs <<<"$process")"
++    used_mem="$(xargs <<<"$used_mem")"
++    [[ -n "$pid" ]] || continue
++    local owner cgroup
++    owner="$(ps -o user= -p "$pid" 2>/dev/null | xargs || true)"
++    cgroup="$(cat "/proc/$pid/cgroup" 2>/dev/null || true)"
++    echo "GPU process pid=$pid owner=${owner:-UNKNOWN} process=$process gpu=$gpu_uuid memory=${used_mem}MiB"
++    if grep -q "/job_${current_job}/" <<<"$cgroup"; then
++      echo "  verdict: current job"
++    elif [[ "$process" == *"nvidia-cuda-mps-server"* ]] && \
++         [[ "$used_mem" =~ ^[0-9]+$ ]] && (( used_mem <= FOREIGN_MPS_MAX_MIB )); then
++      echo "  verdict: small bypassed MPS residue"
++    elif [[ "$owner" == "root" ]]; then
++      echo "  verdict: root/system process"
++    else
++      echo "  verdict: FAIL foreign CUDA client"
++      bad=1
++    fi
++  done < <(nvidia-smi --query-compute-apps=pid,process_name,gpu_uuid,used_memory --format=csv,noheader,nounits 2>/dev/null || true)
++  [[ "$bad" == "0" ]] || return 42
++}
++
++check_gpu_exclusivity || exit $?
++
++GNN_CHUNK_VOTE_POLICY="$(python - <<'PY'
++from Hierarchical_KV.shortq_placement.chunk_voting import selected_vote_policy_name
++print(selected_vote_policy_name())
++PY
++)"
++
++# Keep old fixed-L0 and historical request-local importance paths explicitly off.
++export VLLM_KV_IMPORTANCE_ENABLE=0
++export VLLM_GNN_AWARE_VPC="$KV_GNN_AWARE_VPC"
++export VLLM_GNN_AWARE_VPC_WINDOW
++export VLLM_KV_IMPORTANCE_TIERS="$VPC_IMPORTANCE_SIDECAR"
++export LMCACHE_GNN_EXCLUSIVE_PLACEMENT=0
++export LMCACHE_GNN_DYNAMIC_STORE=1
++export LMCACHE_GNN_L1_BACKING="$KV_GNN_L1_BACKING"
++export LMCACHE_GNN_PLACEMENT_METADATA="$RUNTIME_METADATA"
++export LMCACHE_L0_SMOKE_STORE=0
++export LMCACHE_L0_VPC_IMITATION=0
++
++export VLLM_KV_RECOMPUTE_DEBUG=1
++export LMCACHE_KV_ACCOUNTING_DEBUG=1
++export LMCACHE_PREFETCH_LIFETIME_DEBUG=1 LMCACHE_PREFETCH_LIFETIME_WARN_S=30
++export LMCACHE_MP_STAGE1_FRESHNESS_GUARD_S=270
++export LMCACHE_MP_CONGESTION_DEBUG=1 LMCACHE_MP_CONGESTION_LOG_EVERY=25 LMCACHE_MP_CONGESTION_SLOW_S=5
++export LMCACHE_MP_CHTHM_DEBUG=1
++export LMCACHE_CHUNK_SIZE
++
++LMCACHE_PID=""; VLLM_PID=""
++cleanup() {
++  set +e
++  for pid in "$VLLM_PID" "$LMCACHE_PID"; do
++    [[ -n "$pid" ]] || continue
++    kill -TERM "$pid" 2>/dev/null || true
++    sleep 2
++    kill -KILL "$pid" 2>/dev/null || true
++    wait "$pid" 2>/dev/null || true
++  done
++}
++trap cleanup EXIT
++
++wait_tcp() {
++  local port=$1 pid=$2 limit=$3 start=$SECONDS
++  while (( SECONDS-start < limit )); do
++    kill -0 "$pid" 2>/dev/null || return 1
++    python - "$port" <<'PY' >/dev/null 2>&1 && return 0
++import socket, sys
++s=socket.socket(); s.settimeout(.25)
++r=s.connect_ex(('127.0.0.1', int(sys.argv[1]))); s.close()
++raise SystemExit(0 if r == 0 else 1)
++PY
++    sleep 1
++  done
++  return 1
++}
++
++wait_health() {
++  local pid=$1 limit=$2 start=$SECONDS
++  while (( SECONDS-start < limit )); do
++    kill -0 "$pid" 2>/dev/null || return 1
++    curl -sf http://127.0.0.1:8000/health >/dev/null && return 0
++    sleep 2
++  done
++  return 1
++}
++
++cat > "${RUN_DIR}/run_config.json" <<JSON
++{
++  "profile": "$PROFILE",
++  "model": "$MODEL",
++  "feature_model": "$FEATURE_MODEL",
++  "questions": $NUM_QUESTIONS,
++  "tp": $TP,
++  "gpu_memory_utilization": $GPU_UTIL,
++  "max_num_seqs": $MAX_SEQS,
++  "l0_enabled": false,
++  "l1_gb": $L1_GB,
++  "chunk_size": $LMCACHE_CHUNK_SIZE,
++  "prefetch_max_in_flight": $LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT,
++  "vpc": true,
++  "gnn_aware_vpc": $KV_GNN_AWARE_VPC,
++  "gnn_aware_vpc_window": $VLLM_GNN_AWARE_VPC_WINDOW,
++  "gnn_l1_backing": $KV_GNN_L1_BACKING,
++  "placement": "shortq_dynamic_vpc_plus_lower_backing",
++  "chunk_vote_policy": "$GNN_CHUNK_VOTE_POLICY",
++  "runtime_metadata": "$RUNTIME_METADATA",
++  "vpc_importance_sidecar": "$VPC_IMPORTANCE_SIDECAR",
++  "gnn_inference_batch_size": $GNN_INFERENCE_BATCH_SIZE,
++  "smoke_force_min_unique_per_tier": $SMOKE_FORCE_MIN_UNIQUE_PER_TIER
++}
++JSON
++
++echo "===== SHORT-Q PRECOMPUTE ($PROFILE) ====="
++python experiments/precompute_shortq_placements.py \
++  --dataset_name "$DATASET_NAME" --max_questions "$NUM_QUESTIONS" --retrieval_top_k "$RETRIEVAL_TOP_K" \
++  --request_order "$REQUEST_ORDER" --prefix_sort_depth "$PREFIX_SORT_DEPTH" --request_order_seed "$REQUEST_ORDER_SEED" \
++  --serving_model "$MODEL" --feature_model "$FEATURE_MODEL" --checkpoint "$CHECKPOINT" \
++  --chunk_size "$LMCACHE_CHUNK_SIZE" --max_seq_len 8000 --device cuda:0 \
++  --inference_batch_size "$GNN_INFERENCE_BATCH_SIZE" \
++  --runtime_metadata "$RUNTIME_METADATA" --vpc_importance_sidecar "$VPC_IMPORTANCE_SIDECAR" \
++  --placement_trace "$PLACEMENT_TRACE" --hash_prediction_trace "$HASH_PREDICTION_TRACE" \
++  --timing_trace "$GNN_TIMING_TRACE" --summary "$PLACEMENT_SUMMARY" \
++  --smoke_force_min_unique_per_tier "$SMOKE_FORCE_MIN_UNIQUE_PER_TIER" \
++  > "${LOG_DIR}/gnn_precompute.log" 2>&1
++
++python - "$RUNTIME_METADATA" "$VPC_IMPORTANCE_SIDECAR" "$PLACEMENT_SUMMARY" <<'PY'
++import json, sys
++runtime=json.load(open(sys.argv[1])); sidecar=json.load(open(sys.argv[2])); summary=json.load(open(sys.argv[3]))
++assert runtime and all(v in {'L0','L1','L2'} for v in runtime.values())
++assert len(sidecar) == summary['requests']
++valid={'gpu','cpu','disk'}
++assert all(all(v in valid for v in blocks.values()) for blocks in sidecar.values())
++print('placement_entries', len(runtime))
++print('tier_counts', summary['unique_runtime_tier_counts'])
++print('vpc_sidecar_requests', len(sidecar))
++PY
++
++L2_JSON=$(python - "$L2_DIR" "$L2_WORKERS" <<'PY'
++import json,sys
++print(json.dumps({'type':'fs_native','base_path':sys.argv[1],'num_workers':int(sys.argv[2]),'use_odirect':False}))
++PY
++)
++
++echo "===== START LMCACHE (L0 OFF) ====="
++lmcache server --host localhost --port 5556 --chunk-size "$LMCACHE_CHUNK_SIZE" \
++  --l1-size-gb "$L1_GB" \
++  --l2-prefetch-max-in-flight "$LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT" \
++  --l2-store-policy gnn_dynamic --eviction-policy LRU --max-workers "$LMCACHE_MAX_WORKERS" \
++  --l2-adapter "$L2_JSON" > "${LOG_DIR}/lmcache.log" 2>&1 &
++LMCACHE_PID=$!
++wait_tcp 5556 "$LMCACHE_PID" 240 || { tail -200 "${LOG_DIR}/lmcache.log"; exit 30; }
++curl -sf http://127.0.0.1:8080/metrics > "${RUN_DIR}/lmcache_metrics_before.txt" || true
++
++KV_CONFIG=$(python - "$LMCACHE_MP_TIMEOUT" <<'PY'
++import json,sys
++timeout=float(sys.argv[1])
++print(json.dumps({
++  'kv_connector':'LMCacheMPConnector',
++  'kv_connector_module_path':'lmcache.integration.vllm.lmcache_mp_connector',
++  'kv_role':'kv_both',
++  'kv_load_failure_policy':'recompute',
++  'kv_connector_extra_config':{
++    'lmcache.mp.host':'tcp://localhost',
++    'lmcache.mp.port':5556,
++    'lmcache.mp.mq_timeout':timeout,
++    'lmcache.mp.lookup_timeout':0.0,
++    'lmcache.mp.starvation_fallback':True,
++  },
++}))
++PY
++)
++
++VARGS=(
++  serve "$MODEL" --host 127.0.0.1 --port 8000 --dtype bfloat16
++  --tensor-parallel-size "$TP" --max-model-len 8000
++  --gpu-memory-utilization "$GPU_UTIL" --max-num-seqs "$MAX_SEQS"
++  --enable-chunked-prefill --disable-hybrid-kv-cache-manager
++  --enable-prefix-caching --kv-transfer-config "$KV_CONFIG"
++)
++[[ -z "$QUANTIZATION" ]] || VARGS+=(--quantization "$QUANTIZATION")
++
++echo "===== START VLLM (VPC ON, GPU_UTIL=$GPU_UTIL) ====="
++vllm "${VARGS[@]}" > "${LOG_DIR}/vllm.log" 2>&1 &
++VLLM_PID=$!
++wait_health "$VLLM_PID" 1500 || { tail -300 "${LOG_DIR}/vllm.log"; exit 40; }
++curl -sf http://127.0.0.1:8000/metrics > "${RUN_DIR}/metrics_before.txt" || true
++
++DARGS=(
++  --dataset_name "$DATASET_NAME" --max_questions "$NUM_QUESTIONS"
++  --retrieval_top_k "$RETRIEVAL_TOP_K" --llm_model "$MODEL"
++  --request_order "$REQUEST_ORDER" --prefix_sort_depth "$PREFIX_SORT_DEPTH"
++  --request_order_seed "$REQUEST_ORDER_SEED" --warm_order "$WARM_ORDER"
++  --submission_batch_size "$SUBMISSION_BATCH_SIZE"
++  --server_url http://127.0.0.1:8000 --request_timeout_s 7200
++  --temperature 0 --top_p 0.95 --min_tokens "$MIN_TOKENS" --max_tokens "$MAX_TOKENS"
++  --metrics_after_cold_path "${RUN_DIR}/metrics_after_cold.txt"
++  --deterministic_request_ids --output_dir "$RESULT_DIR"
++)
++
++echo "===== COLD + WARM WORKLOAD ====="
++CUDA_VISIBLE_DEVICES="" python experiments/mp_nognn_project.py "${DARGS[@]}" \
++  > "${LOG_DIR}/driver.log" 2>&1 || { tail -300 "${LOG_DIR}/driver.log"; exit 50; }
++
++sleep 5
++curl -sf http://127.0.0.1:8000/metrics > "${RUN_DIR}/metrics_after.txt" || true
++curl -sf http://127.0.0.1:8080/metrics > "${RUN_DIR}/lmcache_metrics_after.txt" || true
++
++python scripts/analyze_mp_congestion_chthm.py \
++  --lmcache-log "${LOG_DIR}/lmcache.log" --vllm-log "${LOG_DIR}/vllm.log" \
++  --results-dir "$RESULT_DIR" --output "${RUN_DIR}/mp_diag_summary.json" \
++  > "${RUN_DIR}/mp_diag_summary.txt" 2>&1 || true
++python scripts/analyze_vllm_phase_metrics.py \
++  --before "${RUN_DIR}/metrics_before.txt" --after-cold "${RUN_DIR}/metrics_after_cold.txt" \
++  --after-warm "${RUN_DIR}/metrics_after.txt" --output "${RUN_DIR}/vllm_phase_metrics.json" \
++  > "${RUN_DIR}/vllm_phase_metrics.txt" 2>&1 || true
++
++python - "$RESULT_DIR" "$PLACEMENT_SUMMARY" "$LOG_DIR" "$PROFILE" "$KV_GNN_AWARE_VPC" "$KV_GNN_L1_BACKING" <<'PY'
++import json, pathlib, re, sys
++results=pathlib.Path(sys.argv[1]); placement=json.load(open(sys.argv[2])); logs=pathlib.Path(sys.argv[3])
++profile=sys.argv[4]; aware=sys.argv[5]=='1'; backing=sys.argv[6]=='1'
++summary=json.load(open(results/'summary.json'))
++assert summary['cold']['successful']==summary['cold']['requests']
++assert summary['warm']['successful']==summary['warm']['requests']
++lm=(logs/'lmcache.log').read_text(errors='replace')
++vl=(logs/'vllm.log').read_text(errors='replace')
++assert '[GNN_DYNAMIC_STORE]' in lm, 'dynamic GNN store path never executed'
++assert '[GNN_DYNAMIC_L2_POLICY]' in lm, 'dynamic GNN L2 policy never executed'
++assert '[GNN_PLACEMENT_METADATA_MISS]' not in lm, 'placement metadata miss detected'
++assert 'Initialized LMCache L0 arena' not in lm, 'L0 unexpectedly initialized'
++if aware:
++    assert '[GNN_AWARE_VPC_INIT]' in vl, 'GNN-aware VPC was requested but not initialized'
++else:
++    assert '[GNN_AWARE_VPC_INIT]' not in vl, 'GNN-aware VPC initialized while gate is off'
++
++if profile.endswith('_smoke'):
++    counts=placement['unique_runtime_tier_counts']
++    assert all(counts.get(t,0) >= 2 for t in ('L0','L1','L2')), counts
++    if aware:
++        for tier in ('gpu','cpu','disk'):
++            assert f'[GNN_AWARE_VPC_LABEL] first_tier={tier}' in vl, f'missing VPC label {tier}'
++    if backing:
++        assert re.search(r'\[GNN_DYNAMIC_STORE\].*l1_backing=True.*reserved_gpu=[1-9]\d*', lm), \
++            'smoke never physically created an L1 backing copy for a GPU-labelled chunk'
++    else:
++        assert not re.search(r'\[GNN_DYNAMIC_STORE\].*reserved_gpu=[1-9]\d*', lm), \
++            'GPU-labelled chunks reached L1 while backing gate was off'
++    assert re.search(r'\[GNN_DYNAMIC_STORE\].*reserved_cpu=[1-9]\d*', lm), \
++        'smoke never persisted a CPU-labelled chunk in L1'
++    assert '[GNN_DYNAMIC_L2_COMMIT]' in lm, 'smoke never completed an L2 commit'
++    print('GNN_DYNAMIC_VPC_SMOKE_PASS')
++print('GNN_DYNAMIC_VPC_RUN_PASS')
++PY
++
++echo "===== RESULTS ====="
++cat "${RESULT_DIR}/summary.json"
++echo "placement:"; cat "$PLACEMENT_SUMMARY"
++echo "run_dir=$RUN_DIR"
+diff --git a/scripts/submit_h100_shortq_gnn_dynamic_vpc.sh b/scripts/submit_h100_shortq_gnn_dynamic_vpc.sh
+new file mode 100755
+index 0000000..2fb1a06
+--- /dev/null
++++ b/scripts/submit_h100_shortq_gnn_dynamic_vpc.sh
+@@ -0,0 +1,11 @@
++#!/usr/bin/env bash
++set -Eeuo pipefail
++
++# Submit the functional smoke first; Q650 starts only if the smoke exits 0.
++# The two feature gates are inherited by both jobs and can be independently set:
++#   KV_GNN_AWARE_VPC=0/1
++#   KV_GNN_L1_BACKING=0/1
++SMOKE_JOB=$(sbatch --parsable scripts/run_h100_shortq_gnn_dynamic_vpc_smoke.sbatch)
++Q650_JOB=$(sbatch --parsable --dependency="afterok:${SMOKE_JOB}" scripts/run_h100_shortq_gnn_dynamic_vpc_q650.sbatch)
++echo "smoke_job=${SMOKE_JOB}"
++echo "q650_job=${Q650_JOB} dependency=afterok:${SMOKE_JOB}"
+diff --git a/third_party/LMCache/lmcache/v1/distributed/storage_controllers/store_policy.py b/third_party/LMCache/lmcache/v1/distributed/storage_controllers/store_policy.py
+index f478ce9..ec6f863 100644
+--- a/third_party/LMCache/lmcache/v1/distributed/storage_controllers/store_policy.py
++++ b/third_party/LMCache/lmcache/v1/distributed/storage_controllers/store_policy.py
+@@ -243,3 +243,44 @@ class GNNExclusiveStorePolicy(StorePolicy):
+ 
+ 
+ register_store_policy("gnn_exclusive", GNNExclusiveStorePolicy)
++
++
++class GNNDynamicStorePolicy(StorePolicy):
++    """Persistent policy for GNN-aware dynamic VPC.
++
++    Logical GPU/L0 and CPU/L1 objects that reach host memory stay in L1.
++    Logical disk/L2 objects are committed to L2 and their L1 staging copies are
++    removed. Whether logical GPU/L0 objects are copied to host at all is decided
++    independently by ``LMCACHE_GNN_L1_BACKING`` in the transfer path.
++    """
++
++    def select_store_targets(
++        self,
++        keys: list[ObjectKey],
++        adapters: list[AdapterDescriptor],
++    ) -> dict[int, list[ObjectKey]]:
++        from lmcache.v1.distributed.placement_metadata import get_chunk_placement
++
++        l2_keys = [key for key in keys if get_chunk_placement(key.chunk_hash) == "L2"]
++        persistent_l1 = len(keys) - len(l2_keys)
++        logger.info(
++            "[GNN_DYNAMIC_L2_POLICY] candidates=%d persistent_l1=%d "
++            "l2_targets=%d adapters=%d",
++            len(keys),
++            persistent_l1,
++            len(l2_keys),
++            len(adapters),
++        )
++        return {ad.index: list(l2_keys) for ad in adapters if l2_keys}
++
++    def select_l1_deletions(self, keys: list[ObjectKey]) -> list[ObjectKey]:
++        if keys:
++            logger.info(
++                "[GNN_DYNAMIC_L2_COMMIT] l2_keys=%d delete_l1_staging=%d",
++                len(keys),
++                len(keys),
++            )
++        return list(keys)
++
++
++register_store_policy("gnn_dynamic", GNNDynamicStorePolicy)
+diff --git a/third_party/LMCache/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py b/third_party/LMCache/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
+index fe6fa05..fba0711 100644
+--- a/third_party/LMCache/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
++++ b/third_party/LMCache/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
+@@ -63,6 +63,8 @@ def _env_flag(name: str, default: bool = False) -> bool:
+ _L0_SMOKE_STORE_ENABLED = _env_flag("LMCACHE_L0_SMOKE_STORE")
+ _L0_VPC_IMITATION_ENABLED = _env_flag("LMCACHE_L0_VPC_IMITATION")
+ _GNN_EXCLUSIVE_ENABLED = _env_flag("LMCACHE_GNN_EXCLUSIVE_PLACEMENT")
++_GNN_DYNAMIC_STORE_ENABLED = _env_flag("LMCACHE_GNN_DYNAMIC_STORE")
++_GNN_L1_BACKING_ENABLED = _env_flag("LMCACHE_GNN_L1_BACKING")
+ _L0_ROUTE_MODE = os.getenv("LMCACHE_L0_ROUTE_MODE", "all").strip().lower()
+ _L0_SMOKE_MOD = int(os.getenv("LMCACHE_L0_SMOKE_MOD", "4"))
+ _L0_SMOKE_TAKE = int(os.getenv("LMCACHE_L0_SMOKE_TAKE", "2"))
+@@ -72,10 +74,23 @@ if not 0 <= _L0_SMOKE_TAKE <= _L0_SMOKE_MOD:
+     raise ValueError(
+         "LMCACHE_L0_SMOKE_TAKE must be between 0 and LMCACHE_L0_SMOKE_MOD"
+     )
+-if sum(bool(x) for x in (_L0_VPC_IMITATION_ENABLED, _L0_SMOKE_STORE_ENABLED, _GNN_EXCLUSIVE_ENABLED)) > 1:
++if sum(
++    bool(x)
++    for x in (
++        _L0_VPC_IMITATION_ENABLED,
++        _L0_SMOKE_STORE_ENABLED,
++        _GNN_EXCLUSIVE_ENABLED,
++        _GNN_DYNAMIC_STORE_ENABLED,
++    )
++) > 1:
++    raise ValueError(
++        "LMCACHE_L0_VPC_IMITATION, LMCACHE_L0_SMOKE_STORE, "
++        "LMCACHE_GNN_EXCLUSIVE_PLACEMENT, and LMCACHE_GNN_DYNAMIC_STORE "
++        "are mutually exclusive"
++    )
++if _GNN_L1_BACKING_ENABLED and not _GNN_DYNAMIC_STORE_ENABLED:
+     raise ValueError(
+-        "LMCACHE_L0_VPC_IMITATION, LMCACHE_L0_SMOKE_STORE, and "
+-        "LMCACHE_GNN_EXCLUSIVE_PLACEMENT are mutually exclusive"
++        "LMCACHE_GNN_L1_BACKING requires LMCACHE_GNN_DYNAMIC_STORE=1"
+     )
+ if _L0_VPC_IMITATION_ENABLED and _L0_ROUTE_MODE not in {"all", "smoke"}:
+     raise ValueError(
+@@ -760,7 +775,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
+                 _L0_VPC_IMITATION_ENABLED and self._ctx.storage_manager.l0_enabled
+             )
+             gnn_exclusive = _GNN_EXCLUSIVE_ENABLED
++            gnn_dynamic = _GNN_DYNAMIC_STORE_ENABLED
+             gnn_target_counts = {"L0": 0, "L1": 0, "L2": 0}
++            gnn_host_reserved_counts = {"L0": 0, "L1": 0, "L2": 0}
+             global_start_chunk = key.start // self._ctx.chunk_size
+ 
+             if _L0_SMOKE_STORE_ENABLED and not self._ctx.storage_manager.l0_enabled:
+@@ -813,7 +830,62 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
+                         object_group_id=obj_group_id,
+                     )
+ 
+-                    if gnn_exclusive:
++                    if gnn_dynamic:
++                        target_tiers = [
++                            get_chunk_placement(k.chunk_hash) if not skip_mask[i] else "SKIP"
++                            for i, k in enumerate(obj_keys)
++                        ]
++                        if obj_group_id == 0:
++                            for tier in ("L0", "L1", "L2"):
++                                gnn_target_counts[tier] = sum(
++                                    1 for x in target_tiers if x == tier
++                                )
++
++                        # Dynamic VPC owns GPU residency. LMCache only supplies
++                        # lower-tier persistence. L1 backing independently adds
++                        # logical GPU/L0 chunks to the host-store set.
++                        host_tiers = {"L1", "L2"}
++                        if _GNN_L1_BACKING_ENABLED:
++                            host_tiers.add("L0")
++                        host_keys = [
++                            k
++                            for i, k in enumerate(obj_keys)
++                            if not skip_mask[i] and target_tiers[i] in host_tiers
++                        ]
++                        reserved_dict = self._ctx.storage_manager.reserve_write(
++                            host_keys, layout_desc, "new"
++                        )
++                        if obj_group_id == 0:
++                            tier_by_key = {
++                                k: target_tiers[i] for i, k in enumerate(obj_keys)
++                            }
++                            for reserved_key in reserved_dict:
++                                reserved_tier = tier_by_key[reserved_key]
++                                if reserved_tier in gnn_host_reserved_counts:
++                                    gnn_host_reserved_counts[reserved_tier] += 1
++                        all_l1_dict.update(reserved_dict)
++                        if reserved_dict:
++                            total_bytes += (
++                                next(iter(reserved_dict.values())).get_size()
++                                * len(reserved_dict)
++                            )
++
++                        host_memory_objs: list[MemoryObj | None] = [
++                            reserved_dict.get(obj_key) for obj_key in obj_keys
++                        ]
++                        if reserved_dict:
++                            transfer_kv_per_object_group(
++                                cache_context,
++                                block_ids_per_group_gpu,
++                                host_memory_objs,
++                                object_group_id=obj_group_id,
++                                batch_size=1,
++                                skip_first_n_tokens=0,
++                                direction=lmcache_native.TransferDirection.D2H,
++                                transfer_key=transfer_key,
++                            )
++
++                    elif gnn_exclusive:
+                         target_tiers = [
+                             get_chunk_placement(k.chunk_hash) if not skip_mask[i] else "SKIP"
+                             for i, k in enumerate(obj_keys)
+@@ -1071,6 +1143,29 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
+                         len(all_l1_dict),
+                         store_succeeded,
+                     )
++                if gnn_dynamic:
++                    logger.info(
++                        "[GNN_DYNAMIC_STORE] request_id=%s worker=%s "
++                        "global_chunks=[%d,%d) target_gpu=%d target_cpu=%d "
++                        "target_disk=%d l1_backing=%s host_reserved=%d "
++                        "reserved_gpu=%d reserved_cpu=%d reserved_disk=%d "
++                        "host_bytes=%d logical_stored=%d success=%s",
++                        key.request_id,
++                        key.worker_id,
++                        global_start_chunk,
++                        global_start_chunk + num_chunks,
++                        gnn_target_counts["L0"],
++                        gnn_target_counts["L1"],
++                        gnn_target_counts["L2"],
++                        _GNN_L1_BACKING_ENABLED,
++                        len(all_l1_dict),
++                        gnn_host_reserved_counts["L0"],
++                        gnn_host_reserved_counts["L1"],
++                        gnn_host_reserved_counts["L2"],
++                        sum(obj.get_size() for obj in all_l1_dict.values()),
++                        stored_count,
++                        store_succeeded,
++                    )
+                 if gnn_exclusive:
+                     logger.info(
+                         "[GNN_EXCLUSIVE_STORE] request_id=%s worker=%s "
+@@ -1100,7 +1195,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
+                         stored_count,
+                         store_succeeded,
+                     )
+-                num_tokens = num_chunks * self._ctx.chunk_size if stored_count else 0
++                num_tokens = (
++                    stored_count * self._ctx.chunk_size
++                    if gnn_dynamic
++                    else num_chunks * self._ctx.chunk_size if stored_count else 0
++                )
+                 self._ctx.event_bus.publish_on_stream(
+                     cache_context.cupy_stream,
+                     Event(
+diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
+index 83b5445..e64f26e 100644
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -169,8 +169,26 @@ class BlockPool:
+         metrics_collector: KVCacheMetricsCollector | None = None,
+     ):
+         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
+-        self.enable_kv_importance = os.environ.get("VLLM_KV_IMPORTANCE_ENABLE") == "1"
++        # Historical project hook: request-local release ordering only. Keep it
++        # available for old experiments, but do not conflate it with the new
++        # dynamic-VPC policy below.
++        self.enable_legacy_kv_importance = (
++            os.environ.get("VLLM_KV_IMPORTANCE_ENABLE") == "1"
++        )
++        # New experiment: preserve global LRU, but allow a bounded GNN bias when
++        # choosing among the oldest reclaimable cached blocks.
++        self.enable_gnn_aware_vpc = os.environ.get("VLLM_GNN_AWARE_VPC") == "1"
++        self.enable_kv_importance = (
++            self.enable_legacy_kv_importance or self.enable_gnn_aware_vpc
++        )
++        self.gnn_aware_vpc_window = int(
++            os.environ.get("VLLM_GNN_AWARE_VPC_WINDOW", "256")
++        )
++        if self.gnn_aware_vpc_window < 1:
++            raise ValueError("VLLM_GNN_AWARE_VPC_WINDOW must be >= 1")
+         self.kv_importance_by_block_id: dict[int, str] = {}
++        self._logged_importance_tiers: set[str] = set()
++        self._logged_gnn_bias = False
+         self.num_gpu_blocks = num_gpu_blocks
+         self.enable_caching = enable_caching
+         self.hash_block_size = hash_block_size
+@@ -198,19 +216,99 @@ class BlockPool:
+ 
+         self.metrics_collector = metrics_collector
+ 
++        if self.enable_gnn_aware_vpc:
++            logger.info(
++                "[GNN_AWARE_VPC_INIT] enabled=1 window=%d num_gpu_blocks=%d",
++                self.gnn_aware_vpc_window,
++                self.num_gpu_blocks,
++            )
++
++    @staticmethod
++    def _importance_rank(tier: str) -> int:
++        return {"disk": 0, "cpu": 1, "gpu": 2}.get(tier, 1)
++
+     def set_block_importance(self, block_id: int, tier: str) -> None:
+-        """Attach the project's weak disk/cpu/gpu priority label to a block."""
++        """Attach/merge the project's disk/cpu/gpu importance label.
++
++        Shared-prefix blocks can be encountered under more than one request.
++        For the dynamic-VPC experiment, retain the maximum observed importance
++        (gpu > cpu > disk) rather than allowing a later request to downgrade a
++        hot/shared block. Historical request-local mode keeps overwrite semantics.
++        """
+         if not self.enable_kv_importance:
+             return
+         if tier not in ("disk", "cpu", "gpu"):
+             return
+-        self.kv_importance_by_block_id[int(block_id)] = tier
++        block_id = int(block_id)
++        if self.enable_gnn_aware_vpc:
++            previous = self.kv_importance_by_block_id.get(block_id)
++            if previous is None or self._importance_rank(tier) > self._importance_rank(previous):
++                self.kv_importance_by_block_id[block_id] = tier
++            if tier not in self._logged_importance_tiers:
++                self._logged_importance_tiers.add(tier)
++                logger.info(
++                    "[GNN_AWARE_VPC_LABEL] first_tier=%s block_id=%d", tier, block_id
++                )
++        else:
++            self.kv_importance_by_block_id[block_id] = tier
+ 
+     def get_block_importance_rank(self, block: KVCacheBlock) -> int:
+         if not self.enable_kv_importance:
+             return 1
+-        tier = self.kv_importance_by_block_id.get(block.block_id, "cpu")
+-        return {"disk": 0, "cpu": 1, "gpu": 2}.get(tier, 1)
++        tier = self.kv_importance_by_block_id.get(block.block_id)
++        if tier is None:
++            # New dynamic-VPC sidecars intentionally label only reusable full
++            # prompt blocks. Unlabelled tail/decode/foreign blocks receive no
++            # semantic retention bonus and are therefore the easiest victims
++            # inside the bounded old-LRU window.
++            return -1 if self.enable_gnn_aware_vpc else 1
++        return self._importance_rank(tier)
++
++    def _pop_gnn_aware_victim(self) -> KVCacheBlock:
++        """Pop one free block using bounded GNN-biased LRU.
++
++        Uncached blocks retain normal front-of-queue reuse priority. Once the
++        oldest free block is cached, inspect at most ``window`` consecutive
++        reclaimable cached blocks and choose the least-important tier within
++        that old window. Ties preserve LRU order. This intentionally prevents
++        semantic importance from dominating global recency.
++        """
++        head = self.free_block_queue.fake_free_list_head.next_free_block
++        tail = self.free_block_queue.fake_free_list_tail
++        if head is None or head is tail:
++            raise ValueError("No free blocks available")
++        if head.block_hash is None or not self.enable_caching:
++            return self.free_block_queue.popleft()
++
++        candidates: list[KVCacheBlock] = []
++        current = head
++        while current is not None and current is not tail:
++            if current.block_hash is None:
++                break
++            candidates.append(current)
++            if len(candidates) >= self.gnn_aware_vpc_window:
++                break
++            current = current.next_free_block
++
++        victim = min(candidates, key=self.get_block_importance_rank)
++        if victim is head:
++            return self.free_block_queue.popleft()
++
++        self.free_block_queue.remove(victim)
++        if not self._logged_gnn_bias:
++            self._logged_gnn_bias = True
++            logger.info(
++                "[GNN_AWARE_VPC_BIAS] window=%d oldest_block=%d oldest_tier=%s "
++                "selected_block=%d selected_tier=%s",
++                len(candidates),
++                head.block_id,
++                self.kv_importance_by_block_id.get(head.block_id, "unlabeled"),
++                victim.block_id,
++                self.kv_importance_by_block_id.get(
++                    victim.block_id, "unlabeled"
++                ),
++            )
++        return victim
+ 
+     def get_cached_block(
+         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
+@@ -675,18 +773,25 @@ class BlockPool:
+         if num_blocks > self.get_num_free_blocks():
+             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
+ 
+-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
++        if self.enable_gnn_aware_vpc and self.enable_caching:
++            ret = [self._pop_gnn_aware_victim() for _ in range(num_blocks)]
++        else:
++            ret = self.free_block_queue.popleft_n(num_blocks)
+ 
+         # In order to only iterate the list once, we duplicated code a bit
+         if self.enable_caching:
+             for block in ret:
+                 self._maybe_evict_cached_block(block)
++                # The old object's label was needed for victim selection, but the
++                # physical block is now being allocated to new content.
++                self.kv_importance_by_block_id.pop(block.block_id, None)
+                 assert block.ref_cnt == 0
+                 block.ref_cnt += 1
+                 if self.metrics_collector:
+                     self.metrics_collector.on_block_allocated(block)
+         else:
+             for block in ret:
++                self.kv_importance_by_block_id.pop(block.block_id, None)
+                 assert block.ref_cnt == 0
+                 block.ref_cnt += 1
+                 if self.metrics_collector:
+@@ -745,10 +850,12 @@ class BlockPool:
+             ordered_blocks: A list of blocks to free ordered by their eviction
+                 priority.
+         """
+-        # Preserve v0.29's cached-vs-uncached queue semantics, while using
+-        # project importance as a stable ordering within a request release.
++        # Preserve v0.29's cached-vs-uncached queue semantics. Historical
++        # importance mode reorders blocks only within one request release. The
++        # new GNN-aware VPC mode deliberately leaves release/LRU ordering intact
++        # and applies its bounded bias only when a cached victim is allocated.
+         blocks_list = list(ordered_blocks)
+-        if self.enable_kv_importance:
++        if self.enable_legacy_kv_importance and not self.enable_gnn_aware_vpc:
+             blocks_list.sort(key=self.get_block_importance_rank)
+ 
+         # Identify blocks with hash (LRU cache) and without it (never match APC)
+@@ -756,10 +863,10 @@ class BlockPool:
+         blocks_to_evict_first = []
+         for block in blocks_list:
+             block.ref_cnt -= 1
+-            if self.enable_kv_importance:
+-                # Preserve the historical weak/request-local behavior: the label
+-                # only influences this release ordering; it is not a global
+-                # tiered-LRU policy.
++            if self.enable_legacy_kv_importance and not self.enable_gnn_aware_vpc:
++                # Historical weak/request-local behavior: discard the label when
++                # the request releases the block. Dynamic VPC must retain it while
++                # the cached block sits reclaimable on the global free/LRU queue.
+                 self.kv_importance_by_block_id.pop(block.block_id, None)
+             if block.ref_cnt == 0 and not block.is_null:
+                 if block.block_hash is None or not self.enable_caching:
+diff --git a/vllm/v1/request.py b/vllm/v1/request.py
+index 13a9eba..de6a642 100644
+--- a/vllm/v1/request.py
++++ b/vllm/v1/request.py
+@@ -4,7 +4,9 @@
+ import enum
+ import json
+ import os
++import re
+ import time
++from functools import lru_cache
+ from collections import deque
+ from collections.abc import Callable, Mapping
+ from dataclasses import dataclass
+@@ -31,24 +33,61 @@ if TYPE_CHECKING:
+     from vllm.v1.core.kv_cache_utils import BlockHash
+ 
+ 
++@lru_cache(maxsize=4)
++def _read_kv_importance_sidecar(path: str) -> dict[str, Any]:
++    """Read a stable experiment sidecar once per engine process.
++
++    The Short-Q serving experiments generate this file before vLLM starts, so
++    it is immutable for the lifetime of the server. Caching avoids reopening
++    and reparsing a multi-request JSON file for every request.
++    """
++    try:
++        with open(path, encoding="utf-8") as f:
++            data = json.load(f)
++    except Exception:
++        return {}
++    return data if isinstance(data, dict) else {}
++
++
++def _kv_importance_sidecar_keys(request_id: str) -> list[str]:
++    """Return compatible lookup keys for externally assigned request IDs.
++
++    The OpenAI completion server prefixes an X-Request-Id with ``cmpl-``. The
++    project driver assigns IDs of the form ``kvaware-{cold,warm}-NNNNNN``; the
++    numeric suffix is the reordered source index used by Short-Q precompute.
++    Historical exact-request-id sidecars continue to work unchanged.
++    """
++    rid = str(request_id)
++    keys = [rid]
++    if rid.startswith("cmpl-"):
++        keys.append(rid[len("cmpl-") :])
++    for candidate in list(keys):
++        match = re.fullmatch(r"kvaware-(?:cold|warm)-(\d+)(?:[-_].*)?", candidate)
++        if match:
++            keys.append(str(int(match.group(1))))
++    # Preserve order while removing duplicates.
++    return list(dict.fromkeys(keys))
++
++
+ def _load_kv_importance_tiers(request_id: str) -> dict[int, str]:
+-    """Load project KV-importance tiers for one request, if configured.
++    """Load optional per-native-block GNN importance for one request.
+ 
+-    Historical sidecars store either a direct tier string or a record such as
+-    {"tier": "gpu", ...}. Accept both so the v0.29 port preserves the
+-    intended project semantics without depending on one sidecar encoding.
++    Historical sidecars may key directly by request ID and store either a tier
++    string or ``{"tier": ...}``. New Short-Q sidecars key by reordered source
++    index so cold and reverse-order warm requests share the same predictions.
+     """
+     path = os.environ.get("VLLM_KV_IMPORTANCE_TIERS")
+     if not path:
+         return {}
+ 
+-    try:
+-        with open(path, encoding="utf-8") as f:
+-            all_tiers = json.load(f)
+-    except Exception:
+-        return {}
++    all_tiers = _read_kv_importance_sidecar(path)
++    raw_tiers: Any = {}
++    for key in _kv_importance_sidecar_keys(request_id):
++        candidate = all_tiers.get(key)
++        if isinstance(candidate, dict):
++            raw_tiers = candidate
++            break
+ 
+-    raw_tiers = all_tiers.get(str(request_id), {})
+     tiers: dict[int, str] = {}
+     for key, value in raw_tiers.items():
+         if isinstance(value, dict):

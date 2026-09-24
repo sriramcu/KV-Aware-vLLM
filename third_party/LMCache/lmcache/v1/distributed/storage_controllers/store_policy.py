@@ -243,3 +243,44 @@ class GNNExclusiveStorePolicy(StorePolicy):
 
 
 register_store_policy("gnn_exclusive", GNNExclusiveStorePolicy)
+
+
+class GNNDynamicStorePolicy(StorePolicy):
+    """Persistent policy for GNN-aware dynamic VPC.
+
+    Logical GPU/L0 and CPU/L1 objects that reach host memory stay in L1.
+    Logical disk/L2 objects are committed to L2 and their L1 staging copies are
+    removed. Whether logical GPU/L0 objects are copied to host at all is decided
+    independently by ``LMCACHE_GNN_L1_BACKING`` in the transfer path.
+    """
+
+    def select_store_targets(
+        self,
+        keys: list[ObjectKey],
+        adapters: list[AdapterDescriptor],
+    ) -> dict[int, list[ObjectKey]]:
+        from lmcache.v1.distributed.placement_metadata import get_chunk_placement
+
+        l2_keys = [key for key in keys if get_chunk_placement(key.chunk_hash) == "L2"]
+        persistent_l1 = len(keys) - len(l2_keys)
+        logger.info(
+            "[GNN_DYNAMIC_L2_POLICY] candidates=%d persistent_l1=%d "
+            "l2_targets=%d adapters=%d",
+            len(keys),
+            persistent_l1,
+            len(l2_keys),
+            len(adapters),
+        )
+        return {ad.index: list(l2_keys) for ad in adapters if l2_keys}
+
+    def select_l1_deletions(self, keys: list[ObjectKey]) -> list[ObjectKey]:
+        if keys:
+            logger.info(
+                "[GNN_DYNAMIC_L2_COMMIT] l2_keys=%d delete_l1_staging=%d",
+                len(keys),
+                len(keys),
+            )
+        return list(keys)
+
+
+register_store_policy("gnn_dynamic", GNNDynamicStorePolicy)

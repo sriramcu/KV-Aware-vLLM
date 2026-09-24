@@ -4,7 +4,9 @@
 import enum
 import json
 import os
+import re
 import time
+from functools import lru_cache
 from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -31,24 +33,61 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import BlockHash
 
 
-def _load_kv_importance_tiers(request_id: str) -> dict[int, str]:
-    """Load project KV-importance tiers for one request, if configured.
+@lru_cache(maxsize=4)
+def _read_kv_importance_sidecar(path: str) -> dict[str, Any]:
+    """Read a stable experiment sidecar once per engine process.
 
-    Historical sidecars store either a direct tier string or a record such as
-    {"tier": "gpu", ...}. Accept both so the v0.29 port preserves the
-    intended project semantics without depending on one sidecar encoding.
+    The Short-Q serving experiments generate this file before vLLM starts, so
+    it is immutable for the lifetime of the server. Caching avoids reopening
+    and reparsing a multi-request JSON file for every request.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _kv_importance_sidecar_keys(request_id: str) -> list[str]:
+    """Return compatible lookup keys for externally assigned request IDs.
+
+    The OpenAI completion server prefixes an X-Request-Id with ``cmpl-``. The
+    project driver assigns IDs of the form ``kvaware-{cold,warm}-NNNNNN``; the
+    numeric suffix is the reordered source index used by Short-Q precompute.
+    Historical exact-request-id sidecars continue to work unchanged.
+    """
+    rid = str(request_id)
+    keys = [rid]
+    if rid.startswith("cmpl-"):
+        keys.append(rid[len("cmpl-") :])
+    for candidate in list(keys):
+        match = re.fullmatch(r"kvaware-(?:cold|warm)-(\d+)(?:[-_].*)?", candidate)
+        if match:
+            keys.append(str(int(match.group(1))))
+    # Preserve order while removing duplicates.
+    return list(dict.fromkeys(keys))
+
+
+def _load_kv_importance_tiers(request_id: str) -> dict[int, str]:
+    """Load optional per-native-block GNN importance for one request.
+
+    Historical sidecars may key directly by request ID and store either a tier
+    string or ``{"tier": ...}``. New Short-Q sidecars key by reordered source
+    index so cold and reverse-order warm requests share the same predictions.
     """
     path = os.environ.get("VLLM_KV_IMPORTANCE_TIERS")
     if not path:
         return {}
 
-    try:
-        with open(path, encoding="utf-8") as f:
-            all_tiers = json.load(f)
-    except Exception:
-        return {}
+    all_tiers = _read_kv_importance_sidecar(path)
+    raw_tiers: Any = {}
+    for key in _kv_importance_sidecar_keys(request_id):
+        candidate = all_tiers.get(key)
+        if isinstance(candidate, dict):
+            raw_tiers = candidate
+            break
 
-    raw_tiers = all_tiers.get(str(request_id), {})
     tiers: dict[int, str] = {}
     for key, value in raw_tiers.items():
         if isinstance(value, dict):

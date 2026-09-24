@@ -169,8 +169,26 @@ class BlockPool:
         metrics_collector: KVCacheMetricsCollector | None = None,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
-        self.enable_kv_importance = os.environ.get("VLLM_KV_IMPORTANCE_ENABLE") == "1"
+        # Historical project hook: request-local release ordering only. Keep it
+        # available for old experiments, but do not conflate it with the new
+        # dynamic-VPC policy below.
+        self.enable_legacy_kv_importance = (
+            os.environ.get("VLLM_KV_IMPORTANCE_ENABLE") == "1"
+        )
+        # New experiment: preserve global LRU, but allow a bounded GNN bias when
+        # choosing among the oldest reclaimable cached blocks.
+        self.enable_gnn_aware_vpc = os.environ.get("VLLM_GNN_AWARE_VPC") == "1"
+        self.enable_kv_importance = (
+            self.enable_legacy_kv_importance or self.enable_gnn_aware_vpc
+        )
+        self.gnn_aware_vpc_window = int(
+            os.environ.get("VLLM_GNN_AWARE_VPC_WINDOW", "256")
+        )
+        if self.gnn_aware_vpc_window < 1:
+            raise ValueError("VLLM_GNN_AWARE_VPC_WINDOW must be >= 1")
         self.kv_importance_by_block_id: dict[int, str] = {}
+        self._logged_importance_tiers: set[str] = set()
+        self._logged_gnn_bias = False
         self.num_gpu_blocks = num_gpu_blocks
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
@@ -198,19 +216,99 @@ class BlockPool:
 
         self.metrics_collector = metrics_collector
 
+        if self.enable_gnn_aware_vpc:
+            logger.info(
+                "[GNN_AWARE_VPC_INIT] enabled=1 window=%d num_gpu_blocks=%d",
+                self.gnn_aware_vpc_window,
+                self.num_gpu_blocks,
+            )
+
+    @staticmethod
+    def _importance_rank(tier: str) -> int:
+        return {"disk": 0, "cpu": 1, "gpu": 2}.get(tier, 1)
+
     def set_block_importance(self, block_id: int, tier: str) -> None:
-        """Attach the project's weak disk/cpu/gpu priority label to a block."""
+        """Attach/merge the project's disk/cpu/gpu importance label.
+
+        Shared-prefix blocks can be encountered under more than one request.
+        For the dynamic-VPC experiment, retain the maximum observed importance
+        (gpu > cpu > disk) rather than allowing a later request to downgrade a
+        hot/shared block. Historical request-local mode keeps overwrite semantics.
+        """
         if not self.enable_kv_importance:
             return
         if tier not in ("disk", "cpu", "gpu"):
             return
-        self.kv_importance_by_block_id[int(block_id)] = tier
+        block_id = int(block_id)
+        if self.enable_gnn_aware_vpc:
+            previous = self.kv_importance_by_block_id.get(block_id)
+            if previous is None or self._importance_rank(tier) > self._importance_rank(previous):
+                self.kv_importance_by_block_id[block_id] = tier
+            if tier not in self._logged_importance_tiers:
+                self._logged_importance_tiers.add(tier)
+                logger.info(
+                    "[GNN_AWARE_VPC_LABEL] first_tier=%s block_id=%d", tier, block_id
+                )
+        else:
+            self.kv_importance_by_block_id[block_id] = tier
 
     def get_block_importance_rank(self, block: KVCacheBlock) -> int:
         if not self.enable_kv_importance:
             return 1
-        tier = self.kv_importance_by_block_id.get(block.block_id, "cpu")
-        return {"disk": 0, "cpu": 1, "gpu": 2}.get(tier, 1)
+        tier = self.kv_importance_by_block_id.get(block.block_id)
+        if tier is None:
+            # New dynamic-VPC sidecars intentionally label only reusable full
+            # prompt blocks. Unlabelled tail/decode/foreign blocks receive no
+            # semantic retention bonus and are therefore the easiest victims
+            # inside the bounded old-LRU window.
+            return -1 if self.enable_gnn_aware_vpc else 1
+        return self._importance_rank(tier)
+
+    def _pop_gnn_aware_victim(self) -> KVCacheBlock:
+        """Pop one free block using bounded GNN-biased LRU.
+
+        Uncached blocks retain normal front-of-queue reuse priority. Once the
+        oldest free block is cached, inspect at most ``window`` consecutive
+        reclaimable cached blocks and choose the least-important tier within
+        that old window. Ties preserve LRU order. This intentionally prevents
+        semantic importance from dominating global recency.
+        """
+        head = self.free_block_queue.fake_free_list_head.next_free_block
+        tail = self.free_block_queue.fake_free_list_tail
+        if head is None or head is tail:
+            raise ValueError("No free blocks available")
+        if head.block_hash is None or not self.enable_caching:
+            return self.free_block_queue.popleft()
+
+        candidates: list[KVCacheBlock] = []
+        current = head
+        while current is not None and current is not tail:
+            if current.block_hash is None:
+                break
+            candidates.append(current)
+            if len(candidates) >= self.gnn_aware_vpc_window:
+                break
+            current = current.next_free_block
+
+        victim = min(candidates, key=self.get_block_importance_rank)
+        if victim is head:
+            return self.free_block_queue.popleft()
+
+        self.free_block_queue.remove(victim)
+        if not self._logged_gnn_bias:
+            self._logged_gnn_bias = True
+            logger.info(
+                "[GNN_AWARE_VPC_BIAS] window=%d oldest_block=%d oldest_tier=%s "
+                "selected_block=%d selected_tier=%s",
+                len(candidates),
+                head.block_id,
+                self.kv_importance_by_block_id.get(head.block_id, "unlabeled"),
+                victim.block_id,
+                self.kv_importance_by_block_id.get(
+                    victim.block_id, "unlabeled"
+                ),
+            )
+        return victim
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -675,18 +773,25 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        if self.enable_gnn_aware_vpc and self.enable_caching:
+            ret = [self._pop_gnn_aware_victim() for _ in range(num_blocks)]
+        else:
+            ret = self.free_block_queue.popleft_n(num_blocks)
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
             for block in ret:
                 self._maybe_evict_cached_block(block)
+                # The old object's label was needed for victim selection, but the
+                # physical block is now being allocated to new content.
+                self.kv_importance_by_block_id.pop(block.block_id, None)
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         else:
             for block in ret:
+                self.kv_importance_by_block_id.pop(block.block_id, None)
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
                 if self.metrics_collector:
@@ -745,10 +850,12 @@ class BlockPool:
             ordered_blocks: A list of blocks to free ordered by their eviction
                 priority.
         """
-        # Preserve v0.29's cached-vs-uncached queue semantics, while using
-        # project importance as a stable ordering within a request release.
+        # Preserve v0.29's cached-vs-uncached queue semantics. Historical
+        # importance mode reorders blocks only within one request release. The
+        # new GNN-aware VPC mode deliberately leaves release/LRU ordering intact
+        # and applies its bounded bias only when a cached victim is allocated.
         blocks_list = list(ordered_blocks)
-        if self.enable_kv_importance:
+        if self.enable_legacy_kv_importance and not self.enable_gnn_aware_vpc:
             blocks_list.sort(key=self.get_block_importance_rank)
 
         # Identify blocks with hash (LRU cache) and without it (never match APC)
@@ -756,10 +863,10 @@ class BlockPool:
         blocks_to_evict_first = []
         for block in blocks_list:
             block.ref_cnt -= 1
-            if self.enable_kv_importance:
-                # Preserve the historical weak/request-local behavior: the label
-                # only influences this release ordering; it is not a global
-                # tiered-LRU policy.
+            if self.enable_legacy_kv_importance and not self.enable_gnn_aware_vpc:
+                # Historical weak/request-local behavior: discard the label when
+                # the request releases the block. Dynamic VPC must retain it while
+                # the cached block sits reclaimable on the global free/LRU queue.
                 self.kv_importance_by_block_id.pop(block.block_id, None)
             if block.ref_cnt == 0 and not block.is_null:
                 if block.block_hash is None or not self.enable_caching:

@@ -366,6 +366,7 @@ def one_completion(
     top_p: float,
     timeout_s: float,
     payload_extras: dict[str, Any],
+    request_headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model": model,
@@ -384,6 +385,7 @@ def one_completion(
         resp = requests.post(
             endpoint,
             json=payload,
+            headers=request_headers,
             timeout=timeout_s,
         )
         elapsed = time.monotonic() - mono_start
@@ -454,6 +456,7 @@ def generate_in_submission_batches_http(
     phase_name: str,
     policy: RequestPolicy,
     result_file,
+    deterministic_request_ids: bool = False,
 ) -> tuple[list[dict[str, Any]], float]:
     """
     Match the legacy bounded-wave behavior.
@@ -494,6 +497,14 @@ def generate_in_submission_batches_http(
                     prompt_record=record.prompt_record,
                 )
 
+                request_headers = None
+                if deterministic_request_ids:
+                    request_headers = {
+                        "X-Request-Id": (
+                            f"kvaware-{phase_name}-{record.source_index:06d}"
+                        )
+                    }
+
                 future = pool.submit(
                     one_completion,
                     endpoint=endpoint,
@@ -505,6 +516,7 @@ def generate_in_submission_batches_http(
                     top_p=top_p,
                     timeout_s=request_timeout_s,
                     payload_extras=extras,
+                    request_headers=request_headers,
                 )
                 future_to_position[future] = pos
 
@@ -763,6 +775,14 @@ def parse_arguments():
         default="",
         help="Optional path for a Prometheus /metrics snapshot immediately after cold.",
     )
+    parser.add_argument(
+        "--deterministic_request_ids",
+        action="store_true",
+        help=(
+            "Send X-Request-Id=kvaware-{phase}-{reordered_source_index}; "
+            "used by GNN-aware VPC sidecar lookup."
+        ),
+    )
 
     return parser.parse_args()
 
@@ -798,6 +818,7 @@ def main():
                 "server_url": args.server_url,
                 "policy": "none",
                 "gnn_enabled": False,
+                "deterministic_request_ids": args.deterministic_request_ids,
                 "cuda_visible_devices": os.environ.get(
                     "CUDA_VISIBLE_DEVICES"
                 ),
@@ -946,6 +967,7 @@ def main():
                 phase_name="cold",
                 policy=policy,
                 result_file=f,
+                deterministic_request_ids=args.deterministic_request_ids,
             )
         )
 
@@ -996,6 +1018,7 @@ def main():
                 phase_name="warm",
                 policy=policy,
                 result_file=f,
+                deterministic_request_ids=args.deterministic_request_ids,
             )
         )
 
