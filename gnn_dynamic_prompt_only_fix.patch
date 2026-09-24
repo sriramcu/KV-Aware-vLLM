@@ -1,0 +1,35 @@
+--- a/third_party/LMCache/lmcache/integration/vllm/lmcache_mp_connector.py
++++ b/third_party/LMCache/lmcache/integration/vllm/lmcache_mp_connector.py
+@@ -524,19 +524,24 @@
+             os.getenv("LMCACHE_MP_STAGE1_FRESHNESS_GUARD_S", "0")
+         )
+         self._chthm_debug = os.getenv("LMCACHE_MP_CHTHM_DEBUG", "0") == "1"
+-        # GNN exclusive placement is a prompt-KV placement experiment. The
+-        # GNN sidecar contains decisions only for chunks that are complete in
++        # Both GNN placement modes are prompt-KV placement experiments. The
++        # GNN sidecars contain decisions only for chunks that are complete in
+         # the original prompt, so do not allow decode tokens to complete a
+         # partial prompt-tail chunk and turn it into an unpredicted store.
+-        self._gnn_prompt_only_store = (
+-            os.getenv("LMCACHE_GNN_EXCLUSIVE_PLACEMENT", "0").strip().lower()
+-            in {"1", "true", "yes", "on"}
++        # Keep this independent of physical L0: dynamic-VPC mode needs the same
++        # prompt-only persistence invariant even when L0 is completely disabled.
++        _true_values = {"1", "true", "yes", "on"}
++        self._gnn_prompt_only_store = any(
++            os.getenv(name, "0").strip().lower() in _true_values
++            for name in (
++                "LMCACHE_GNN_EXCLUSIVE_PLACEMENT",
++                "LMCACHE_GNN_DYNAMIC_STORE",
++            )
+         )
+         if self._gnn_prompt_only_store and self.role == KVConnectorRole.SCHEDULER:
+             logger.info(
+-                "GNN exclusive placement: persistence is capped at complete "
+-                "original-prompt LMCache chunks; decode-completed tail chunks "
+-                "will not be stored"
++                "GNN prompt-only persistence: capped at complete original-prompt "
++                "LMCache chunks; decode-completed tail chunks will not be stored"
+             )
+ 
+         # Multi-server: prefer lmcache.mp.server_urls (list or comma-separated
