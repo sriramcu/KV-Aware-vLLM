@@ -1,0 +1,13 @@
+# From the repo root
+patch -p1 < /path/to/0001-shortq-inference-batching.patch
+cp /path/to/run_l40_shortq_gnn_batch_sweep.sbatch scripts/
+cp /path/to/run_l40_compare_nognn_vs_gnn.sbatch scripts/
+
+# Fast Q96 sweep on one L40
+sbatch scripts/run_l40_shortq_gnn_batch_sweep.sbatch 1,2,4,8 96
+
+# Optional larger confirmation sweep on Q650 after narrowing candidates
+sbatch scripts/run_l40_shortq_gnn_batch_sweep.sbatch 1,2,4,8 650
+
+# Full normal no-GNN vs full GNN comparison; pass the chosen GNN inference batch size
+sbatch scripts/run_l40_compare_nognn_vs_gnn.sbatch 4

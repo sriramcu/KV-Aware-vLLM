@@ -17,6 +17,7 @@ LMCACHE_MAX_WORKERS=8
 LMCACHE_MP_TIMEOUT=30
 FEATURE_MODEL=meta-llama/Llama-3.1-8B-Instruct
 CHECKPOINT="${REPO}/Hierarchical_KV/shortq_placement/model.pt"
+GNN_INFERENCE_BATCH_SIZE="${GNN_INFERENCE_BATCH_SIZE:-1}"
 
 case "$PROFILE" in
   h100_smoke)
@@ -27,26 +28,52 @@ case "$PROFILE" in
     NUM_QUESTIONS=96; SUBMISSION_BATCH_SIZE=96; MIN_TOKENS=32; MAX_TOKENS=128
     RUN_LABEL=h100_shortq_gnn_smoke
     L2_DIR="/scratch2/sriramc2/lmcache_mp_l2/gnn_h100_smoke_${SLURM_JOB_ID}"
-    SMOKE_FORCE_MIN_UNIQUE_PER_TIER=2
+    SMOKE_FORCE_MIN_UNIQUE_PER_TIER="${SMOKE_FORCE_MIN_UNIQUE_PER_TIER:-2}"
     ;;
   l40_smoke)
     CUDA_HOME=/usr/local/cuda-13.0
     MODEL=meta-llama/Llama-3.1-8B-Instruct
     TP=1; QUANTIZATION=""; GPU_UTIL=0.60; MAX_SEQS=12
     L0_GB=2; L1_GB=64; L2_WORKERS=4
-    NUM_QUESTIONS=96; SUBMISSION_BATCH_SIZE=96; MIN_TOKENS=32; MAX_TOKENS=128
+    NUM_QUESTIONS="${NUM_QUESTIONS:-96}"
+    SUBMISSION_BATCH_SIZE="${SUBMISSION_BATCH_SIZE:-$NUM_QUESTIONS}"
+    MIN_TOKENS="${MIN_TOKENS:-32}"
+    MAX_TOKENS="${MAX_TOKENS:-128}"
     RUN_LABEL=l40_shortq_gnn_smoke
     L2_DIR="${RUN_ROOT}/lmcache_mp_l2/gnn_l40_smoke_${SLURM_JOB_ID}"
-    SMOKE_FORCE_MIN_UNIQUE_PER_TIER=2
+    SMOKE_FORCE_MIN_UNIQUE_PER_TIER="${SMOKE_FORCE_MIN_UNIQUE_PER_TIER:-2}"
     ;;
   h100_q650)
     CUDA_HOME=/usr/local/cuda-13.1
     MODEL=meta-llama/Llama-3.3-70B-Instruct
     TP=2; QUANTIZATION=fp8; GPU_UTIL=0.60; MAX_SEQS=16
-    L0_GB=4; L1_GB=200; L2_WORKERS=8
+    L0_GB="${L0_GB:-4}"; L1_GB=200; L2_WORKERS=8
     NUM_QUESTIONS=650; SUBMISSION_BATCH_SIZE=650; MIN_TOKENS=128; MAX_TOKENS=512
     RUN_LABEL=h100_shortq_gnn_q650
     L2_DIR="/scratch2/sriramc2/lmcache_mp_l2/gnn_h100_q650_${SLURM_JOB_ID}"
+    SMOKE_FORCE_MIN_UNIQUE_PER_TIER="${SMOKE_FORCE_MIN_UNIQUE_PER_TIER:-0}"
+    ;;
+  l40_q200)
+    CUDA_HOME=/usr/local/cuda-13.0
+    MODEL=meta-llama/Llama-3.1-8B-Instruct
+    TP=1
+    QUANTIZATION=""
+    GPU_UTIL=0.60
+    MAX_SEQS=12
+
+    L0_GB=2
+    L1_GB=64
+    L2_WORKERS=4
+
+    NUM_QUESTIONS=200
+    SUBMISSION_BATCH_SIZE=200
+    MIN_TOKENS=32
+    MAX_TOKENS=128
+
+    RUN_LABEL=l40_shortq_gnn_q200_gpu6_cpu5
+    L2_DIR="${RUN_ROOT}/lmcache_mp_l2/gnn_l40_q200_gpu6_cpu5_${SLURM_JOB_ID}"
+
+    # Real performance experiment: never force placement tier coverage.
     SMOKE_FORCE_MIN_UNIQUE_PER_TIER=0
     ;;
   *) echo "unknown KV_GNN_PROFILE=$PROFILE" >&2; exit 2;;
@@ -59,10 +86,68 @@ PLACEMENT_TRACE="${PLACEMENT_DIR}/gnn_chunk_placements.jsonl"
 HASH_PREDICTION_TRACE="${PLACEMENT_DIR}/gnn_hash_prediction_occurrences.jsonl"
 GNN_TIMING_TRACE="${PLACEMENT_DIR}/gnn_prediction_timing.jsonl"
 PLACEMENT_SUMMARY="${PLACEMENT_DIR}/gnn_placement_summary.json"
+
+CLEAN_OLD_LMCACHE="${CLEAN_OLD_LMCACHE:-1}"
+
+clean_old_lmcache() {
+    if [[ "$CLEAN_OLD_LMCACHE" != "1" ]]; then
+        echo "Skipping old LMCache cleanup: CLEAN_OLD_LMCACHE=$CLEAN_OLD_LMCACHE"
+        return
+    fi
+
+    case "$PROFILE" in
+        h100_*)
+            # Match the existing H100 no-GNN clean-all behavior:
+            # preserve /scratch2/sriramc2 itself, delete EVERYTHING below it.
+            local root="/scratch2/sriramc2"
+
+            if [[ "$root" != "/scratch2/sriramc2" ]]; then
+                echo "ERROR: refusing destructive cleanup of unexpected scratch root: $root"
+                exit 12
+            fi
+
+            echo "WARNING: deleting EVERYTHING under $root"
+            mkdir -p "$root"
+            find "$root" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+            ;;
+
+        l40_*)
+            # L40 uses NFS. Delete all previous LMCache L2 runs,
+            # but do NOT touch the rest of RUN_ROOT.
+            local root="${RUN_ROOT}/lmcache_mp_l2"
+
+            if [[ "$root" != "/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/lmcache_mp_l2" ]]; then
+                echo "ERROR: refusing destructive cleanup of unexpected NFS LMCache root: $root"
+                exit 13
+            fi
+
+            echo "WARNING: deleting all old LMCache data under $root"
+            mkdir -p "$root"
+            find "$root" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+            ;;
+
+        *)
+            echo "ERROR: no cleanup policy for PROFILE=$PROFILE"
+            exit 14
+            ;;
+    esac
+}
+
+clean_old_lmcache
+
 mkdir -p "$LOG_DIR" "$RESULT_DIR" "$PLACEMENT_DIR" "$L2_DIR"
-rm -rf -- "$L2_DIR"/*
+
 cd "$REPO"
 source "${VENV}/bin/activate"
+
+GNN_CHUNK_VOTE_POLICY="$(
+python - <<'PY'
+from Hierarchical_KV.shortq_placement.chunk_voting import (
+    selected_vote_policy_name,
+)
+print(selected_vote_policy_name())
+PY
+)"
 export CUDA_HOME PATH="${CUDA_HOME}/bin:${PATH}" LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
 export CUDA_MPS_PIPE_DIRECTORY="/tmp/kvaware-no-mps-${USER}-${SLURM_JOB_ID}-DO-NOT-CREATE"
 export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false
@@ -98,7 +183,7 @@ sleep 1; done; return 1; }
 wait_health(){ local pid=$1 limit=$2 start=$SECONDS; while (( SECONDS-start < limit )); do kill -0 "$pid" 2>/dev/null || return 1; curl -sf http://127.0.0.1:8000/health >/dev/null && return 0; sleep 2; done; return 1; }
 
 cat > "${RUN_DIR}/run_config.json" <<JSON
-{"profile":"$PROFILE","model":"$MODEL","feature_model":"$FEATURE_MODEL","questions":$NUM_QUESTIONS,"tp":$TP,"gpu_memory_utilization":$GPU_UTIL,"max_num_seqs":$MAX_SEQS,"l0_gb":$L0_GB,"l1_gb":$L1_GB,"chunk_size":$LMCACHE_CHUNK_SIZE,"prefetch_max_in_flight":$LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT,"vpc":false,"placement":"shortq_argmax_drop+disk_to_L2_plurality_cold_tie_exclusive","runtime_metadata":"$RUNTIME_METADATA","hash_prediction_trace":"$HASH_PREDICTION_TRACE","gnn_timing_trace":"$GNN_TIMING_TRACE","smoke_force_min_unique_per_tier":$SMOKE_FORCE_MIN_UNIQUE_PER_TIER}
+{"profile":"$PROFILE","model":"$MODEL","feature_model":"$FEATURE_MODEL","questions":$NUM_QUESTIONS,"tp":$TP,"gpu_memory_utilization":$GPU_UTIL,"max_num_seqs":$MAX_SEQS,"l0_gb":$L0_GB,"l1_gb":$L1_GB,"chunk_size":$LMCACHE_CHUNK_SIZE,"prefetch_max_in_flight":$LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT,"vpc":false,"placement":"shortq_class_logits_exclusive", "chunk_vote_policy":"${GNN_CHUNK_VOTE_POLICY}","runtime_metadata":"$RUNTIME_METADATA","hash_prediction_trace":"$HASH_PREDICTION_TRACE","gnn_timing_trace":"$GNN_TIMING_TRACE","gnn_inference_batch_size":$GNN_INFERENCE_BATCH_SIZE,"smoke_force_min_unique_per_tier":$SMOKE_FORCE_MIN_UNIQUE_PER_TIER}
 JSON
 
 echo "===== SHORT-Q PRECOMPUTE ($PROFILE) ====="
@@ -106,7 +191,7 @@ python experiments/precompute_shortq_placements.py \
   --dataset_name "$DATASET_NAME" --max_questions "$NUM_QUESTIONS" --retrieval_top_k "$RETRIEVAL_TOP_K" \
   --request_order "$REQUEST_ORDER" --prefix_sort_depth "$PREFIX_SORT_DEPTH" --request_order_seed "$REQUEST_ORDER_SEED" \
   --serving_model "$MODEL" --feature_model "$FEATURE_MODEL" --checkpoint "$CHECKPOINT" --chunk_size "$LMCACHE_CHUNK_SIZE" \
-  --max_seq_len 8000 --device cuda:0 --runtime_metadata "$RUNTIME_METADATA" \
+  --max_seq_len 8000 --device cuda:0 --inference_batch_size "$GNN_INFERENCE_BATCH_SIZE" --runtime_metadata "$RUNTIME_METADATA" \
   --placement_trace "$PLACEMENT_TRACE" --hash_prediction_trace "$HASH_PREDICTION_TRACE" \
   --timing_trace "$GNN_TIMING_TRACE" --summary "$PLACEMENT_SUMMARY" \
   --smoke_force_min_unique_per_tier "$SMOKE_FORCE_MIN_UNIQUE_PER_TIER" \

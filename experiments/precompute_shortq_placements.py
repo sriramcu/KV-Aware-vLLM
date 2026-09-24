@@ -35,7 +35,11 @@ from experiments.mp_nognn_project import (  # noqa: E402
     reorder_requests,
 )
 from Hierarchical_KV.shortq_placement.block_prediction import get_block_predictions  # noqa: E402
-from Hierarchical_KV.shortq_placement.chunk_voting import vote_chunk_placement  # noqa: E402
+from Hierarchical_KV.shortq_placement.chunk_voting import (
+    make_block_tier_vote,
+    selected_vote_policy_name,
+    vote_chunk_placement,
+)
 from Hierarchical_KV.shortq_placement.duplicate_resolution import resolve_duplicate  # noqa: E402
 from Hierarchical_KV.shortq_placement.model import (  # noqa: E402
     load_ranker_from_checkpoint,
@@ -74,6 +78,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--chunk_size", type=int, default=512)
     p.add_argument("--max_seq_len", type=int, default=8000)
     p.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--inference_batch_size", type=int, default=1)
     p.add_argument("--runtime_metadata", required=True)
     p.add_argument("--placement_trace", required=True)
     p.add_argument("--hash_prediction_trace", required=True)
@@ -166,12 +171,35 @@ def _load_feature_model(name: str, device: torch.device):
 
 
 @torch.inference_mode()
-def _block_features(token_ids: list[int], model, device: torch.device, block_size: int):
-    ids = torch.tensor([token_ids], dtype=torch.long, device=device)
-    mask = torch.ones_like(ids, dtype=torch.bool)
+def _block_features_batch(
+    token_id_rows: list[list[int]],
+    model,
+    device: torch.device,
+    block_size: int,
+    pad_token_id: int,
+):
+    if not token_id_rows:
+        raise ValueError("empty inference batch")
+    max_len = max(len(row) for row in token_id_rows)
+    ids = torch.full(
+        (len(token_id_rows), max_len),
+        int(pad_token_id),
+        dtype=torch.long,
+        device=device,
+    )
+    mask = torch.zeros_like(ids, dtype=torch.bool)
+    for i, row in enumerate(token_id_rows):
+        n = len(row)
+        ids[i, :n] = torch.tensor(row, dtype=torch.long, device=device)
+        mask[i, :n] = True
     backbone = getattr(model, "model", None)
     if backbone is None:
-        out = model(input_ids=ids, attention_mask=mask.long(), output_hidden_states=True, use_cache=False)
+        out = model(
+            input_ids=ids,
+            attention_mask=mask.long(),
+            output_hidden_states=True,
+            use_cache=False,
+        )
         hidden = out.hidden_states[-1].float()
     else:
         out = backbone(input_ids=ids, attention_mask=mask.long(), use_cache=False)
@@ -330,142 +358,251 @@ def main() -> None:
     class_occurrences = Counter()
 
     max_retrieved = int(cfg["max_retrieved"])
-    inference_started = time.monotonic()
-    for request_order_index, (prompt, record) in enumerate(zip(prompts, records, strict=True)):
-        request_t0 = time.perf_counter()
-        tok_t0 = time.perf_counter()
-        serving_ids = serving_tok.encode(prompt, add_special_tokens=True)
-        feature_ids = feature_tok.encode(prompt, add_special_tokens=True)
-        tokenization_seconds = time.perf_counter() - tok_t0
-        source_index = int(record.get("source_index", request_order_index))
-        if serving_ids != feature_ids:
-            first = next((i for i, (a, b) in enumerate(zip(serving_ids, feature_ids)) if a != b), None)
-            raise RuntimeError(
-                f"serving/feature tokenizer mismatch at source_index={source_index}, "
-                f"request_order_index={request_order_index}, first_diff={first}, "
-                f"serving_len={len(serving_ids)}, feature_len={len(feature_ids)}"
-            )
-        exact_alignment_requests += 1
-        if len(serving_ids) > args.max_seq_len:
-            raise RuntimeError(
-                f"prompt {source_index} has {len(serving_ids)} tokens > max_seq_len={args.max_seq_len}; "
-                "do not silently truncate placement relative to serving"
-            )
+    if args.inference_batch_size < 1:
+        raise ValueError("--inference_batch_size must be >= 1")
+    pad_token_id = feature_tok.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = feature_tok.eos_token_id
+    if pad_token_id is None:
+        pad_token_id = 0
 
-        (block_features, block_mask), feature_seconds = _timed(
-            device, lambda: _block_features(serving_ids, feature_model, device, block_size)
+    batch_timing_rows: list[dict[str, Any]] = []
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    inference_started = time.monotonic()
+    for batch_start in range(0, len(prompts), args.inference_batch_size):
+        batch_end = min(batch_start + args.inference_batch_size, len(prompts))
+        batch_prompts = prompts[batch_start:batch_end]
+        batch_records = records[batch_start:batch_end]
+        serving_id_rows: list[list[int]] = []
+        tokenization_seconds_rows: list[float] = []
+        source_indices: list[int] = []
+
+        for local_index, (prompt, record) in enumerate(
+            zip(batch_prompts, batch_records, strict=True)
+        ):
+            request_order_index = batch_start + local_index
+            tok_t0 = time.perf_counter()
+            serving_ids = serving_tok.encode(prompt, add_special_tokens=True)
+            feature_ids = feature_tok.encode(prompt, add_special_tokens=True)
+            tokenization_seconds = time.perf_counter() - tok_t0
+            source_index = int(record.get("source_index", request_order_index))
+            if serving_ids != feature_ids:
+                first = next(
+                    (i for i, (a, b) in enumerate(zip(serving_ids, feature_ids)) if a != b),
+                    None,
+                )
+                raise RuntimeError(
+                    f"serving/feature tokenizer mismatch at source_index={source_index}, "
+                    f"request_order_index={request_order_index}, first_diff={first}, "
+                    f"serving_len={len(serving_ids)}, feature_len={len(feature_ids)}"
+                )
+            exact_alignment_requests += 1
+            if len(serving_ids) > args.max_seq_len:
+                raise RuntimeError(
+                    f"prompt {source_index} has {len(serving_ids)} tokens > max_seq_len={args.max_seq_len}; "
+                    "do not silently truncate placement relative to serving"
+                )
+            serving_id_rows.append(serving_ids)
+            tokenization_seconds_rows.append(tokenization_seconds)
+            source_indices.append(source_index)
+
+        (batch_block_features, batch_block_mask), batch_feature_seconds = _timed(
+            device,
+            lambda: _block_features_batch(
+                serving_id_rows,
+                feature_model,
+                device,
+                block_size,
+                pad_token_id,
+            ),
         )
-        if block_features.shape[-1] != int(cfg["llm_feat_dim"]):
-            raise ValueError(f"feature dim {block_features.shape[-1]} != checkpoint {cfg['llm_feat_dim']}")
-        recency, passage_ids = recency_and_passage_ids(block_mask, max_retrieved)
+        if batch_block_features.shape[-1] != int(cfg["llm_feat_dim"]):
+            raise ValueError(
+                f"feature dim {batch_block_features.shape[-1]} != checkpoint {cfg['llm_feat_dim']}"
+            )
+        recency, passage_ids = recency_and_passage_ids(batch_block_mask, max_retrieved)
         retrieved = torch.tensor(
-            [_retrieved_indices(record, passage_text_to_hash, node_to_idx, max_retrieved)],
+            [
+                _retrieved_indices(record, passage_text_to_hash, node_to_idx, max_retrieved)
+                for record in batch_records
+            ],
             dtype=torch.long,
             device=device,
         )
         with torch.inference_mode():
-            (class_logits, rank_scores), gnn_forward_seconds = _timed(
+            (batch_class_logits, batch_rank_scores), batch_gnn_forward_seconds = _timed(
                 device,
                 lambda: ranker.forward_blocks(
-                    block_features, block_mask, recency, passage_ids, node_repr, retrieved
+                    batch_block_features,
+                    batch_block_mask,
+                    recency,
+                    passage_ids,
+                    node_repr,
+                    retrieved,
                 ),
             )
 
-        post_t0 = time.perf_counter()
-        valid_blocks = int(block_mask[0].sum().item())
-        class_ids = get_block_predictions(
-            class_logits[0, :valid_blocks], rank_scores[0, :valid_blocks]
-        ).tolist()
-        class_occurrences.update(int(x) for x in class_ids)
-        mapped = map_block_predictions_to_tiers(class_ids)
-        hashes = hasher.compute_chunk_hashes(serving_ids)
-        full_chunks = len(serving_ids) // args.chunk_size
-        if len(hashes) != full_chunks:
-            raise AssertionError("TokenHasher full-chunk count mismatch")
-
-        for chunk_index, chunk_hash in enumerate(hashes):
-            h = chunk_hash.hex()
-            cached = lookup_prediction(h)
-            if cached is not None:
-                cache_hits += 1
-                candidate = cached
-            else:
-                lo = chunk_index * blocks_per_chunk
-                hi = lo + blocks_per_chunk
-                block_tiers = mapped[lo:hi]
-                if len(block_tiers) != blocks_per_chunk:
-                    raise RuntimeError("full LMCache chunk did not have 32 aligned block predictions")
-                candidate = vote_chunk_placement(block_tiers)
-                store_prediction(h, candidate)
-            previous = runtime.get(h)
-            resolved = resolve_duplicate(previous, candidate)
-            conflict = previous is not None and previous != candidate
-            if conflict:
-                conflict_occurrences += 1
-            runtime[h] = resolved
-            candidate_by_hash[h][candidate] += 1
-            occurrence_tiers.append(candidate)
-            class_slice = class_ids[
-                chunk_index * blocks_per_chunk : (chunk_index + 1) * blocks_per_chunk
-            ]
-            tier_slice = mapped[
-                chunk_index * blocks_per_chunk : (chunk_index + 1) * blocks_per_chunk
-            ]
-            occurrences.append(
-                {
-                    "source_index": source_index,
-                    "request_order_index": request_order_index,
-                    "chunk_index": chunk_index,
-                    "chunk_hash": h,
-                    "candidate_tier": candidate,
-                    "runtime_tier": resolved,
-                    "duplicate_conflict": conflict,
-                    "block_class_counts": {
-                        CLASS_NAMES[i]: sum(1 for x in class_slice if int(x) == i)
-                        for i in range(4)
-                    },
-                    "block_tier_counts": _counter_dict(tier_slice),
-                }
-            )
-            hash_prediction_rows.append(
-                {
-                    "chunk_hash": h,
-                    "source_index": source_index,
-                    "request_order_index": request_order_index,
-                    "chunk_index": chunk_index,
-                    "prediction": candidate,
-                    "duplicate_conflict": conflict,
-                }
-            )
-
-        postprocess_seconds = time.perf_counter() - post_t0
-        total_prediction_seconds = time.perf_counter() - request_t0
-        timing_row = {
-            "source_index": source_index,
-            "request_order_index": request_order_index,
-            "prompt_tokens": len(serving_ids),
-            "full_chunks": full_chunks,
-            "tokenization_alignment_seconds": tokenization_seconds,
-            "feature_extraction_seconds": feature_seconds,
-            "gnn_forward_seconds": gnn_forward_seconds,
-            "postprocess_seconds": postprocess_seconds,
-            "total_prediction_pipeline_seconds": total_prediction_seconds,
-        }
-        timing_rows.append(timing_row)
-        print(
-            f"[SHORTQ_GNN_TIMING] source_index={source_index} request_order_index={request_order_index} "
-            f"tokens={len(serving_ids)} feature_s={feature_seconds:.6f} "
-            f"gnn_forward_s={gnn_forward_seconds:.6f} postprocess_s={postprocess_seconds:.6f} "
-            f"total_prediction_s={total_prediction_seconds:.6f}",
-            flush=True,
+        batch_size_actual = len(batch_prompts)
+        amortized_feature_seconds = batch_feature_seconds / batch_size_actual
+        amortized_gnn_forward_seconds = batch_gnn_forward_seconds / batch_size_actual
+        batch_timing_rows.append(
+            {
+                "batch_start": batch_start,
+                "batch_size": batch_size_actual,
+                "max_prompt_tokens": max(len(x) for x in serving_id_rows),
+                "prompt_tokens": sum(len(x) for x in serving_id_rows),
+                "feature_extraction_seconds": batch_feature_seconds,
+                "gnn_forward_seconds": batch_gnn_forward_seconds,
+            }
         )
         print(
-            f"[SHORTQ_PLACEMENT] {request_order_index + 1}/{len(prompts)} tokens={len(serving_ids)} "
-            f"full_chunks={full_chunks} unique_hashes={len(runtime)} conflicts={conflict_occurrences}",
+            f"[SHORTQ_GNN_BATCH_TIMING] batch_start={batch_start} batch_size={batch_size_actual} "
+            f"max_tokens={max(len(x) for x in serving_id_rows)} "
+            f"feature_s={batch_feature_seconds:.6f} gnn_forward_s={batch_gnn_forward_seconds:.6f}",
             flush=True,
         )
+
+        for local_index, record in enumerate(batch_records):
+            request_order_index = batch_start + local_index
+            source_index = source_indices[local_index]
+            serving_ids = serving_id_rows[local_index]
+            tokenization_seconds = tokenization_seconds_rows[local_index]
+            block_mask = batch_block_mask[local_index : local_index + 1]
+            class_logits = batch_class_logits[local_index]
+            rank_scores = batch_rank_scores[local_index]
+
+            post_t0 = time.perf_counter()
+            valid_blocks = int(block_mask[0].sum().item())
+            class_ids = get_block_predictions(
+                class_logits[:valid_blocks], rank_scores[:valid_blocks]
+            ).tolist()
+            class_occurrences.update(int(x) for x in class_ids)
+            
+            # Preserve the normal argmax-derived L0/L1/L2 tier for every block,
+            # but attach whether CPU was among that block's top-2 class logits.
+            base_mapped = map_block_predictions_to_tiers(class_ids)
+
+            cpu_class_id = CLASS_NAMES.index("cpu")
+
+            top2_class_ids = torch.topk(
+                        class_logits[:valid_blocks],
+                        k=2,
+                        dim=-1,
+                    ).indices
+            cpu_top2_flags = (
+                (top2_class_ids == cpu_class_id)
+                .any(dim=-1)
+                .tolist()
+            )
+
+            mapped = [
+                make_block_tier_vote(
+                    tier,
+                    cpu_top2=cpu_top2_flags[i],
+                )
+                for i, tier in enumerate(base_mapped)
+            ]
+
+            hashes = hasher.compute_chunk_hashes(serving_ids)
+            full_chunks = len(serving_ids) // args.chunk_size
+            if len(hashes) != full_chunks:
+                raise AssertionError("TokenHasher full-chunk count mismatch")
+
+            for chunk_index, chunk_hash in enumerate(hashes):
+                h = chunk_hash.hex()
+                cached = lookup_prediction(h)
+                if cached is not None:
+                    cache_hits += 1
+                    candidate = cached
+                else:
+                    lo = chunk_index * blocks_per_chunk
+                    hi = lo + blocks_per_chunk
+                    block_tiers = mapped[lo:hi]
+                    if len(block_tiers) != blocks_per_chunk:
+                        raise RuntimeError(
+                            "full LMCache chunk did not have 32 aligned block predictions"
+                        )
+                    candidate = vote_chunk_placement(block_tiers)
+                    store_prediction(h, candidate)
+                previous = runtime.get(h)
+                resolved = resolve_duplicate(previous, candidate)
+                conflict = previous is not None and previous != candidate
+                if conflict:
+                    conflict_occurrences += 1
+                runtime[h] = resolved
+                candidate_by_hash[h][candidate] += 1
+                occurrence_tiers.append(candidate)
+                class_slice = class_ids[
+                    chunk_index * blocks_per_chunk : (chunk_index + 1) * blocks_per_chunk
+                ]
+                tier_slice = mapped[
+                    chunk_index * blocks_per_chunk : (chunk_index + 1) * blocks_per_chunk
+                ]
+                occurrences.append(
+                    {
+                        "source_index": source_index,
+                        "request_order_index": request_order_index,
+                        "chunk_index": chunk_index,
+                        "chunk_hash": h,
+                        "candidate_tier": candidate,
+                        "runtime_tier": resolved,
+                        "duplicate_conflict": conflict,
+                        "block_class_counts": {
+                            CLASS_NAMES[i]: sum(1 for x in class_slice if int(x) == i)
+                            for i in range(4)
+                        },
+                        "block_tier_counts": _counter_dict(tier_slice),
+                    }
+                )
+                hash_prediction_rows.append(
+                    {
+                        "chunk_hash": h,
+                        "source_index": source_index,
+                        "request_order_index": request_order_index,
+                        "chunk_index": chunk_index,
+                        "prediction": candidate,
+                        "duplicate_conflict": conflict,
+                    }
+                )
+
+            postprocess_seconds = time.perf_counter() - post_t0
+            total_prediction_seconds = (
+                tokenization_seconds
+                + amortized_feature_seconds
+                + amortized_gnn_forward_seconds
+                + postprocess_seconds
+            )
+            timing_row = {
+                "source_index": source_index,
+                "request_order_index": request_order_index,
+                "prompt_tokens": len(serving_ids),
+                "full_chunks": full_chunks,
+                "tokenization_alignment_seconds": tokenization_seconds,
+                "feature_extraction_seconds": amortized_feature_seconds,
+                "gnn_forward_seconds": amortized_gnn_forward_seconds,
+                "postprocess_seconds": postprocess_seconds,
+                "total_prediction_pipeline_seconds": total_prediction_seconds,
+                "inference_batch_size": batch_size_actual,
+            }
+            timing_rows.append(timing_row)
+            print(
+                f"[SHORTQ_GNN_TIMING] source_index={source_index} request_order_index={request_order_index} "
+                f"tokens={len(serving_ids)} feature_s_amortized={amortized_feature_seconds:.6f} "
+                f"gnn_forward_s_amortized={amortized_gnn_forward_seconds:.6f} "
+                f"postprocess_s={postprocess_seconds:.6f} total_prediction_s_amortized={total_prediction_seconds:.6f}",
+                flush=True,
+            )
+            print(
+                f"[SHORTQ_PLACEMENT] {request_order_index + 1}/{len(prompts)} tokens={len(serving_ids)} "
+                f"full_chunks={full_chunks} unique_hashes={len(runtime)} conflicts={conflict_occurrences}",
+                flush=True,
+            )
 
     inference_seconds = time.monotonic() - inference_started
+    peak_cuda_memory_bytes = (
+        int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else None
+    )
 
     smoke_overrides = _force_smoke_tier_coverage(
         runtime, args.smoke_force_min_unique_per_tier
@@ -522,6 +659,10 @@ def main() -> None:
         "graph_load_seconds": graph_load_seconds,
         "graph_encode_seconds": graph_encode_seconds,
         "request_prediction_loop_seconds": inference_seconds,
+        "inference_batch_size": args.inference_batch_size,
+        "request_prediction_throughput_rps": (len(prompts) / inference_seconds if inference_seconds else None),
+        "peak_cuda_memory_bytes": peak_cuda_memory_bytes,
+        "batch_timing": batch_timing_rows,
         "metadata_write_seconds": metadata_write_seconds,
         "prediction_timing": timing_summary,
         "requests": len(prompts),
@@ -530,7 +671,7 @@ def main() -> None:
         "prediction_cache_hits": cache_hits,
         "block_policy": "argmax_class_logits",
         "class_to_tier_mapping": {"drop": "L2", "disk": "L2", "cpu": "L1", "gpu": "L0"},
-        "chunk_vote": "plurality_cold_tiebreak_L2_L1_L0",
+        "chunk_vote": selected_vote_policy_name(),
         "duplicate_resolution": "first_seen_wins",
         "block_class_counts": {CLASS_NAMES[i]: int(class_occurrences[i]) for i in range(4)},
         "chunk_occurrences": len(occurrences),

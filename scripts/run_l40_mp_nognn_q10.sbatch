@@ -41,6 +41,7 @@ LMCACHE_L2_DIR="${LMCACHE_L2_ROOT}/${CACHE_TAG}"
 #
 # --quantization fp8 below performs online FP8 quantization on Ada (L40/sm89).
 MODEL="${MODEL:-Qwen/Qwen2.5-32B-Instruct}"
+QUANTIZATION="${QUANTIZATION-fp8}"
 
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
 
@@ -54,6 +55,7 @@ LMCACHE_L1_SIZE_GB="${LMCACHE_L1_SIZE_GB:-32}"
 LMCACHE_MAX_WORKERS="${LMCACHE_MAX_WORKERS:-8}"
 LMCACHE_L2_WORKERS="${LMCACHE_L2_WORKERS:-8}"
 LMCACHE_MP_TIMEOUT="${LMCACHE_MP_TIMEOUT:-30}"
+LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT="${LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT:-}"
 
 # Fresh state across ALL prior MP cache tags unless explicitly disabled.
 CLEAN_OLD_LMCACHE="${CLEAN_OLD_LMCACHE:-1}"
@@ -244,7 +246,7 @@ echo "dataset:             ${DATASET_NAME}"
 echo "questions:           ${NUM_QUESTIONS}"
 echo "model:               ${MODEL}"
 echo "TP:                  ${TENSOR_PARALLEL_SIZE}"
-echo "quantization:        online FP8"
+echo "quantization:        ${QUANTIZATION:-none}"
 echo "VPC enabled:         ${ENABLE_VPC}"
 echo "LMCache chunk:       ${LMCACHE_CHUNK_SIZE}"
 echo "LMCache L1 GiB:      ${LMCACHE_L1_SIZE_GB}"
@@ -392,7 +394,7 @@ cat > "${RUN_DIR}/run_config.json" <<EOF
   "node": "$(hostname)",
   "model": "${MODEL}",
   "tensor_parallel_size": ${TENSOR_PARALLEL_SIZE},
-  "quantization": "fp8",
+  "quantization": "${QUANTIZATION}",
   "max_model_len": ${MAX_MODEL_LEN},
   "gpu_memory_utilization": ${GPU_MEMORY_UTILIZATION},
   "max_num_seqs": ${MAX_NUM_SEQS},
@@ -436,15 +438,20 @@ print(
 PY
 )
 
-lmcache server \
-    --host localhost \
-    --port 5556 \
-    --chunk-size "$LMCACHE_CHUNK_SIZE" \
-    --l1-size-gb "$LMCACHE_L1_SIZE_GB" \
-    --eviction-policy LRU \
-    --max-workers "$LMCACHE_MAX_WORKERS" \
-    --l2-adapter "$L2_ADAPTER_JSON" \
-    > "${LOG_DIR}/lmcache.log" 2>&1 &
+LMCACHE_ARGS=(
+    server
+    --host localhost
+    --port 5556
+    --chunk-size "$LMCACHE_CHUNK_SIZE"
+    --l1-size-gb "$LMCACHE_L1_SIZE_GB"
+    --eviction-policy LRU
+    --max-workers "$LMCACHE_MAX_WORKERS"
+    --l2-adapter "$L2_ADAPTER_JSON"
+)
+if [[ -n "$LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT" ]]; then
+    LMCACHE_ARGS+=(--l2-prefetch-max-in-flight "$LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT")
+fi
+lmcache "${LMCACHE_ARGS[@]}" > "${LOG_DIR}/lmcache.log" 2>&1 &
 
 LMCACHE_PID=$!
 
@@ -494,7 +501,6 @@ VLLM_ARGS=(
     --host 127.0.0.1
     --port 8000
     --dtype bfloat16
-    --quantization fp8
     --tensor-parallel-size "$TENSOR_PARALLEL_SIZE"
     --max-model-len "$MAX_MODEL_LEN"
     --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
@@ -503,6 +509,10 @@ VLLM_ARGS=(
     --disable-hybrid-kv-cache-manager
     --kv-transfer-config "$KV_TRANSFER_CONFIG"
 )
+
+if [[ -n "$QUANTIZATION" ]]; then
+    VLLM_ARGS+=(--quantization "$QUANTIZATION")
+fi
 
 if [[ "$ENABLE_VPC" == "1" ]]; then
     VLLM_ARGS+=(--enable-prefix-caching)
