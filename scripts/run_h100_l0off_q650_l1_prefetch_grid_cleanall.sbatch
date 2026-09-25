@@ -655,25 +655,46 @@ echo
 echo "===== START LMCACHE MP SERVER ====="
 
 L2_ADAPTER_JSON=$(
-python - "$LMCACHE_L2_DIR" "$LMCACHE_L2_WORKERS" <<'PY'
+python - "$LMCACHE_L2_DIR" \
+  "${KV_FS_SHARED_WORKERS:-$LMCACHE_L2_WORKERS}" \
+  "${KV_FS_PER_OP_WORKERS:-0}" \
+  "${KV_FS_LOOKUP_WORKERS:-0}" \
+  "${KV_FS_RETRIEVE_WORKERS:-0}" \
+  "${KV_FS_STORE_WORKERS:-0}" \
+  "${KV_FS_DELETE_WORKERS:-0}" <<'PY'
 import json
 import sys
 
 base_path = sys.argv[1]
-num_workers = int(sys.argv[2])
+shared_workers = int(sys.argv[2])
+per_op_enabled = bool(int(sys.argv[3]))
+lane_names = ("lookup", "retrieve", "store", "delete")
+lane_counts = list(map(int, sys.argv[4:8]))
 
-print(
-    json.dumps(
-        {
-            "type": "fs_native",
-            "base_path": base_path,
-            "num_workers": num_workers,
-            "use_odirect": False,
-        }
-    )
-)
+if shared_workers <= 0:
+    raise ValueError("KV_FS_SHARED_WORKERS must be > 0")
+if any(count < 0 for count in lane_counts):
+    raise ValueError("KV_FS_*_WORKERS lane counts must be >= 0")
+
+spec = {
+    "type": "fs_native",
+    "base_path": base_path,
+    "num_workers": shared_workers,
+    "use_odirect": False,
+}
+if per_op_enabled:
+    per_op = {
+        name: count
+        for name, count in zip(lane_names, lane_counts)
+        if count > 0
+    }
+    if per_op:
+        spec["per_op_workers"] = per_op
+
+print(json.dumps(spec))
 PY
 )
+echo "fs_native adapter: $L2_ADAPTER_JSON"
 
 lmcache server \
     --host localhost \

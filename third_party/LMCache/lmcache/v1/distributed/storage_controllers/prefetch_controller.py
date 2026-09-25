@@ -215,6 +215,10 @@ class InFlightPrefetchRequest:
     pending_lookup_tasks: dict[int, L2TaskId] = field(default_factory=dict)
     # Lookup phase: adapter_idx -> bitmap (populated as results arrive)
     lookup_results: dict[int, Bitmap] = field(default_factory=dict)
+    # Optional zero-I/O prefix diagnostics captured at native EXISTS completion.
+    # These are adapter_idx -> key-index bitmaps.
+    lookup_pending_store: dict[int, Bitmap] = field(default_factory=dict)
+    lookup_ever_stored: dict[int, Bitmap] = field(default_factory=dict)
     # L2 read locks currently held (adapter_idx -> key indices).
     # _release_l2_locks subtracts keys as their locks are returned.
     l2_adapter2readlocks: dict[int, Bitmap] = field(default_factory=dict)
@@ -304,6 +308,9 @@ class PrefetchController(StorageControllerInterface):
         self._max_in_flight = max_in_flight
         self._congestion_debug = (
             os.getenv("LMCACHE_MP_CONGESTION_DEBUG", "0") == "1"
+        )
+        self._prefix_diag = (
+            os.getenv("LMCACHE_MP_PREFIX_DIAGNOSTICS", "0") == "1"
         )
         self._debug_submit_times: dict[PrefetchRequestId, float] = {}
 
@@ -1040,6 +1047,89 @@ class PrefetchController(StorageControllerInterface):
             request.policy,
             request.attn_desc,
         )
+
+        if self._prefix_diag:
+            raw_l2 = merge_bitmaps(request.lookup_results.values(), num_keys)
+            pending_store = merge_bitmaps(
+                request.lookup_pending_store.values(), num_keys
+            )
+            ever_stored = merge_bitmaps(
+                request.lookup_ever_stored.values(), num_keys
+            )
+            physical_union = raw_l2 | request.l1_readlocks
+            physical_prefix_chunks, _ = build_trim_mask(
+                physical_union,
+                num_keys,
+                request.policy,
+                request.attn_desc,
+            )
+            stride = (
+                request.attn_desc.num_object_groups
+                * request.attn_desc.world_size
+            )
+            num_chunks = num_keys // stride if stride else 0
+            first_gap_chunk = (
+                physical_prefix_chunks
+                if physical_prefix_chunks < num_chunks
+                else -1
+            )
+            first_gap_missing = 0
+            first_gap_pending_missing = 0
+            first_gap_ever_stored_missing = 0
+            hidden_l2_complete_chunks = 0
+            hidden_l2_any_keys = 0
+            if first_gap_chunk >= 0:
+                gap_start = first_gap_chunk * stride
+                gap_end = min(gap_start + stride, num_keys)
+                for i in range(gap_start, gap_end):
+                    if physical_union.test(i):
+                        continue
+                    first_gap_missing += 1
+                    if pending_store.test(i):
+                        first_gap_pending_missing += 1
+                    if ever_stored.test(i):
+                        first_gap_ever_stored_missing += 1
+                for chunk in range(first_gap_chunk + 1, num_chunks):
+                    start = chunk * stride
+                    end = min(start + stride, num_keys)
+                    bits = [raw_l2.test(i) for i in range(start, end)]
+                    hidden_l2_any_keys += sum(bits)
+                    if bits and all(bits):
+                        hidden_l2_complete_chunks += 1
+
+            def _bits(bitmap: Bitmap) -> str:
+                return "".join(
+                    "1" if bitmap.test(i) else "0" for i in range(num_keys)
+                )
+
+            logger.info(
+                "[MP_PREFIX_DIAG] request=%d keys=%d stride=%d chunks=%d "
+                "physical_prefix_chunks=%d planned_prefix_chunks=%d "
+                "first_gap_chunk=%d first_gap_missing=%d "
+                "first_gap_pending_missing=%d "
+                "first_gap_ever_stored_missing=%d "
+                "hidden_l2_complete_chunks=%d hidden_l2_any_keys=%d "
+                "l1_bits=%s l2_bits=%s pending_store_bits=%s "
+                "ever_stored_bits=%s union_bits=%s",
+                request.request_id,
+                num_keys,
+                stride,
+                num_chunks,
+                physical_prefix_chunks,
+                hit_length,
+                first_gap_chunk,
+                first_gap_missing,
+                first_gap_pending_missing,
+                first_gap_ever_stored_missing,
+                hidden_l2_complete_chunks,
+                hidden_l2_any_keys,
+                _bits(request.l1_readlocks),
+                _bits(raw_l2),
+                _bits(pending_store),
+                _bits(ever_stored),
+                _bits(physical_union),
+            )
+
         trimmed_plan = trim_load_plan_with_mask(load_plan, retained)
 
         if not trimmed_plan:
@@ -1323,11 +1413,23 @@ class PrefetchController(StorageControllerInterface):
             if adapter_idx not in signaled_adapters:
                 continue
             task_id = request.pending_lookup_tasks[adapter_idx]
-            result = self._l2_adapters[adapter_idx].query_lookup_and_lock_result(
-                task_id
+            adapter = self._l2_adapters[adapter_idx]
+            debug_query = getattr(
+                adapter, "query_lookup_and_lock_result_with_debug", None
             )
-            if result is None:
-                continue
+            if self._prefix_diag and callable(debug_query):
+                debug_result = debug_query(task_id)
+                if debug_result is None:
+                    continue
+                result, pending_store, ever_stored = debug_result
+                if pending_store is not None:
+                    request.lookup_pending_store[adapter_idx] = pending_store
+                if ever_stored is not None:
+                    request.lookup_ever_stored[adapter_idx] = ever_stored
+            else:
+                result = adapter.query_lookup_and_lock_result(task_id)
+                if result is None:
+                    continue
             request.lookup_results[adapter_idx] = result
             request.l2_adapter2readlocks[adapter_idx] = result
             del request.pending_lookup_tasks[adapter_idx]

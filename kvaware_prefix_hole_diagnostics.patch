@@ -1,0 +1,301 @@
+--- a/third_party/LMCache/lmcache/v1/distributed/l2_adapters/native_connector_l2_adapter.py
++++ b/third_party/LMCache/lmcache/v1/distributed/l2_adapters/native_connector_l2_adapter.py
+@@ -125,6 +125,9 @@
+         self._congestion_slow_s = float(
+             os.getenv("LMCACHE_MP_CONGESTION_SLOW_S", "5")
+         )
++        self._prefix_diag = (
++            os.getenv("LMCACHE_MP_PREFIX_DIAGNOSTICS", "0") == "1"
++        )
+         self._debug_submit_at: dict[int, float] = {}
+         self._debug_submit_seq = 0
+         self._debug_complete_seq = 0
+@@ -168,6 +171,15 @@
+         # demux thread can fire ``_notify_keys_stored(keys, sizes)``.
+         self._pending_store_sizes: dict[int, tuple[list[ObjectKey], list[int]]] = {}
+ 
++        # Optional prefix-hole diagnostics. Track keys whose native SET is
++        # still outstanding so an EXISTS miss can be classified without issuing
++        # any extra filesystem I/O. The completed lookup debug state is consumed
++        # atomically with the normal lookup result by PrefetchController.
++        self._pending_store_key_refcounts: dict[ObjectKey, int] = defaultdict(int)
++        self._completed_lookup_debug: dict[
++            L2TaskId, tuple[Bitmap, Bitmap]
++        ] = {}
++
+         # Task ID counter
+         self._next_task_id: L2TaskId = 0
+ 
+@@ -258,6 +270,9 @@
+                 None,
+             )
+             self._pending_store_sizes[future_id] = (list(keys), per_key_sizes)
++            if self._prefix_diag:
++                for key in keys:
++                    self._pending_store_key_refcounts[key] += 1
+             self._debug_submit_locked(
+                 future_id, self._OP_STORE, task_id, len(keys)
+             )
+@@ -302,6 +317,26 @@
+         with self._lock:
+             return self._completed_lookups.pop(task_id, None)
+ 
++    def query_lookup_and_lock_result_with_debug(
++        self, task_id: L2TaskId
++    ) -> tuple[Bitmap, Bitmap | None, Bitmap | None] | None:
++        """Atomically consume a lookup plus zero-I/O diagnostic state.
++
++        The second bitmap marks keys whose SET was still pending when the native
++        EXISTS completion was observed. The third marks keys known to have
++        completed a successful store previously. Both are diagnostic-only and
++        are omitted when LMCACHE_MP_PREFIX_DIAGNOSTICS is disabled.
++        """
++        with self._lock:
++            result = self._completed_lookups.pop(task_id, None)
++            if result is None:
++                return None
++            debug = self._completed_lookup_debug.pop(task_id, None)
++            if debug is None:
++                return result, None, None
++            pending_store, ever_stored = debug
++            return result, pending_store, ever_stored
++
+     def submit_unlock(self, keys: list[ObjectKey]) -> None:
+         with self._lock:
+             for key in keys:
+@@ -544,6 +579,14 @@
+ 
+                     if op_type == self._OP_STORE:
+                         store_info = self._pending_store_sizes.pop(fid, None)
++                        if self._prefix_diag and store_info is not None:
++                            store_keys, _sizes = store_info
++                            for key in store_keys:
++                                count = self._pending_store_key_refcounts.get(key, 0)
++                                if count <= 1:
++                                    self._pending_store_key_refcounts.pop(key, None)
++                                else:
++                                    self._pending_store_key_refcounts[key] = count - 1
+                         task_bytes = 0
+                         if ok and store_info is not None:
+                             store_keys, sizes = store_info
+@@ -574,6 +617,17 @@
+                                     bitmap.set(i)
+                                     if lookup_keys is not None:
+                                         self._locked_keys[lookup_keys[i]] += 1
++                        if self._prefix_diag and lookup_keys is not None:
++                            pending_store = Bitmap(num_keys)
++                            ever_stored = Bitmap(num_keys)
++                            for i, key in enumerate(lookup_keys):
++                                if self._pending_store_key_refcounts.get(key, 0) > 0:
++                                    pending_store.set(i)
++                                if key in self._key_sizes:
++                                    ever_stored.set(i)
++                            self._completed_lookup_debug[task_id] = (
++                                pending_store, ever_stored
++                            )
+                         self._completed_lookups[task_id] = bitmap
+                         self._lookup_efd.notify()
+ 
+--- a/third_party/LMCache/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
++++ b/third_party/LMCache/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
+@@ -215,6 +215,10 @@
+     pending_lookup_tasks: dict[int, L2TaskId] = field(default_factory=dict)
+     # Lookup phase: adapter_idx -> bitmap (populated as results arrive)
+     lookup_results: dict[int, Bitmap] = field(default_factory=dict)
++    # Optional zero-I/O prefix diagnostics captured at native EXISTS completion.
++    # These are adapter_idx -> key-index bitmaps.
++    lookup_pending_store: dict[int, Bitmap] = field(default_factory=dict)
++    lookup_ever_stored: dict[int, Bitmap] = field(default_factory=dict)
+     # L2 read locks currently held (adapter_idx -> key indices).
+     # _release_l2_locks subtracts keys as their locks are returned.
+     l2_adapter2readlocks: dict[int, Bitmap] = field(default_factory=dict)
+@@ -305,6 +309,9 @@
+         self._congestion_debug = (
+             os.getenv("LMCACHE_MP_CONGESTION_DEBUG", "0") == "1"
+         )
++        self._prefix_diag = (
++            os.getenv("LMCACHE_MP_PREFIX_DIAGNOSTICS", "0") == "1"
++        )
+         self._debug_submit_times: dict[PrefetchRequestId, float] = {}
+ 
+         # Adapters that are being drained and will be removed after all
+@@ -1040,6 +1047,89 @@
+             request.policy,
+             request.attn_desc,
+         )
++
++        if self._prefix_diag:
++            raw_l2 = merge_bitmaps(request.lookup_results.values(), num_keys)
++            pending_store = merge_bitmaps(
++                request.lookup_pending_store.values(), num_keys
++            )
++            ever_stored = merge_bitmaps(
++                request.lookup_ever_stored.values(), num_keys
++            )
++            physical_union = raw_l2 | request.l1_readlocks
++            physical_prefix_chunks, _ = build_trim_mask(
++                physical_union,
++                num_keys,
++                request.policy,
++                request.attn_desc,
++            )
++            stride = (
++                request.attn_desc.num_object_groups
++                * request.attn_desc.world_size
++            )
++            num_chunks = num_keys // stride if stride else 0
++            first_gap_chunk = (
++                physical_prefix_chunks
++                if physical_prefix_chunks < num_chunks
++                else -1
++            )
++            first_gap_missing = 0
++            first_gap_pending_missing = 0
++            first_gap_ever_stored_missing = 0
++            hidden_l2_complete_chunks = 0
++            hidden_l2_any_keys = 0
++            if first_gap_chunk >= 0:
++                gap_start = first_gap_chunk * stride
++                gap_end = min(gap_start + stride, num_keys)
++                for i in range(gap_start, gap_end):
++                    if physical_union.test(i):
++                        continue
++                    first_gap_missing += 1
++                    if pending_store.test(i):
++                        first_gap_pending_missing += 1
++                    if ever_stored.test(i):
++                        first_gap_ever_stored_missing += 1
++                for chunk in range(first_gap_chunk + 1, num_chunks):
++                    start = chunk * stride
++                    end = min(start + stride, num_keys)
++                    bits = [raw_l2.test(i) for i in range(start, end)]
++                    hidden_l2_any_keys += sum(bits)
++                    if bits and all(bits):
++                        hidden_l2_complete_chunks += 1
++
++            def _bits(bitmap: Bitmap) -> str:
++                return "".join(
++                    "1" if bitmap.test(i) else "0" for i in range(num_keys)
++                )
++
++            logger.info(
++                "[MP_PREFIX_DIAG] request=%d keys=%d stride=%d chunks=%d "
++                "physical_prefix_chunks=%d planned_prefix_chunks=%d "
++                "first_gap_chunk=%d first_gap_missing=%d "
++                "first_gap_pending_missing=%d "
++                "first_gap_ever_stored_missing=%d "
++                "hidden_l2_complete_chunks=%d hidden_l2_any_keys=%d "
++                "l1_bits=%s l2_bits=%s pending_store_bits=%s "
++                "ever_stored_bits=%s union_bits=%s",
++                request.request_id,
++                num_keys,
++                stride,
++                num_chunks,
++                physical_prefix_chunks,
++                hit_length,
++                first_gap_chunk,
++                first_gap_missing,
++                first_gap_pending_missing,
++                first_gap_ever_stored_missing,
++                hidden_l2_complete_chunks,
++                hidden_l2_any_keys,
++                _bits(request.l1_readlocks),
++                _bits(raw_l2),
++                _bits(pending_store),
++                _bits(ever_stored),
++                _bits(physical_union),
++            )
++
+         trimmed_plan = trim_load_plan_with_mask(load_plan, retained)
+ 
+         if not trimmed_plan:
+@@ -1323,11 +1413,23 @@
+             if adapter_idx not in signaled_adapters:
+                 continue
+             task_id = request.pending_lookup_tasks[adapter_idx]
+-            result = self._l2_adapters[adapter_idx].query_lookup_and_lock_result(
+-                task_id
+-            )
+-            if result is None:
+-                continue
++            adapter = self._l2_adapters[adapter_idx]
++            debug_query = getattr(
++                adapter, "query_lookup_and_lock_result_with_debug", None
++            )
++            if self._prefix_diag and callable(debug_query):
++                debug_result = debug_query(task_id)
++                if debug_result is None:
++                    continue
++                result, pending_store, ever_stored = debug_result
++                if pending_store is not None:
++                    request.lookup_pending_store[adapter_idx] = pending_store
++                if ever_stored is not None:
++                    request.lookup_ever_stored[adapter_idx] = ever_stored
++            else:
++                result = adapter.query_lookup_and_lock_result(task_id)
++                if result is None:
++                    continue
+             request.lookup_results[adapter_idx] = result
+             request.l2_adapter2readlocks[adapter_idx] = result
+             del request.pending_lookup_tasks[adapter_idx]
+--- a/scripts/run_h100_l0off_q650_l1_prefetch_grid_cleanall.sbatch
++++ b/scripts/run_h100_l0off_q650_l1_prefetch_grid_cleanall.sbatch
+@@ -655,25 +655,46 @@
+ echo "===== START LMCACHE MP SERVER ====="
+ 
+ L2_ADAPTER_JSON=$(
+-python - "$LMCACHE_L2_DIR" "$LMCACHE_L2_WORKERS" <<'PY'
++python - "$LMCACHE_L2_DIR" \
++  "${KV_FS_SHARED_WORKERS:-$LMCACHE_L2_WORKERS}" \
++  "${KV_FS_PER_OP_WORKERS:-0}" \
++  "${KV_FS_LOOKUP_WORKERS:-0}" \
++  "${KV_FS_RETRIEVE_WORKERS:-0}" \
++  "${KV_FS_STORE_WORKERS:-0}" \
++  "${KV_FS_DELETE_WORKERS:-0}" <<'PY'
+ import json
+ import sys
+ 
+ base_path = sys.argv[1]
+-num_workers = int(sys.argv[2])
++shared_workers = int(sys.argv[2])
++per_op_enabled = bool(int(sys.argv[3]))
++lane_names = ("lookup", "retrieve", "store", "delete")
++lane_counts = list(map(int, sys.argv[4:8]))
+ 
+-print(
+-    json.dumps(
+-        {
+-            "type": "fs_native",
+-            "base_path": base_path,
+-            "num_workers": num_workers,
+-            "use_odirect": False,
+-        }
+-    )
+-)
++if shared_workers <= 0:
++    raise ValueError("KV_FS_SHARED_WORKERS must be > 0")
++if any(count < 0 for count in lane_counts):
++    raise ValueError("KV_FS_*_WORKERS lane counts must be >= 0")
++
++spec = {
++    "type": "fs_native",
++    "base_path": base_path,
++    "num_workers": shared_workers,
++    "use_odirect": False,
++}
++if per_op_enabled:
++    per_op = {
++        name: count
++        for name, count in zip(lane_names, lane_counts)
++        if count > 0
++    }
++    if per_op:
++        spec["per_op_workers"] = per_op
++
++print(json.dumps(spec))
+ PY
+ )
++echo "fs_native adapter: $L2_ADAPTER_JSON"
+ 
+ lmcache server \
+     --host localhost \

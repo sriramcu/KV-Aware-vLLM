@@ -125,6 +125,9 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         self._congestion_slow_s = float(
             os.getenv("LMCACHE_MP_CONGESTION_SLOW_S", "5")
         )
+        self._prefix_diag = (
+            os.getenv("LMCACHE_MP_PREFIX_DIAGNOSTICS", "0") == "1"
+        )
         self._debug_submit_at: dict[int, float] = {}
         self._debug_submit_seq = 0
         self._debug_complete_seq = 0
@@ -167,6 +170,15 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         # Bridges the async store submit → demux completion gap so the
         # demux thread can fire ``_notify_keys_stored(keys, sizes)``.
         self._pending_store_sizes: dict[int, tuple[list[ObjectKey], list[int]]] = {}
+
+        # Optional prefix-hole diagnostics. Track keys whose native SET is
+        # still outstanding so an EXISTS miss can be classified without issuing
+        # any extra filesystem I/O. The completed lookup debug state is consumed
+        # atomically with the normal lookup result by PrefetchController.
+        self._pending_store_key_refcounts: dict[ObjectKey, int] = defaultdict(int)
+        self._completed_lookup_debug: dict[
+            L2TaskId, tuple[Bitmap, Bitmap]
+        ] = {}
 
         # Task ID counter
         self._next_task_id: L2TaskId = 0
@@ -258,6 +270,9 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                 None,
             )
             self._pending_store_sizes[future_id] = (list(keys), per_key_sizes)
+            if self._prefix_diag:
+                for key in keys:
+                    self._pending_store_key_refcounts[key] += 1
             self._debug_submit_locked(
                 future_id, self._OP_STORE, task_id, len(keys)
             )
@@ -301,6 +316,26 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
     def query_lookup_and_lock_result(self, task_id: L2TaskId) -> Bitmap | None:
         with self._lock:
             return self._completed_lookups.pop(task_id, None)
+
+    def query_lookup_and_lock_result_with_debug(
+        self, task_id: L2TaskId
+    ) -> tuple[Bitmap, Bitmap | None, Bitmap | None] | None:
+        """Atomically consume a lookup plus zero-I/O diagnostic state.
+
+        The second bitmap marks keys whose SET was still pending when the native
+        EXISTS completion was observed. The third marks keys known to have
+        completed a successful store previously. Both are diagnostic-only and
+        are omitted when LMCACHE_MP_PREFIX_DIAGNOSTICS is disabled.
+        """
+        with self._lock:
+            result = self._completed_lookups.pop(task_id, None)
+            if result is None:
+                return None
+            debug = self._completed_lookup_debug.pop(task_id, None)
+            if debug is None:
+                return result, None, None
+            pending_store, ever_stored = debug
+            return result, pending_store, ever_stored
 
     def submit_unlock(self, keys: list[ObjectKey]) -> None:
         with self._lock:
@@ -544,6 +579,14 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
 
                     if op_type == self._OP_STORE:
                         store_info = self._pending_store_sizes.pop(fid, None)
+                        if self._prefix_diag and store_info is not None:
+                            store_keys, _sizes = store_info
+                            for key in store_keys:
+                                count = self._pending_store_key_refcounts.get(key, 0)
+                                if count <= 1:
+                                    self._pending_store_key_refcounts.pop(key, None)
+                                else:
+                                    self._pending_store_key_refcounts[key] = count - 1
                         task_bytes = 0
                         if ok and store_info is not None:
                             store_keys, sizes = store_info
@@ -574,6 +617,17 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                                     bitmap.set(i)
                                     if lookup_keys is not None:
                                         self._locked_keys[lookup_keys[i]] += 1
+                        if self._prefix_diag and lookup_keys is not None:
+                            pending_store = Bitmap(num_keys)
+                            ever_stored = Bitmap(num_keys)
+                            for i, key in enumerate(lookup_keys):
+                                if self._pending_store_key_refcounts.get(key, 0) > 0:
+                                    pending_store.set(i)
+                                if key in self._key_sizes:
+                                    ever_stored.set(i)
+                            self._completed_lookup_debug[task_id] = (
+                                pending_store, ever_stored
+                            )
                         self._completed_lookups[task_id] = bitmap
                         self._lookup_efd.notify()
 
