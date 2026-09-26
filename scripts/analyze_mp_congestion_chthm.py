@@ -33,6 +33,10 @@ ADMIT_RE = re.compile(
     r"vllm_hit_tokens=(\d+) lmcache_hit_tokens=(\d+) external_load_tokens=(\d+) "
     r"lookup_age_s=([0-9.]+)"
 )
+MUTUAL_PREFIX_RE = re.compile(
+    r"\[MP_MUTUAL_PREFIX_LOOKUP\] request=(\S+) prompt_tokens=(\d+) "
+    r"vllm_hit_tokens=(\d+) lookup_start_tokens=(\d+)"
+)
 FRESH_RE = re.compile(r"\[MP_STAGE1_FRESHNESS_GUARD\] request=(\S+) lookup_age_s=([0-9.]+)")
 STARVE_REQ_RE = re.compile(r"\[MP_STAGE1_STARVATION_FALLBACK\] abandoning pending request (\S+)")
 STARVE_WAVE_RE = re.compile(r"\[KV_STAGE1_STARVATION_FALLBACK\].*abandoning (\d+)")
@@ -109,8 +113,10 @@ def overlap(a0: int, a1: int, b0: int, b1: int) -> int:
 def source_token_counts(raw: dict, start: int, end: int) -> dict[str, int]:
     out = {"L0": 0, "L1": 0, "L2": 0}
     cs = raw["chunk_size"]
+    offset = raw.get("start_token", 0)
     for i, tier in enumerate(raw["source_tiers"]):
-        out[tier] += overlap(start, end, i * cs, (i + 1) * cs)
+        chunk_start = offset + i * cs
+        out[tier] += overlap(start, end, chunk_start, chunk_start + cs)
     return out
 
 
@@ -173,6 +179,7 @@ def main() -> None:
                 lifetimes.append(age)
 
     admits: dict[str, dict] = {}
+    mutual_lookup_starts: dict[str, int] = {}
     freshness: list[tuple[str, float]] = []
     starvation_requests: list[str] = []
     starvation_wave_sum = 0
@@ -192,6 +199,8 @@ def main() -> None:
                     "age": float(age),
                 },
             )
+        if m := MUTUAL_PREFIX_RE.search(line):
+            mutual_lookup_starts[m.group(1)] = int(m.group(4))
         if m := FRESH_RE.search(line):
             freshness.append((m.group(1), float(m.group(2))))
         if m := STARVE_REQ_RE.search(line):
@@ -201,6 +210,12 @@ def main() -> None:
         if m := RECOVERY_RE.search(line):
             recovery_waves += 1
             recovered_request_events += int(m.group(1))
+
+    # Raw source_tiers are relative to the submitted LMCache lookup range.
+    # Under mutual-prefix lookup that range can start after token 0, so carry
+    # the vLLM-side lookup offset into CHTHM overlap accounting.
+    for rid, rec in raw.items():
+        rec["start_token"] = mutual_lookup_starts.get(rid, 0)
 
     # Backward-compatible raw-source reconstruction for older L0-off logs.
     # Their MP_CHTHM_LOOKUP records describe a monotonic L1 prefix followed by
@@ -220,6 +235,7 @@ def main() -> None:
             "l1_hit_chunks": l1_chunks,
             "l2_hit_chunks": l2_chunks,
             "source_tiers": ["L1"] * l1_chunks + ["L2"] * l2_chunks,
+            "start_token": mutual_lookup_starts.get(rid, 0),
             "reconstructed_from_legacy_lookup": True,
         }
 

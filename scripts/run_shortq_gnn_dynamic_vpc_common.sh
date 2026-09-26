@@ -29,6 +29,7 @@ VLLM_GNN_AWARE_VPC_WINDOW="${VLLM_GNN_AWARE_VPC_WINDOW:-256}"
 # pre-patch dynamic-VPC experiment except for the historical starvation
 # fallback, which was already enabled.
 KV_VPC_SUFFICIENT_BYPASS="${KV_VPC_SUFFICIENT_BYPASS:-0}"
+KV_MUTUAL_PREFIX="${KV_MUTUAL_PREFIX:-0}"
 KV_STAGE1_STARVATION_FALLBACK="${KV_STAGE1_STARVATION_FALLBACK:-1}"
 KV_STAGE1_OCCUPANCY_FALLBACK="${KV_STAGE1_OCCUPANCY_FALLBACK:-0}"
 KV_STAGE1_OCCUPANCY_LOW_FRACTION="${KV_STAGE1_OCCUPANCY_LOW_FRACTION:-0.50}"
@@ -49,7 +50,7 @@ KV_FS_STORE_WORKERS="${KV_FS_STORE_WORKERS:-0}"
 KV_FS_DELETE_WORKERS="${KV_FS_DELETE_WORKERS:-0}"
 
 for name in KV_GNN_AWARE_VPC KV_GNN_L1_BACKING \
-  KV_VPC_SUFFICIENT_BYPASS KV_STAGE1_STARVATION_FALLBACK \
+  KV_VPC_SUFFICIENT_BYPASS KV_MUTUAL_PREFIX KV_STAGE1_STARVATION_FALLBACK \
   KV_STAGE1_OCCUPANCY_FALLBACK KV_FS_PER_OP_WORKERS; do
   value="${!name}"
   [[ "$value" == "0" || "$value" == "1" ]] || {
@@ -102,7 +103,9 @@ case "$PROFILE" in
     ;;
 esac
 
-RUN_DIR="${RUN_ROOT}/${RUN_LABEL}_${SLURM_JOB_ID}"
+EXPERIMENT_LABEL="${EXPERIMENT_LABEL:-}"
+RUN_LABEL_SUFFIX="${EXPERIMENT_LABEL:+_${EXPERIMENT_LABEL}}"
+RUN_DIR="${RUN_ROOT}/${RUN_LABEL}${RUN_LABEL_SUFFIX}_${SLURM_JOB_ID}"
 LOG_DIR="${RUN_DIR}/logs"
 RESULT_DIR="${RUN_DIR}/results"
 PLACEMENT_DIR="${RUN_DIR}/placement"
@@ -195,6 +198,7 @@ export LMCACHE_PREFETCH_LIFETIME_DEBUG=1 LMCACHE_PREFETCH_LIFETIME_WARN_S=30
 export LMCACHE_MP_STAGE1_FRESHNESS_GUARD_S=270
 export LMCACHE_MP_CONGESTION_DEBUG=1 LMCACHE_MP_CONGESTION_LOG_EVERY=25 LMCACHE_MP_CONGESTION_SLOW_S=5
 export LMCACHE_MP_CHTHM_DEBUG=1
+export LMCACHE_MP_PREFIX_DIAGNOSTICS="${LMCACHE_MP_PREFIX_DIAGNOSTICS:-0}"
 export LMCACHE_CHUNK_SIZE
 
 LMCACHE_PID=""; VLLM_PID=""
@@ -252,6 +256,9 @@ cat > "${RUN_DIR}/run_config.json" <<JSON
   "gnn_aware_vpc": $KV_GNN_AWARE_VPC,
   "gnn_aware_vpc_window": $VLLM_GNN_AWARE_VPC_WINDOW,
   "vpc_sufficient_bypass": $KV_VPC_SUFFICIENT_BYPASS,
+  "mutual_prefix": $KV_MUTUAL_PREFIX,
+  "experiment_label": "$EXPERIMENT_LABEL",
+  "prefix_diagnostics": $LMCACHE_MP_PREFIX_DIAGNOSTICS,
   "stage1_starvation_fallback": $KV_STAGE1_STARVATION_FALLBACK,
   "stage1_occupancy_fallback": $KV_STAGE1_OCCUPANCY_FALLBACK,
   "stage1_occupancy_low_fraction": $KV_STAGE1_OCCUPANCY_LOW_FRACTION,
@@ -332,7 +339,7 @@ curl -sf http://127.0.0.1:8080/metrics > "${RUN_DIR}/lmcache_metrics_before.txt"
 KV_CONFIG=$(python - "$LMCACHE_MP_TIMEOUT" "$KV_STAGE1_STARVATION_FALLBACK" \
   "$KV_STAGE1_OCCUPANCY_FALLBACK" "$KV_STAGE1_OCCUPANCY_LOW_FRACTION" \
   "$KV_STAGE1_OCCUPANCY_TARGET_FRACTION" "$KV_STAGE1_OCCUPANCY_GRACE_S" \
-  "$KV_VPC_SUFFICIENT_BYPASS" <<'PY'
+  "$KV_VPC_SUFFICIENT_BYPASS" "$KV_MUTUAL_PREFIX" <<'PY'
 import json,sys
 timeout=float(sys.argv[1])
 print(json.dumps({
@@ -351,6 +358,7 @@ print(json.dumps({
     'lmcache.mp.occupancy_target_fraction':float(sys.argv[5]),
     'lmcache.mp.occupancy_grace_s':float(sys.argv[6]),
     'lmcache.mp.vpc_sufficient_bypass':bool(int(sys.argv[7])),
+    'lmcache.mp.mutual_prefix':bool(int(sys.argv[8])),
   },
 }))
 PY

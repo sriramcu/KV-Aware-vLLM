@@ -26,6 +26,7 @@ def _make_ctx(wait_result=True, found=None):
     ctx.storage_manager = storage_manager
     ctx.event_bus = mock.Mock()
     ctx.chunk_size = 256
+    ctx.session_manager.get_or_create.return_value.lookup_ipc_key.start = 0
     return ctx
 
 
@@ -71,6 +72,35 @@ def test_wait_prefetch_status_returns_count_and_consumes_job():
     ctx.session_manager.get_or_create.assert_called_once_with("req")
     session = ctx.session_manager.get_or_create.return_value
     session.record_prefetch_result.assert_called_once_with(4, (0,))
+
+
+def test_wait_prefetch_status_records_absolute_hit_end_for_ranged_lookup():
+    # The prefetch result is 4 chunks relative to a lookup that starts at
+    # chunk 2. Lock cleanup must remember absolute end chunk 6.
+    num_keys = 4
+    found = Bitmap(num_keys, num_keys)
+    handle = PrefetchHandle(
+        prefetch_request_id=0,
+        external_request_id="req",
+        l1_found_indices=(),
+        l1_hit_chunks=0,
+        total_requested_keys=num_keys,
+        submit_time=0.0,
+    )
+    ctx = _make_ctx(wait_result=True, found=found)
+    ctx.chunk_size = 256
+    session = ctx.session_manager.get_or_create.return_value
+    session.lookup_ipc_key.start = 512
+    module = _make_module(ctx)
+    module._prefetch_jobs["req"] = _PrefetchJob(
+        handle=handle,
+        world_size=1,
+        request_id="req",
+        requested_tokens=1024,
+    )
+
+    assert module.wait_prefetch_status("req", timeout=1.0) == 4
+    session.record_prefetch_result.assert_called_once_with(6, (0,))
 
 
 def test_wait_prefetch_status_timeout_returns_none_and_keeps_job():

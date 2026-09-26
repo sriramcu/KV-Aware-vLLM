@@ -475,6 +475,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
     - lmcache.mp.vpc_sufficient_bypass: skip Stage-1 entirely when vLLM's
       local prefix is already at least as long as the largest full LMCache
       chunk prefix that could exist for the request.
+    - lmcache.mp.mutual_prefix: start LMCache lookup at the LMCache chunk
+      containing the first vLLM/VPC miss, so a contiguous external suffix can
+      extend the local prefix without requiring LMCache to duplicate its head.
     - lmcache.mp.eager_prefetch: submit the LMCache lookup when a request
       enters vLLM's waiting queue. Disabled by default.
     """
@@ -529,13 +532,24 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 "lmcache.mp.vpc_sufficient_bypass", False
             )
         )
+        self._mutual_prefix_enabled: bool = bool(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "lmcache.mp.mutual_prefix", False
+            )
+        )
+        if self._mutual_prefix_enabled and self._eager_prefetch:
+            raise ValueError(
+                "lmcache.mp.mutual_prefix requires lmcache.mp.eager_prefetch=false "
+                "because the VPC hit boundary is not known at eager submission time"
+            )
         if self.role == KVConnectorRole.SCHEDULER:
             logger.info(
                 "[MP_STAGE1_POLICY_CONFIG] starvation=%s occupancy=%s "
-                "vpc_sufficient_bypass=%s",
+                "vpc_sufficient_bypass=%s mutual_prefix=%s",
                 self._stage1_starvation_fallback_enabled,
                 self._stage1_occupancy_fallback_enabled,
                 self._vpc_sufficient_bypass_enabled,
+                self._mutual_prefix_enabled,
             )
         # Optional research guard: a Stage-1 LOOKUP/PREFETCH may hold L1 read
         # reservations from near the beginning of the lookup.  If Stage 1
@@ -1188,11 +1202,30 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         if tracker.lookup_started_at is None:
             tracker.lookup_started_at = time.monotonic()
+        if tracker.lmcache_lookup_start_tokens is None:
+            if self._mutual_prefix_enabled:
+                chunk_tokens = self.scheduler_adapter.lmcache_tokens_per_chunk
+                tracker.lmcache_lookup_start_tokens = (
+                    num_computed_tokens // chunk_tokens
+                ) * chunk_tokens
+            else:
+                tracker.lmcache_lookup_start_tokens = 0
+            if self._mutual_prefix_enabled:
+                logger.info(
+                    "[MP_MUTUAL_PREFIX_LOOKUP] request=%s prompt_tokens=%d "
+                    "vllm_hit_tokens=%d lookup_start_tokens=%d",
+                    request.request_id,
+                    tracker.num_prompt_tokens,
+                    num_computed_tokens,
+                    tracker.lmcache_lookup_start_tokens,
+                )
+        lookup_start_tokens = tracker.lmcache_lookup_start_tokens or 0
         self.scheduler_adapter.maybe_submit_lookup_request(
             request.request_id,
             token_ids=tracker.get_token_ids(),
             cache_salt=tracker.cache_salt,
             request_configs=tracker.request_configs,
+            start=lookup_start_tokens,
         )
 
         ret = self.scheduler_adapter.check_lookup_result(request.request_id)
@@ -1202,6 +1235,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         lookup_age_s = time.monotonic() - tracker.lookup_started_at
         self._connector_stats.record_lookup(lookup_age_s)
         tracker.lookup_started_at = None
+
+        lmcache_hit_end_tokens = lookup_start_tokens + ret
 
         # Freshness gate before Stage-2 admission.  L1 read reservations are
         # acquired during Stage 1 (including the initial L1 lock pass), so a
@@ -1220,15 +1255,15 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 request.request_id,
                 lookup_age_s,
                 self._stage1_result_freshness_guard_s,
-                ret,
+                lmcache_hit_end_tokens,
             )
             # Release every lookup/prefetch read reservation represented by
             # this hit.  The RPC is asynchronous; no GPU destination blocks
             # have been committed yet, so local recomputation is safe.
             self.scheduler_adapter.free_lookup_locks(
                 token_ids=tracker.get_token_ids(),
-                start=0,
-                end=ret,
+                start=lookup_start_tokens,
+                end=lmcache_hit_end_tokens,
                 request_id=request.request_id,
                 cache_salt=tracker.cache_salt,
                 request_configs=tracker.request_configs,
@@ -1244,7 +1279,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                     request.request_id,
                     len(request.all_token_ids),
                     num_computed_tokens,
-                    ret,
+                    lmcache_hit_end_tokens,
                     lookup_age_s,
                 )
             return 0, False
@@ -1273,19 +1308,26 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             return 0, False
 
         assert ret % self.scheduler_adapter.lmcache_tokens_per_chunk == 0
+        assert (
+            lmcache_hit_end_tokens
+            % self.scheduler_adapter.lmcache_tokens_per_chunk
+            == 0
+        )
 
-        # Update num stored tokens for the tracker
-        tracker.increase_num_stored_tokens(ret)
+        # ``ret`` is the contiguous LMCache suffix length within the ranged
+        # lookup. Downstream tracker/retrieve code expects the absolute end of
+        # the combined cached prefix, so convert back to request coordinates.
+        tracker.increase_num_stored_tokens(lmcache_hit_end_tokens)
 
-        tracker.num_lmcache_hit_tokens = ret
+        tracker.num_lmcache_hit_tokens = lmcache_hit_end_tokens
 
-        need_to_load = max(0, ret - num_computed_tokens)
+        need_to_load = max(0, lmcache_hit_end_tokens - num_computed_tokens)
 
         # In full-prompt-hit case, we need to recompute the last token.
         # Without this, num_computed_tokens would equal request.num_tokens,
         # causing num_new_tokens to be 0 and triggering the
         # `assert num_new_tokens > 0` in the scheduler.
-        if ret == len(request.all_token_ids):
+        if lmcache_hit_end_tokens == len(request.all_token_ids):
             need_to_load = max(0, need_to_load - 1)
 
         logger.debug(
@@ -1299,7 +1341,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 request.request_id,
                 len(request.all_token_ids),
                 tracker.num_vllm_hit_tokens,
-                ret,
+                lmcache_hit_end_tokens,
                 need_to_load,
                 lookup_age_s,
             )
@@ -1402,7 +1444,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 if free_end > 0:
                     self.scheduler_adapter.free_lookup_locks(
                         token_ids=tracker.get_token_ids(),
-                        start=0,
+                        start=tracker.lmcache_lookup_start_tokens or 0,
                         end=free_end,
                         request_id=request.request_id,
                         cache_salt=tracker.cache_salt,

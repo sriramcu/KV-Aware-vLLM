@@ -206,7 +206,9 @@ class LookupModule:
 
         num_kv_readers = key.require_num_kv_readers()
 
-        chunk_hashes = self._ctx.token_hasher.compute_chunk_hashes(list(key.token_ids))
+        chunk_hashes = self._ctx.token_hasher.compute_chunk_hashes(
+            list(key.token_ids), start=key.start, end=key.end
+        )
         if not chunk_hashes:
             self._register_prefetch_job(
                 _PrefetchJob(
@@ -392,8 +394,14 @@ class LookupModule:
         # read-locked (see ``unfold``: full-attention groups lock the whole
         # hit prefix, sliding-window groups only its in-window suffix).
         session = self._ctx.session_manager.get_or_create(job.request_id)
+        lookup_key = session.lookup_ipc_key
+        lookup_start_chunk = (
+            lookup_key.start // self._ctx.chunk_size if lookup_key is not None else 0
+        )
+        # Lock-release helpers operate in absolute chunk coordinates. The
+        # status result itself remains relative to the submitted lookup range.
         session.record_prefetch_result(
-            found_count,
+            lookup_start_chunk + found_count,
             tuple(range(job.attn_desc.num_object_groups)),
         )
 

@@ -75,6 +75,16 @@ TOP_P="${TOP_P:-0.95}"
 # Real project baseline: VPC enabled. Set ENABLE_VPC=0 only for targeted
 # isolation experiments later (especially during L0 validation).
 ENABLE_VPC="${ENABLE_VPC:-1}"
+KV_VPC_SUFFICIENT_BYPASS="${KV_VPC_SUFFICIENT_BYPASS:-0}"
+KV_MUTUAL_PREFIX="${KV_MUTUAL_PREFIX:-0}"
+
+for name in KV_VPC_SUFFICIENT_BYPASS KV_MUTUAL_PREFIX; do
+    value="${!name}"
+    [[ "$value" == "0" || "$value" == "1" ]] || {
+        echo "ERROR: $name must be 0 or 1, got $value" >&2
+        exit 2
+    }
+done
 
 # Preserve legacy compiled-mode intent by default. Set to 1 if debugging.
 ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
@@ -122,6 +132,7 @@ export LMCACHE_MP_CONGESTION_DEBUG="${LMCACHE_MP_CONGESTION_DEBUG:-0}"
 export LMCACHE_MP_CONGESTION_LOG_EVERY="${LMCACHE_MP_CONGESTION_LOG_EVERY:-25}"
 export LMCACHE_MP_CONGESTION_SLOW_S="${LMCACHE_MP_CONGESTION_SLOW_S:-5}"
 export LMCACHE_MP_CHTHM_DEBUG="${LMCACHE_MP_CHTHM_DEBUG:-0}"
+export LMCACHE_MP_PREFIX_DIAGNOSTICS="${LMCACHE_MP_PREFIX_DIAGNOSTICS:-0}"
 
 # This grid is explicitly the L0-OFF baseline.  The L0 server feature is
 # disabled by default because this script never passes --l0-enable; also
@@ -277,6 +288,10 @@ echo "L0:                  OFF"
 echo "Stage1 freshness s:  ${LMCACHE_MP_STAGE1_FRESHNESS_GUARD_S}"
 echo "MP congestion debug: ${LMCACHE_MP_CONGESTION_DEBUG}"
 echo "MP CHTHM debug:      ${LMCACHE_MP_CHTHM_DEBUG}"
+echo "prefix diagnostics:  ${LMCACHE_MP_PREFIX_DIAGNOSTICS}"
+echo "VPC bypass:          ${KV_VPC_SUFFICIENT_BYPASS}"
+echo "mutual prefix:       ${KV_MUTUAL_PREFIX}"
+echo "fs workers:          shared=${KV_FS_SHARED_WORKERS:-$LMCACHE_L2_WORKERS} lookup=${KV_FS_LOOKUP_WORKERS:-0} retrieve=${KV_FS_RETRIEVE_WORKERS:-0} store=${KV_FS_STORE_WORKERS:-0} delete=${KV_FS_DELETE_WORKERS:-0}"
 echo "============================================================"
 
 # ============================================================================
@@ -633,6 +648,15 @@ cat > "${RUN_DIR}/run_config.json" <<EOF
   "lmcache_mp_congestion_log_every": ${LMCACHE_MP_CONGESTION_LOG_EVERY},
   "lmcache_mp_congestion_slow_s": ${LMCACHE_MP_CONGESTION_SLOW_S},
   "lmcache_mp_chthm_debug": ${LMCACHE_MP_CHTHM_DEBUG},
+  "lmcache_mp_prefix_diagnostics": ${LMCACHE_MP_PREFIX_DIAGNOSTICS},
+  "vpc_sufficient_bypass": ${KV_VPC_SUFFICIENT_BYPASS},
+  "mutual_prefix": ${KV_MUTUAL_PREFIX},
+  "fs_per_op_workers": ${KV_FS_PER_OP_WORKERS:-0},
+  "fs_shared_workers": ${KV_FS_SHARED_WORKERS:-$LMCACHE_L2_WORKERS},
+  "fs_lookup_workers": ${KV_FS_LOOKUP_WORKERS:-0},
+  "fs_retrieve_workers": ${KV_FS_RETRIEVE_WORKERS:-0},
+  "fs_store_workers": ${KV_FS_STORE_WORKERS:-0},
+  "fs_delete_workers": ${KV_FS_DELETE_WORKERS:-0},
   "enable_vpc": ${ENABLE_VPC},
   "cuda_mps_bypass": true,
   "cuda_mps_pipe_directory": "${CUDA_MPS_PIPE_DIRECTORY}",
@@ -725,11 +749,13 @@ echo
 echo "===== START VLLM SERVER ====="
 
 KV_TRANSFER_CONFIG=$(
-python - "$LMCACHE_MP_TIMEOUT" <<'PY'
+python - "$LMCACHE_MP_TIMEOUT" "$KV_VPC_SUFFICIENT_BYPASS" "$KV_MUTUAL_PREFIX" <<'PY'
 import json
 import sys
 
 timeout = float(sys.argv[1])
+vpc_sufficient_bypass = bool(int(sys.argv[2]))
+mutual_prefix = bool(int(sys.argv[3]))
 
 print(
     json.dumps(
@@ -744,6 +770,8 @@ print(
                 "lmcache.mp.mq_timeout": timeout,
                 "lmcache.mp.lookup_timeout": 0.0,
                 "lmcache.mp.starvation_fallback": True,
+                "lmcache.mp.vpc_sufficient_bypass": vpc_sufficient_bypass,
+                "lmcache.mp.mutual_prefix": mutual_prefix,
             },
         }
     )

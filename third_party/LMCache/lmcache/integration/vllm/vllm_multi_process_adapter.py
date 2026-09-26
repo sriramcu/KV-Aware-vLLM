@@ -693,8 +693,9 @@ class LMCacheMPSchedulerAdapter:
         # - _unacked_lookups: LOOKUP futures not yet acknowledged by every
         #   server. check_lookup_result never sends QUERY_PREFETCH_STATUS for
         #   a request until its LOOKUP has been acked (see _LookupAck).
-        # - _finished_lookup_results: cached chunk count keyed by request_id,
-        #   so that repeated calls to check_lookup_result return the same value
+        # - _finished_lookup_results: cached matched-token count within the
+        #   submitted lookup range, keyed by request_id, so that repeated calls
+        #   to check_lookup_result return the same value
         #   even after the server has already popped the job (exactly-once).
         # - _per_server_hits: {request_id: {server_url: hit_chunks}}.
         #   Per-server hit counts, used to detect disagreement and free tail locks.
@@ -707,7 +708,7 @@ class LMCacheMPSchedulerAdapter:
             str, dict[str, tuple[MessagingFuture[Any], float]]
         ] = {}
         self._lookup_params: dict[
-            str, tuple[list[int], str, dict[str, Any] | None]
+            str, tuple[list[int], int, str, dict[str, Any] | None]
         ] = {}
         # Monotonic submission timestamp for the end-to-end Stage-1 timeout.
         self._lookup_started_at: dict[str, float] = {}
@@ -957,19 +958,20 @@ class LMCacheMPSchedulerAdapter:
             state.free_futures = {}
             params = self._lookup_params.get(request_id)
             if params is not None:
-                token_ids, cache_salt, request_configs = params
+                token_ids, lookup_start, cache_salt, request_configs = params
                 for url, hit_chunks in per_server.items():
                     if hit_chunks <= 0:
                         continue
                     end = min(
-                        hit_chunks * self.lmcache_tokens_per_chunk,
+                        lookup_start
+                        + hit_chunks * self.lmcache_tokens_per_chunk,
                         len(token_ids),
                     )
-                    if end <= 0:
+                    if end <= lookup_start:
                         continue
                     key = self._create_key(
                         token_ids,
-                        start=0,
+                        start=lookup_start,
                         end=end,
                         request_id=request_id,
                         cache_salt=cache_salt,
@@ -1039,6 +1041,7 @@ class LMCacheMPSchedulerAdapter:
         token_ids: list[int],
         cache_salt: str = "",
         request_configs: dict[str, Any] | None = None,
+        start: int = 0,
     ):
         """
         Submit a new lookup request to LMCache if there is no ongoing request.
@@ -1055,6 +1058,9 @@ class LMCacheMPSchedulerAdapter:
                 cache_salt values produce separate cache entries.
             request_configs: Optional LMCache request configs to include in
                 the IPC key.
+            start: Chunk-aligned token index at which external prefix lookup
+                should begin. Tokens before ``start`` are assumed to be covered
+                by vLLM's local prefix cache and are not required from LMCache.
 
         Returns:
             None
@@ -1084,10 +1090,21 @@ class LMCacheMPSchedulerAdapter:
         aligned_end = (
             len(token_ids) // self.lmcache_tokens_per_chunk
         ) * self.lmcache_tokens_per_chunk
+        if start < 0 or start % self.lmcache_tokens_per_chunk != 0:
+            raise ValueError(
+                f"lookup start={start} must be a non-negative multiple of "
+                f"LMCache chunk size {self.lmcache_tokens_per_chunk}"
+            )
+        if start >= aligned_end:
+            # Nothing externally addressable remains after the local prefix.
+            # The connector normally catches this via VPC-sufficient bypass,
+            # but keep the adapter defensive for direct callers.
+            self._finished_lookup_results[request_id] = 0
+            return
 
         key = self._create_key(
             token_ids,
-            start=0,
+            start=start,
             end=aligned_end,
             request_id=request_id,
             cache_salt=cache_salt,
@@ -1106,7 +1123,9 @@ class LMCacheMPSchedulerAdapter:
             futures=futures, submitted_at=time.monotonic()
         )
         self._pending_lookups.add(request_id)
-        self._lookup_params[request_id] = (token_ids, cache_salt, request_configs)
+        self._lookup_params[request_id] = (
+            token_ids, start, cache_salt, request_configs
+        )
         self._lookup_started_at[request_id] = time.monotonic()
 
     def _free_inconsistent_lookup_locks(
@@ -1127,19 +1146,21 @@ class LMCacheMPSchedulerAdapter:
             per_server: Per-server hit chunk counts.
             min_chunks: Minimum hit chunk count across all servers.
         """
-        token_ids_l, cs, request_configs = self._lookup_params.pop(
-            request_id, (None, None, None)
+        token_ids_l, lookup_start, cs, request_configs = self._lookup_params.pop(
+            request_id, (None, 0, None, None)
         )
         if token_ids_l is not None:
             for url, hit_chunks in per_server.items():
                 if hit_chunks <= min_chunks:
                     continue
                 tail_end = min(
-                    hit_chunks * self.lmcache_tokens_per_chunk, len(token_ids_l)
+                    lookup_start + hit_chunks * self.lmcache_tokens_per_chunk,
+                    len(token_ids_l),
                 )
                 tail_key = self._create_key(
                     token_ids=token_ids_l,
-                    start=min_chunks * self.lmcache_tokens_per_chunk,
+                    start=lookup_start
+                    + min_chunks * self.lmcache_tokens_per_chunk,
                     end=tail_end,
                     request_id=request_id,
                     cache_salt=cs or "",

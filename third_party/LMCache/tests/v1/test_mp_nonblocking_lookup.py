@@ -157,6 +157,30 @@ def resolved(adapter: LMCacheMPSchedulerAdapter) -> int:
     raise AssertionError("completed status did not become observable")
 
 
+def test_ranged_lookup_starts_after_local_prefix_and_returns_suffix_length(
+    make_adapter: AdapterFactory,
+) -> None:
+    adapter, (client,) = make_adapter()
+    adapter.maybe_submit_lookup_request(
+        "r",
+        list(range(256)),
+        cache_salt="tenant",
+        request_configs={"tag": "value"},
+        start=128,
+    )
+    assert len(client.lookups) == 1
+    key = client.lookups[0]
+    assert key.start == 128
+    assert key.end == 256
+
+    client.ack.set_result(None)
+    client.status.set_result(1)
+    # Status results stay relative to the requested external suffix. The
+    # connector adds the VPC-covered lookup start back to form the absolute
+    # mutual-prefix endpoint.
+    assert resolved(adapter) == 64
+
+
 @pytest.mark.parametrize("setting", [False, "false"])
 def test_explicit_blocking_status_reply_is_consumed_in_the_same_callback(
     make_adapter: AdapterFactory, setting: bool | str

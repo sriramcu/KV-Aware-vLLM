@@ -1,0 +1,737 @@
+diff --git a/third_party/LMCache/lmcache/integration/vllm/vllm_multi_process_adapter.py b/third_party/LMCache/lmcache/integration/vllm/vllm_multi_process_adapter.py
+--- a/third_party/LMCache/lmcache/integration/vllm/vllm_multi_process_adapter.py
++++ b/third_party/LMCache/lmcache/integration/vllm/vllm_multi_process_adapter.py
+@@ -693,8 +693,9 @@
+         # - _unacked_lookups: LOOKUP futures not yet acknowledged by every
+         #   server. check_lookup_result never sends QUERY_PREFETCH_STATUS for
+         #   a request until its LOOKUP has been acked (see _LookupAck).
+-        # - _finished_lookup_results: cached chunk count keyed by request_id,
+-        #   so that repeated calls to check_lookup_result return the same value
++        # - _finished_lookup_results: cached matched-token count within the
++        #   submitted lookup range, keyed by request_id, so that repeated calls
++        #   to check_lookup_result return the same value
+         #   even after the server has already popped the job (exactly-once).
+         # - _per_server_hits: {request_id: {server_url: hit_chunks}}.
+         #   Per-server hit counts, used to detect disagreement and free tail locks.
+@@ -707,7 +708,7 @@
+             str, dict[str, tuple[MessagingFuture[Any], float]]
+         ] = {}
+         self._lookup_params: dict[
+-            str, tuple[list[int], str, dict[str, Any] | None]
++            str, tuple[list[int], int, str, dict[str, Any] | None]
+         ] = {}
+         # Monotonic submission timestamp for the end-to-end Stage-1 timeout.
+         self._lookup_started_at: dict[str, float] = {}
+@@ -957,19 +958,20 @@
+             state.free_futures = {}
+             params = self._lookup_params.get(request_id)
+             if params is not None:
+-                token_ids, cache_salt, request_configs = params
++                token_ids, lookup_start, cache_salt, request_configs = params
+                 for url, hit_chunks in per_server.items():
+                     if hit_chunks <= 0:
+                         continue
+                     end = min(
+-                        hit_chunks * self.lmcache_tokens_per_chunk,
++                        lookup_start
++                        + hit_chunks * self.lmcache_tokens_per_chunk,
+                         len(token_ids),
+                     )
+-                    if end <= 0:
++                    if end <= lookup_start:
+                         continue
+                     key = self._create_key(
+                         token_ids,
+-                        start=0,
++                        start=lookup_start,
+                         end=end,
+                         request_id=request_id,
+                         cache_salt=cache_salt,
+@@ -1039,6 +1041,7 @@
+         token_ids: list[int],
+         cache_salt: str = "",
+         request_configs: dict[str, Any] | None = None,
++        start: int = 0,
+     ):
+         """
+         Submit a new lookup request to LMCache if there is no ongoing request.
+@@ -1055,6 +1058,9 @@
+                 cache_salt values produce separate cache entries.
+             request_configs: Optional LMCache request configs to include in
+                 the IPC key.
++            start: Chunk-aligned token index at which external prefix lookup
++                should begin. Tokens before ``start`` are assumed to be covered
++                by vLLM's local prefix cache and are not required from LMCache.
+ 
+         Returns:
+             None
+@@ -1084,10 +1090,21 @@
+         aligned_end = (
+             len(token_ids) // self.lmcache_tokens_per_chunk
+         ) * self.lmcache_tokens_per_chunk
++        if start < 0 or start % self.lmcache_tokens_per_chunk != 0:
++            raise ValueError(
++                f"lookup start={start} must be a non-negative multiple of "
++                f"LMCache chunk size {self.lmcache_tokens_per_chunk}"
++            )
++        if start >= aligned_end:
++            # Nothing externally addressable remains after the local prefix.
++            # The connector normally catches this via VPC-sufficient bypass,
++            # but keep the adapter defensive for direct callers.
++            self._finished_lookup_results[request_id] = 0
++            return
+ 
+         key = self._create_key(
+             token_ids,
+-            start=0,
++            start=start,
+             end=aligned_end,
+             request_id=request_id,
+             cache_salt=cache_salt,
+@@ -1106,7 +1123,9 @@
+             futures=futures, submitted_at=time.monotonic()
+         )
+         self._pending_lookups.add(request_id)
+-        self._lookup_params[request_id] = (token_ids, cache_salt, request_configs)
++        self._lookup_params[request_id] = (
++            token_ids, start, cache_salt, request_configs
++        )
+         self._lookup_started_at[request_id] = time.monotonic()
+ 
+     def _free_inconsistent_lookup_locks(
+@@ -1127,19 +1146,21 @@
+             per_server: Per-server hit chunk counts.
+             min_chunks: Minimum hit chunk count across all servers.
+         """
+-        token_ids_l, cs, request_configs = self._lookup_params.pop(
+-            request_id, (None, None, None)
++        token_ids_l, lookup_start, cs, request_configs = self._lookup_params.pop(
++            request_id, (None, 0, None, None)
+         )
+         if token_ids_l is not None:
+             for url, hit_chunks in per_server.items():
+                 if hit_chunks <= min_chunks:
+                     continue
+                 tail_end = min(
+-                    hit_chunks * self.lmcache_tokens_per_chunk, len(token_ids_l)
++                    lookup_start + hit_chunks * self.lmcache_tokens_per_chunk,
++                    len(token_ids_l),
+                 )
+                 tail_key = self._create_key(
+                     token_ids=token_ids_l,
+-                    start=min_chunks * self.lmcache_tokens_per_chunk,
++                    start=lookup_start
++                    + min_chunks * self.lmcache_tokens_per_chunk,
+                     end=tail_end,
+                     request_id=request_id,
+                     cache_salt=cs or "",
+diff --git a/third_party/LMCache/lmcache/integration/vllm/lmcache_mp_connector.py b/third_party/LMCache/lmcache/integration/vllm/lmcache_mp_connector.py
+--- a/third_party/LMCache/lmcache/integration/vllm/lmcache_mp_connector.py
++++ b/third_party/LMCache/lmcache/integration/vllm/lmcache_mp_connector.py
+@@ -475,6 +475,9 @@
+     - lmcache.mp.vpc_sufficient_bypass: skip Stage-1 entirely when vLLM's
+       local prefix is already at least as long as the largest full LMCache
+       chunk prefix that could exist for the request.
++    - lmcache.mp.mutual_prefix: start LMCache lookup at the LMCache chunk
++      containing the first vLLM/VPC miss, so a contiguous external suffix can
++      extend the local prefix without requiring LMCache to duplicate its head.
+     - lmcache.mp.eager_prefetch: submit the LMCache lookup when a request
+       enters vLLM's waiting queue. Disabled by default.
+     """
+@@ -529,13 +532,24 @@
+                 "lmcache.mp.vpc_sufficient_bypass", False
+             )
+         )
++        self._mutual_prefix_enabled: bool = bool(
++            vllm_config.kv_transfer_config.get_from_extra_config(
++                "lmcache.mp.mutual_prefix", False
++            )
++        )
++        if self._mutual_prefix_enabled and self._eager_prefetch:
++            raise ValueError(
++                "lmcache.mp.mutual_prefix requires lmcache.mp.eager_prefetch=false "
++                "because the VPC hit boundary is not known at eager submission time"
++            )
+         if self.role == KVConnectorRole.SCHEDULER:
+             logger.info(
+                 "[MP_STAGE1_POLICY_CONFIG] starvation=%s occupancy=%s "
+-                "vpc_sufficient_bypass=%s",
++                "vpc_sufficient_bypass=%s mutual_prefix=%s",
+                 self._stage1_starvation_fallback_enabled,
+                 self._stage1_occupancy_fallback_enabled,
+                 self._vpc_sufficient_bypass_enabled,
++                self._mutual_prefix_enabled,
+             )
+         # Optional research guard: a Stage-1 LOOKUP/PREFETCH may hold L1 read
+         # reservations from near the beginning of the lookup.  If Stage 1
+@@ -1188,11 +1202,30 @@
+ 
+         if tracker.lookup_started_at is None:
+             tracker.lookup_started_at = time.monotonic()
++        if tracker.lmcache_lookup_start_tokens is None:
++            if self._mutual_prefix_enabled:
++                chunk_tokens = self.scheduler_adapter.lmcache_tokens_per_chunk
++                tracker.lmcache_lookup_start_tokens = (
++                    num_computed_tokens // chunk_tokens
++                ) * chunk_tokens
++            else:
++                tracker.lmcache_lookup_start_tokens = 0
++            if self._mutual_prefix_enabled:
++                logger.info(
++                    "[MP_MUTUAL_PREFIX_LOOKUP] request=%s prompt_tokens=%d "
++                    "vllm_hit_tokens=%d lookup_start_tokens=%d",
++                    request.request_id,
++                    tracker.num_prompt_tokens,
++                    num_computed_tokens,
++                    tracker.lmcache_lookup_start_tokens,
++                )
++        lookup_start_tokens = tracker.lmcache_lookup_start_tokens or 0
+         self.scheduler_adapter.maybe_submit_lookup_request(
+             request.request_id,
+             token_ids=tracker.get_token_ids(),
+             cache_salt=tracker.cache_salt,
+             request_configs=tracker.request_configs,
++            start=lookup_start_tokens,
+         )
+ 
+         ret = self.scheduler_adapter.check_lookup_result(request.request_id)
+@@ -1202,6 +1235,8 @@
+         lookup_age_s = time.monotonic() - tracker.lookup_started_at
+         self._connector_stats.record_lookup(lookup_age_s)
+         tracker.lookup_started_at = None
++
++        lmcache_hit_end_tokens = lookup_start_tokens + ret
+ 
+         # Freshness gate before Stage-2 admission.  L1 read reservations are
+         # acquired during Stage 1 (including the initial L1 lock pass), so a
+@@ -1220,15 +1255,15 @@
+                 request.request_id,
+                 lookup_age_s,
+                 self._stage1_result_freshness_guard_s,
+-                ret,
++                lmcache_hit_end_tokens,
+             )
+             # Release every lookup/prefetch read reservation represented by
+             # this hit.  The RPC is asynchronous; no GPU destination blocks
+             # have been committed yet, so local recomputation is safe.
+             self.scheduler_adapter.free_lookup_locks(
+                 token_ids=tracker.get_token_ids(),
+-                start=0,
+-                end=ret,
++                start=lookup_start_tokens,
++                end=lmcache_hit_end_tokens,
+                 request_id=request.request_id,
+                 cache_salt=tracker.cache_salt,
+                 request_configs=tracker.request_configs,
+@@ -1244,7 +1279,7 @@
+                     request.request_id,
+                     len(request.all_token_ids),
+                     num_computed_tokens,
+-                    ret,
++                    lmcache_hit_end_tokens,
+                     lookup_age_s,
+                 )
+             return 0, False
+@@ -1273,19 +1308,26 @@
+             return 0, False
+ 
+         assert ret % self.scheduler_adapter.lmcache_tokens_per_chunk == 0
+-
+-        # Update num stored tokens for the tracker
+-        tracker.increase_num_stored_tokens(ret)
+-
+-        tracker.num_lmcache_hit_tokens = ret
+-
+-        need_to_load = max(0, ret - num_computed_tokens)
++        assert (
++            lmcache_hit_end_tokens
++            % self.scheduler_adapter.lmcache_tokens_per_chunk
++            == 0
++        )
++
++        # ``ret`` is the contiguous LMCache suffix length within the ranged
++        # lookup. Downstream tracker/retrieve code expects the absolute end of
++        # the combined cached prefix, so convert back to request coordinates.
++        tracker.increase_num_stored_tokens(lmcache_hit_end_tokens)
++
++        tracker.num_lmcache_hit_tokens = lmcache_hit_end_tokens
++
++        need_to_load = max(0, lmcache_hit_end_tokens - num_computed_tokens)
+ 
+         # In full-prompt-hit case, we need to recompute the last token.
+         # Without this, num_computed_tokens would equal request.num_tokens,
+         # causing num_new_tokens to be 0 and triggering the
+         # `assert num_new_tokens > 0` in the scheduler.
+-        if ret == len(request.all_token_ids):
++        if lmcache_hit_end_tokens == len(request.all_token_ids):
+             need_to_load = max(0, need_to_load - 1)
+ 
+         logger.debug(
+@@ -1299,7 +1341,7 @@
+                 request.request_id,
+                 len(request.all_token_ids),
+                 tracker.num_vllm_hit_tokens,
+-                ret,
++                lmcache_hit_end_tokens,
+                 need_to_load,
+                 lookup_age_s,
+             )
+@@ -1402,7 +1444,7 @@
+                 if free_end > 0:
+                     self.scheduler_adapter.free_lookup_locks(
+                         token_ids=tracker.get_token_ids(),
+-                        start=0,
++                        start=tracker.lmcache_lookup_start_tokens or 0,
+                         end=free_end,
+                         request_id=request.request_id,
+                         cache_salt=tracker.cache_salt,
+diff --git a/third_party/LMCache/lmcache/integration/vllm/lmcache_mp_metadata.py b/third_party/LMCache/lmcache/integration/vllm/lmcache_mp_metadata.py
+--- a/third_party/LMCache/lmcache/integration/vllm/lmcache_mp_metadata.py
++++ b/third_party/LMCache/lmcache/integration/vllm/lmcache_mp_metadata.py
+@@ -82,6 +82,7 @@
+     request_configs: dict[str, Any] | None = None
+     max_offload_tokens: int | None = None
+     lookup_started_at: float | None = None
++    lmcache_lookup_start_tokens: int | None = None
+ 
+     mm_adjusted_prompt_ids: list[int] = field(default_factory=list)
+ 
+@@ -93,6 +94,7 @@
+             "lmcache.max_offload_tokens"
+         )
+         self.lookup_started_at = None
++        self.lmcache_lookup_start_tokens = None
+         self.all_token_ids = request.all_token_ids
+         self.num_prompt_tokens = len(request.prompt_token_ids)
+         self.allocated_block_ids = {}
+diff --git a/third_party/LMCache/lmcache/v1/multiprocess/modules/lookup.py b/third_party/LMCache/lmcache/v1/multiprocess/modules/lookup.py
+--- a/third_party/LMCache/lmcache/v1/multiprocess/modules/lookup.py
++++ b/third_party/LMCache/lmcache/v1/multiprocess/modules/lookup.py
+@@ -206,7 +206,9 @@
+ 
+         num_kv_readers = key.require_num_kv_readers()
+ 
+-        chunk_hashes = self._ctx.token_hasher.compute_chunk_hashes(list(key.token_ids))
++        chunk_hashes = self._ctx.token_hasher.compute_chunk_hashes(
++            list(key.token_ids), start=key.start, end=key.end
++        )
+         if not chunk_hashes:
+             self._register_prefetch_job(
+                 _PrefetchJob(
+@@ -392,8 +394,14 @@
+         # read-locked (see ``unfold``: full-attention groups lock the whole
+         # hit prefix, sliding-window groups only its in-window suffix).
+         session = self._ctx.session_manager.get_or_create(job.request_id)
++        lookup_key = session.lookup_ipc_key
++        lookup_start_chunk = (
++            lookup_key.start // self._ctx.chunk_size if lookup_key is not None else 0
++        )
++        # Lock-release helpers operate in absolute chunk coordinates. The
++        # status result itself remains relative to the submitted lookup range.
+         session.record_prefetch_result(
+-            found_count,
++            lookup_start_chunk + found_count,
+             tuple(range(job.attn_desc.num_object_groups)),
+         )
+ 
+diff --git a/scripts/analyze_mp_congestion_chthm.py b/scripts/analyze_mp_congestion_chthm.py
+--- a/scripts/analyze_mp_congestion_chthm.py
++++ b/scripts/analyze_mp_congestion_chthm.py
+@@ -32,6 +32,10 @@
+     r"\[MP_CHTHM_ADMIT\] request=(\S+) decision=(\S+) prompt_tokens=(\d+) "
+     r"vllm_hit_tokens=(\d+) lmcache_hit_tokens=(\d+) external_load_tokens=(\d+) "
+     r"lookup_age_s=([0-9.]+)"
++)
++MUTUAL_PREFIX_RE = re.compile(
++    r"\[MP_MUTUAL_PREFIX_LOOKUP\] request=(\S+) prompt_tokens=(\d+) "
++    r"vllm_hit_tokens=(\d+) lookup_start_tokens=(\d+)"
+ )
+ FRESH_RE = re.compile(r"\[MP_STAGE1_FRESHNESS_GUARD\] request=(\S+) lookup_age_s=([0-9.]+)")
+ STARVE_REQ_RE = re.compile(r"\[MP_STAGE1_STARVATION_FALLBACK\] abandoning pending request (\S+)")
+@@ -109,8 +113,10 @@
+ def source_token_counts(raw: dict, start: int, end: int) -> dict[str, int]:
+     out = {"L0": 0, "L1": 0, "L2": 0}
+     cs = raw["chunk_size"]
++    offset = raw.get("start_token", 0)
+     for i, tier in enumerate(raw["source_tiers"]):
+-        out[tier] += overlap(start, end, i * cs, (i + 1) * cs)
++        chunk_start = offset + i * cs
++        out[tier] += overlap(start, end, chunk_start, chunk_start + cs)
+     return out
+ 
+ 
+@@ -173,6 +179,7 @@
+                 lifetimes.append(age)
+ 
+     admits: dict[str, dict] = {}
++    mutual_lookup_starts: dict[str, int] = {}
+     freshness: list[tuple[str, float]] = []
+     starvation_requests: list[str] = []
+     starvation_wave_sum = 0
+@@ -192,6 +199,8 @@
+                     "age": float(age),
+                 },
+             )
++        if m := MUTUAL_PREFIX_RE.search(line):
++            mutual_lookup_starts[m.group(1)] = int(m.group(4))
+         if m := FRESH_RE.search(line):
+             freshness.append((m.group(1), float(m.group(2))))
+         if m := STARVE_REQ_RE.search(line):
+@@ -201,6 +210,12 @@
+         if m := RECOVERY_RE.search(line):
+             recovery_waves += 1
+             recovered_request_events += int(m.group(1))
++
++    # Raw source_tiers are relative to the submitted LMCache lookup range.
++    # Under mutual-prefix lookup that range can start after token 0, so carry
++    # the vLLM-side lookup offset into CHTHM overlap accounting.
++    for rid, rec in raw.items():
++        rec["start_token"] = mutual_lookup_starts.get(rid, 0)
+ 
+     # Backward-compatible raw-source reconstruction for older L0-off logs.
+     # Their MP_CHTHM_LOOKUP records describe a monotonic L1 prefix followed by
+@@ -220,6 +235,7 @@
+             "l1_hit_chunks": l1_chunks,
+             "l2_hit_chunks": l2_chunks,
+             "source_tiers": ["L1"] * l1_chunks + ["L2"] * l2_chunks,
++            "start_token": mutual_lookup_starts.get(rid, 0),
+             "reconstructed_from_legacy_lookup": True,
+         }
+ 
+diff --git a/scripts/run_shortq_gnn_dynamic_vpc_common.sh b/scripts/run_shortq_gnn_dynamic_vpc_common.sh
+--- a/scripts/run_shortq_gnn_dynamic_vpc_common.sh
++++ b/scripts/run_shortq_gnn_dynamic_vpc_common.sh
+@@ -29,6 +29,7 @@
+ # pre-patch dynamic-VPC experiment except for the historical starvation
+ # fallback, which was already enabled.
+ KV_VPC_SUFFICIENT_BYPASS="${KV_VPC_SUFFICIENT_BYPASS:-0}"
++KV_MUTUAL_PREFIX="${KV_MUTUAL_PREFIX:-0}"
+ KV_STAGE1_STARVATION_FALLBACK="${KV_STAGE1_STARVATION_FALLBACK:-1}"
+ KV_STAGE1_OCCUPANCY_FALLBACK="${KV_STAGE1_OCCUPANCY_FALLBACK:-0}"
+ KV_STAGE1_OCCUPANCY_LOW_FRACTION="${KV_STAGE1_OCCUPANCY_LOW_FRACTION:-0.50}"
+@@ -49,7 +50,7 @@
+ KV_FS_DELETE_WORKERS="${KV_FS_DELETE_WORKERS:-0}"
+ 
+ for name in KV_GNN_AWARE_VPC KV_GNN_L1_BACKING \
+-  KV_VPC_SUFFICIENT_BYPASS KV_STAGE1_STARVATION_FALLBACK \
++  KV_VPC_SUFFICIENT_BYPASS KV_MUTUAL_PREFIX KV_STAGE1_STARVATION_FALLBACK \
+   KV_STAGE1_OCCUPANCY_FALLBACK KV_FS_PER_OP_WORKERS; do
+   value="${!name}"
+   [[ "$value" == "0" || "$value" == "1" ]] || {
+@@ -102,7 +103,9 @@
+     ;;
+ esac
+ 
+-RUN_DIR="${RUN_ROOT}/${RUN_LABEL}_${SLURM_JOB_ID}"
++EXPERIMENT_LABEL="${EXPERIMENT_LABEL:-}"
++RUN_LABEL_SUFFIX="${EXPERIMENT_LABEL:+_${EXPERIMENT_LABEL}}"
++RUN_DIR="${RUN_ROOT}/${RUN_LABEL}${RUN_LABEL_SUFFIX}_${SLURM_JOB_ID}"
+ LOG_DIR="${RUN_DIR}/logs"
+ RESULT_DIR="${RUN_DIR}/results"
+ PLACEMENT_DIR="${RUN_DIR}/placement"
+@@ -195,6 +198,7 @@
+ export LMCACHE_MP_STAGE1_FRESHNESS_GUARD_S=270
+ export LMCACHE_MP_CONGESTION_DEBUG=1 LMCACHE_MP_CONGESTION_LOG_EVERY=25 LMCACHE_MP_CONGESTION_SLOW_S=5
+ export LMCACHE_MP_CHTHM_DEBUG=1
++export LMCACHE_MP_PREFIX_DIAGNOSTICS="${LMCACHE_MP_PREFIX_DIAGNOSTICS:-0}"
+ export LMCACHE_CHUNK_SIZE
+ 
+ LMCACHE_PID=""; VLLM_PID=""
+@@ -252,6 +256,9 @@
+   "gnn_aware_vpc": $KV_GNN_AWARE_VPC,
+   "gnn_aware_vpc_window": $VLLM_GNN_AWARE_VPC_WINDOW,
+   "vpc_sufficient_bypass": $KV_VPC_SUFFICIENT_BYPASS,
++  "mutual_prefix": $KV_MUTUAL_PREFIX,
++  "experiment_label": "$EXPERIMENT_LABEL",
++  "prefix_diagnostics": $LMCACHE_MP_PREFIX_DIAGNOSTICS,
+   "stage1_starvation_fallback": $KV_STAGE1_STARVATION_FALLBACK,
+   "stage1_occupancy_fallback": $KV_STAGE1_OCCUPANCY_FALLBACK,
+   "stage1_occupancy_low_fraction": $KV_STAGE1_OCCUPANCY_LOW_FRACTION,
+@@ -332,7 +339,7 @@
+ KV_CONFIG=$(python - "$LMCACHE_MP_TIMEOUT" "$KV_STAGE1_STARVATION_FALLBACK" \
+   "$KV_STAGE1_OCCUPANCY_FALLBACK" "$KV_STAGE1_OCCUPANCY_LOW_FRACTION" \
+   "$KV_STAGE1_OCCUPANCY_TARGET_FRACTION" "$KV_STAGE1_OCCUPANCY_GRACE_S" \
+-  "$KV_VPC_SUFFICIENT_BYPASS" <<'PY'
++  "$KV_VPC_SUFFICIENT_BYPASS" "$KV_MUTUAL_PREFIX" <<'PY'
+ import json,sys
+ timeout=float(sys.argv[1])
+ print(json.dumps({
+@@ -351,6 +358,7 @@
+     'lmcache.mp.occupancy_target_fraction':float(sys.argv[5]),
+     'lmcache.mp.occupancy_grace_s':float(sys.argv[6]),
+     'lmcache.mp.vpc_sufficient_bypass':bool(int(sys.argv[7])),
++    'lmcache.mp.mutual_prefix':bool(int(sys.argv[8])),
+   },
+ }))
+ PY
+diff --git a/scripts/run_h100_l0off_q650_l1_prefetch_grid_cleanall.sbatch b/scripts/run_h100_l0off_q650_l1_prefetch_grid_cleanall.sbatch
+--- a/scripts/run_h100_l0off_q650_l1_prefetch_grid_cleanall.sbatch
++++ b/scripts/run_h100_l0off_q650_l1_prefetch_grid_cleanall.sbatch
+@@ -75,6 +75,16 @@
+ # Real project baseline: VPC enabled. Set ENABLE_VPC=0 only for targeted
+ # isolation experiments later (especially during L0 validation).
+ ENABLE_VPC="${ENABLE_VPC:-1}"
++KV_VPC_SUFFICIENT_BYPASS="${KV_VPC_SUFFICIENT_BYPASS:-0}"
++KV_MUTUAL_PREFIX="${KV_MUTUAL_PREFIX:-0}"
++
++for name in KV_VPC_SUFFICIENT_BYPASS KV_MUTUAL_PREFIX; do
++    value="${!name}"
++    [[ "$value" == "0" || "$value" == "1" ]] || {
++        echo "ERROR: $name must be 0 or 1, got $value" >&2
++        exit 2
++    }
++done
+ 
+ # Preserve legacy compiled-mode intent by default. Set to 1 if debugging.
+ ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
+@@ -122,6 +132,7 @@
+ export LMCACHE_MP_CONGESTION_LOG_EVERY="${LMCACHE_MP_CONGESTION_LOG_EVERY:-25}"
+ export LMCACHE_MP_CONGESTION_SLOW_S="${LMCACHE_MP_CONGESTION_SLOW_S:-5}"
+ export LMCACHE_MP_CHTHM_DEBUG="${LMCACHE_MP_CHTHM_DEBUG:-0}"
++export LMCACHE_MP_PREFIX_DIAGNOSTICS="${LMCACHE_MP_PREFIX_DIAGNOSTICS:-0}"
+ 
+ # This grid is explicitly the L0-OFF baseline.  The L0 server feature is
+ # disabled by default because this script never passes --l0-enable; also
+@@ -277,6 +288,10 @@
+ echo "Stage1 freshness s:  ${LMCACHE_MP_STAGE1_FRESHNESS_GUARD_S}"
+ echo "MP congestion debug: ${LMCACHE_MP_CONGESTION_DEBUG}"
+ echo "MP CHTHM debug:      ${LMCACHE_MP_CHTHM_DEBUG}"
++echo "prefix diagnostics:  ${LMCACHE_MP_PREFIX_DIAGNOSTICS}"
++echo "VPC bypass:          ${KV_VPC_SUFFICIENT_BYPASS}"
++echo "mutual prefix:       ${KV_MUTUAL_PREFIX}"
++echo "fs workers:          shared=${KV_FS_SHARED_WORKERS:-$LMCACHE_L2_WORKERS} lookup=${KV_FS_LOOKUP_WORKERS:-0} retrieve=${KV_FS_RETRIEVE_WORKERS:-0} store=${KV_FS_STORE_WORKERS:-0} delete=${KV_FS_DELETE_WORKERS:-0}"
+ echo "============================================================"
+ 
+ # ============================================================================
+@@ -633,6 +648,15 @@
+   "lmcache_mp_congestion_log_every": ${LMCACHE_MP_CONGESTION_LOG_EVERY},
+   "lmcache_mp_congestion_slow_s": ${LMCACHE_MP_CONGESTION_SLOW_S},
+   "lmcache_mp_chthm_debug": ${LMCACHE_MP_CHTHM_DEBUG},
++  "lmcache_mp_prefix_diagnostics": ${LMCACHE_MP_PREFIX_DIAGNOSTICS},
++  "vpc_sufficient_bypass": ${KV_VPC_SUFFICIENT_BYPASS},
++  "mutual_prefix": ${KV_MUTUAL_PREFIX},
++  "fs_per_op_workers": ${KV_FS_PER_OP_WORKERS:-0},
++  "fs_shared_workers": ${KV_FS_SHARED_WORKERS:-$LMCACHE_L2_WORKERS},
++  "fs_lookup_workers": ${KV_FS_LOOKUP_WORKERS:-0},
++  "fs_retrieve_workers": ${KV_FS_RETRIEVE_WORKERS:-0},
++  "fs_store_workers": ${KV_FS_STORE_WORKERS:-0},
++  "fs_delete_workers": ${KV_FS_DELETE_WORKERS:-0},
+   "enable_vpc": ${ENABLE_VPC},
+   "cuda_mps_bypass": true,
+   "cuda_mps_pipe_directory": "${CUDA_MPS_PIPE_DIRECTORY}",
+@@ -725,11 +749,13 @@
+ echo "===== START VLLM SERVER ====="
+ 
+ KV_TRANSFER_CONFIG=$(
+-python - "$LMCACHE_MP_TIMEOUT" <<'PY'
++python - "$LMCACHE_MP_TIMEOUT" "$KV_VPC_SUFFICIENT_BYPASS" "$KV_MUTUAL_PREFIX" <<'PY'
+ import json
+ import sys
+ 
+ timeout = float(sys.argv[1])
++vpc_sufficient_bypass = bool(int(sys.argv[2]))
++mutual_prefix = bool(int(sys.argv[3]))
+ 
+ print(
+     json.dumps(
+@@ -744,6 +770,8 @@
+                 "lmcache.mp.mq_timeout": timeout,
+                 "lmcache.mp.lookup_timeout": 0.0,
+                 "lmcache.mp.starvation_fallback": True,
++                "lmcache.mp.vpc_sufficient_bypass": vpc_sufficient_bypass,
++                "lmcache.mp.mutual_prefix": mutual_prefix,
+             },
+         }
+     )
+diff --git a/scripts/submit_h100_mutual_prefix_grid.sh b/scripts/submit_h100_mutual_prefix_grid.sh
+new file mode 100755
+--- /dev/null
++++ b/scripts/submit_h100_mutual_prefix_grid.sh
+@@ -0,0 +1,106 @@
++#!/usr/bin/env bash
++set -Eeuo pipefail
++
++# Six-run mutual-prefix grid. Both arms use the same scheduler/storage semantics:
++#   - mutual prefix ON
++#   - VPC-sufficient bypass ON
++#   - legacy Stage-1 starvation fallback ON
++#   - occupancy fallback OFF
++#   - prefix diagnostics ON
++# Only the learned GNN placement/VPC-retention policy differs between arms.
++#
++# Runs are chained with afterany because both experiment scripts perform an
++# aggressive /scratch2/sriramc2 cleanup. Serializing the jobs also makes the
++# filesystem-pressure comparisons easier to interpret.
++
++GNN_SCRIPT="scripts/run_h100_shortq_gnn_dynamic_vpc_q650.sbatch"
++NOGNN_SCRIPT="scripts/run_h100_l0off_q650_l1_prefetch_grid_cleanall.sbatch"
++DEPENDENCY_TYPE="${DEPENDENCY_TYPE:-afterany}"
++DRY_RUN="${DRY_RUN:-0}"
++
++common_exports=(
++  KV_FS_PER_OP_WORKERS=1
++  KV_FS_LOOKUP_WORKERS=1
++  KV_FS_STORE_WORKERS=0
++  KV_FS_DELETE_WORKERS=0
++  KV_VPC_SUFFICIENT_BYPASS=1
++  KV_MUTUAL_PREFIX=1
++  KV_STAGE1_STARVATION_FALLBACK=1
++  KV_STAGE1_OCCUPANCY_FALLBACK=0
++  LMCACHE_MP_PREFIX_DIAGNOSTICS=1
++  LMCACHE_MP_CONGESTION_DEBUG=1
++  LMCACHE_MP_CHTHM_DEBUG=1
++  LMCACHE_MP_STAGE1_FRESHNESS_GUARD_S=270
++)
++
++# label PF shared retrieve
++configs=(
++  "pf2_s5_r2 2 5 2"
++  "pf8_s5_r2 8 5 2"
++  "pf8_s10_r5 8 10 5"
++)
++
++join_exports() {
++  local IFS=,
++  echo "$*"
++}
++
++submit_one() {
++  local arm="$1" label="$2" pf="$3" shared="$4" retrieve="$5" dep="${6:-}"
++  local script run_label
++  local -a exports=("${common_exports[@]}")
++  exports+=(
++    "LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT=${pf}"
++    "KV_FS_SHARED_WORKERS=${shared}"
++    "KV_FS_RETRIEVE_WORKERS=${retrieve}"
++  )
++
++  if [[ "$arm" == "gnn" ]]; then
++    script="$GNN_SCRIPT"
++    run_label="gnn_mutual_${label}"
++    exports+=(
++      "EXPERIMENT_LABEL=${run_label}"
++      "KV_GNN_AWARE_VPC=1"
++      "KV_GNN_L1_BACKING=1"
++    )
++  else
++    script="$NOGNN_SCRIPT"
++    run_label="nognn_mutual_${label}"
++    exports+=(
++      "GRID_LABEL=${run_label}"
++      "LMCACHE_L1_SIZE_GB=200"
++      "GPU_MEMORY_UTILIZATION=0.65"
++      "MAX_NUM_SEQS=16"
++      "ENABLE_VPC=1"
++    )
++  fi
++
++  local export_arg
++  export_arg="ALL,$(join_exports "${exports[@]}")"
++  local -a cmd=(sbatch --parsable --export="$export_arg")
++  if [[ -n "$dep" ]]; then
++    cmd+=(--dependency="${DEPENDENCY_TYPE}:${dep}")
++  fi
++  cmd+=("$script")
++
++  { printf '%q ' "${cmd[@]}"; echo; } >&2
++  if [[ "$DRY_RUN" == "1" ]]; then
++    return 0
++  fi
++  "${cmd[@]}"
++}
++
++prev_job=""
++for row in "${configs[@]}"; do
++  read -r label pf shared retrieve <<<"$row"
++  for arm in gnn nognn; do
++    if [[ "$DRY_RUN" == "1" ]]; then
++      submit_one "$arm" "$label" "$pf" "$shared" "$retrieve" "$prev_job"
++      continue
++    fi
++    raw_job_id="$(submit_one "$arm" "$label" "$pf" "$shared" "$retrieve" "$prev_job" | tail -n1)"
++    job_id="${raw_job_id%%;*}"
++    echo "submitted arm=${arm} config=${label} job=${job_id}${prev_job:+ dependency=${DEPENDENCY_TYPE}:${prev_job}}" >&2
++    prev_job="$job_id"
++  done
++done
+diff --git a/third_party/LMCache/tests/v1/test_mp_nonblocking_lookup.py b/third_party/LMCache/tests/v1/test_mp_nonblocking_lookup.py
+--- a/third_party/LMCache/tests/v1/test_mp_nonblocking_lookup.py
++++ b/third_party/LMCache/tests/v1/test_mp_nonblocking_lookup.py
+@@ -157,6 +157,30 @@
+     raise AssertionError("completed status did not become observable")
+ 
+ 
++def test_ranged_lookup_starts_after_local_prefix_and_returns_suffix_length(
++    make_adapter: AdapterFactory,
++) -> None:
++    adapter, (client,) = make_adapter()
++    adapter.maybe_submit_lookup_request(
++        "r",
++        list(range(256)),
++        cache_salt="tenant",
++        request_configs={"tag": "value"},
++        start=128,
++    )
++    assert len(client.lookups) == 1
++    key = client.lookups[0]
++    assert key.start == 128
++    assert key.end == 256
++
++    client.ack.set_result(None)
++    client.status.set_result(1)
++    # Status results stay relative to the requested external suffix. The
++    # connector adds the VPC-covered lookup start back to form the absolute
++    # mutual-prefix endpoint.
++    assert resolved(adapter) == 64
++
++
+ @pytest.mark.parametrize("setting", [False, "false"])
+ def test_explicit_blocking_status_reply_is_consumed_in_the_same_callback(
+     make_adapter: AdapterFactory, setting: bool | str
+diff --git a/third_party/LMCache/tests/v1/multiprocess/test_lookup_wait_prefetch.py b/third_party/LMCache/tests/v1/multiprocess/test_lookup_wait_prefetch.py
+--- a/third_party/LMCache/tests/v1/multiprocess/test_lookup_wait_prefetch.py
++++ b/third_party/LMCache/tests/v1/multiprocess/test_lookup_wait_prefetch.py
+@@ -26,6 +26,7 @@
+     ctx.storage_manager = storage_manager
+     ctx.event_bus = mock.Mock()
+     ctx.chunk_size = 256
++    ctx.session_manager.get_or_create.return_value.lookup_ipc_key.start = 0
+     return ctx
+ 
+ 
+@@ -73,6 +74,35 @@
+     session.record_prefetch_result.assert_called_once_with(4, (0,))
+ 
+ 
++def test_wait_prefetch_status_records_absolute_hit_end_for_ranged_lookup():
++    # The prefetch result is 4 chunks relative to a lookup that starts at
++    # chunk 2. Lock cleanup must remember absolute end chunk 6.
++    num_keys = 4
++    found = Bitmap(num_keys, num_keys)
++    handle = PrefetchHandle(
++        prefetch_request_id=0,
++        external_request_id="req",
++        l1_found_indices=(),
++        l1_hit_chunks=0,
++        total_requested_keys=num_keys,
++        submit_time=0.0,
++    )
++    ctx = _make_ctx(wait_result=True, found=found)
++    ctx.chunk_size = 256
++    session = ctx.session_manager.get_or_create.return_value
++    session.lookup_ipc_key.start = 512
++    module = _make_module(ctx)
++    module._prefetch_jobs["req"] = _PrefetchJob(
++        handle=handle,
++        world_size=1,
++        request_id="req",
++        requested_tokens=1024,
++    )
++
++    assert module.wait_prefetch_status("req", timeout=1.0) == 4
++    session.record_prefetch_result.assert_called_once_with(6, (0,))
++
++
+ def test_wait_prefetch_status_timeout_returns_none_and_keeps_job():
+     ctx = _make_ctx(wait_result=False)
+     module = _make_module(ctx)
