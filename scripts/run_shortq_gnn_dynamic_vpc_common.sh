@@ -23,7 +23,18 @@ GNN_INFERENCE_BATCH_SIZE="${GNN_INFERENCE_BATCH_SIZE:-1}"
 # KV_GNN_AWARE_VPC=0; only the learned retention bias is disabled.
 KV_GNN_AWARE_VPC="${KV_GNN_AWARE_VPC:-1}"
 KV_GNN_L1_BACKING="${KV_GNN_L1_BACKING:-1}"
+# Optional durability experiment: back every host-resident GNN prompt chunk to
+# L2 while preserving its original VPC/L1 placement. Disabled by default so
+# existing grid runs are unchanged.
+KV_GNN_L2_BACKING="${KV_GNN_L2_BACKING:-0}"
 VLLM_GNN_AWARE_VPC_WINDOW="${VLLM_GNN_AWARE_VPC_WINDOW:-256}"
+
+# Optional true cold->warm persistence barrier. When enabled, the driver waits
+# for LMCache StoreController + L1 writes to remain fully drained before warm.
+KV_COLD_WARM_STORE_BARRIER="${KV_COLD_WARM_STORE_BARRIER:-0}"
+KV_STORE_BARRIER_TIMEOUT_S="${KV_STORE_BARRIER_TIMEOUT_S:-7200}"
+KV_STORE_BARRIER_POLL_S="${KV_STORE_BARRIER_POLL_S:-1}"
+KV_STORE_BARRIER_STABLE_POLLS="${KV_STORE_BARRIER_STABLE_POLLS:-5}"
 
 # Three independently gated scheduler/storage fixes. Defaults preserve the
 # pre-patch dynamic-VPC experiment except for the historical starvation
@@ -49,9 +60,10 @@ KV_FS_RETRIEVE_WORKERS="${KV_FS_RETRIEVE_WORKERS:-4}"
 KV_FS_STORE_WORKERS="${KV_FS_STORE_WORKERS:-0}"
 KV_FS_DELETE_WORKERS="${KV_FS_DELETE_WORKERS:-0}"
 
-for name in KV_GNN_AWARE_VPC KV_GNN_L1_BACKING \
-  KV_VPC_SUFFICIENT_BYPASS KV_MUTUAL_PREFIX KV_STAGE1_STARVATION_FALLBACK \
-  KV_STAGE1_OCCUPANCY_FALLBACK KV_FS_PER_OP_WORKERS; do
+for name in KV_GNN_AWARE_VPC KV_GNN_L1_BACKING KV_GNN_L2_BACKING \
+  KV_COLD_WARM_STORE_BARRIER KV_VPC_SUFFICIENT_BYPASS KV_MUTUAL_PREFIX \
+  KV_STAGE1_STARVATION_FALLBACK KV_STAGE1_OCCUPANCY_FALLBACK \
+  KV_FS_PER_OP_WORKERS; do
   value="${!name}"
   [[ "$value" == "0" || "$value" == "1" ]] || {
     echo "ERROR: $name must be 0 or 1, got $value" >&2
@@ -105,7 +117,34 @@ esac
 
 EXPERIMENT_LABEL="${EXPERIMENT_LABEL:-}"
 RUN_LABEL_SUFFIX="${EXPERIMENT_LABEL:+_${EXPERIMENT_LABEL}}"
-RUN_DIR="${RUN_ROOT}/${RUN_LABEL}${RUN_LABEL_SUFFIX}_${SLURM_JOB_ID}"
+
+# Interactive reruns inside one srun allocation reuse SLURM_JOB_ID. Reserve a
+# unique result directory atomically while keeping the job ID at the very end
+# of the basename so existing folder-discovery aliases continue to work:
+#   run_name_20908
+#   2_run_name_20908
+#   3_run_name_20908
+reserve_unique_run_dir() {
+  local base="$1"
+  local parent name candidate n=1
+  parent="$(dirname -- "$base")"
+  name="$(basename -- "$base")"
+  mkdir -p "$parent"
+  while :; do
+    if (( n == 1 )); then
+      candidate="$base"
+    else
+      candidate="${parent}/${n}_${name}"
+    fi
+    if mkdir "$candidate" 2>/dev/null; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+    ((n += 1))
+  done
+}
+
+RUN_DIR="$(reserve_unique_run_dir "${RUN_ROOT}/${RUN_LABEL}${RUN_LABEL_SUFFIX}_${SLURM_JOB_ID}")"
 LOG_DIR="${RUN_DIR}/logs"
 RESULT_DIR="${RUN_DIR}/results"
 PLACEMENT_DIR="${RUN_DIR}/placement"
@@ -188,6 +227,7 @@ export VLLM_KV_IMPORTANCE_TIERS="$VPC_IMPORTANCE_SIDECAR"
 export LMCACHE_GNN_EXCLUSIVE_PLACEMENT=0
 export LMCACHE_GNN_DYNAMIC_STORE=1
 export LMCACHE_GNN_L1_BACKING="$KV_GNN_L1_BACKING"
+export LMCACHE_GNN_L2_BACKING="$KV_GNN_L2_BACKING"
 export LMCACHE_GNN_PLACEMENT_METADATA="$RUNTIME_METADATA"
 export LMCACHE_L0_SMOKE_STORE=0
 export LMCACHE_L0_VPC_IMITATION=0
@@ -271,6 +311,11 @@ cat > "${RUN_DIR}/run_config.json" <<JSON
   "fs_store_workers": $KV_FS_STORE_WORKERS,
   "fs_delete_workers": $KV_FS_DELETE_WORKERS,
   "gnn_l1_backing": $KV_GNN_L1_BACKING,
+  "gnn_l2_backing": $KV_GNN_L2_BACKING,
+  "cold_warm_store_barrier": $KV_COLD_WARM_STORE_BARRIER,
+  "store_barrier_timeout_s": $KV_STORE_BARRIER_TIMEOUT_S,
+  "store_barrier_poll_s": $KV_STORE_BARRIER_POLL_S,
+  "store_barrier_stable_polls": $KV_STORE_BARRIER_STABLE_POLLS,
   "placement": "shortq_dynamic_vpc_plus_lower_backing",
   "chunk_vote_policy": "$GNN_CHUNK_VOTE_POLICY",
   "runtime_metadata": "$RUNTIME_METADATA",
@@ -391,6 +436,18 @@ DARGS=(
   --deterministic_request_ids --output_dir "$RESULT_DIR"
 )
 
+if [[ "$KV_COLD_WARM_STORE_BARRIER" == "1" ]]; then
+  DARGS+=(
+    --between_phases_store_barrier
+    --lmcache_status_url http://127.0.0.1:8080/status
+    --store_barrier_timeout_s "$KV_STORE_BARRIER_TIMEOUT_S"
+    --store_barrier_poll_s "$KV_STORE_BARRIER_POLL_S"
+    --store_barrier_stable_polls "$KV_STORE_BARRIER_STABLE_POLLS"
+    --store_barrier_result_path "${RUN_DIR}/store_barrier.json"
+    --metrics_after_barrier_path "${RUN_DIR}/metrics_after_barrier.txt"
+  )
+fi
+
 echo "===== COLD + WARM WORKLOAD ====="
 CUDA_VISIBLE_DEVICES="" python experiments/mp_nognn_project.py "${DARGS[@]}" \
   > "${LOG_DIR}/driver.log" 2>&1 || { tail -300 "${LOG_DIR}/driver.log"; exit 50; }
@@ -408,17 +465,27 @@ python scripts/analyze_vllm_phase_metrics.py \
   --after-warm "${RUN_DIR}/metrics_after.txt" --output "${RUN_DIR}/vllm_phase_metrics.json" \
   > "${RUN_DIR}/vllm_phase_metrics.txt" 2>&1 || true
 
-python - "$RESULT_DIR" "$PLACEMENT_SUMMARY" "$LOG_DIR" "$PROFILE" "$KV_GNN_AWARE_VPC" "$KV_GNN_L1_BACKING" <<'PY'
+python - "$RESULT_DIR" "$PLACEMENT_SUMMARY" "$LOG_DIR" "$PROFILE" \
+  "$KV_GNN_AWARE_VPC" "$KV_GNN_L1_BACKING" "$KV_GNN_L2_BACKING" \
+  "$KV_COLD_WARM_STORE_BARRIER" <<'PY'
 import json, pathlib, re, sys
 results=pathlib.Path(sys.argv[1]); placement=json.load(open(sys.argv[2])); logs=pathlib.Path(sys.argv[3])
 profile=sys.argv[4]; aware=sys.argv[5]=='1'; backing=sys.argv[6]=='1'
+l2_backing=sys.argv[7]=='1'; store_barrier=sys.argv[8]=='1'
 summary=json.load(open(results/'summary.json'))
 assert summary['cold']['successful']==summary['cold']['requests']
 assert summary['warm']['successful']==summary['warm']['requests']
+assert bool(summary.get('store_barrier', {}).get('enabled', False)) == store_barrier, \
+    ('store barrier gate/result mismatch', store_barrier, summary.get('store_barrier'))
 lm=(logs/'lmcache.log').read_text(errors='replace')
 vl=(logs/'vllm.log').read_text(errors='replace')
 assert '[GNN_DYNAMIC_STORE]' in lm, 'dynamic GNN store path never executed'
 assert '[GNN_DYNAMIC_L2_POLICY]' in lm, 'dynamic GNN L2 policy never executed'
+if l2_backing:
+    assert '[GNN_DYNAMIC_L2_BACKING_INIT] enabled=True' in lm, \
+        'GNN L2 backing was requested but policy did not enable it'
+    assert re.search(r'\[GNN_DYNAMIC_L2_POLICY\].*backing_targets=[1-9]\d*.*l2_backing=True', lm), \
+        'GNN L2 backing enabled but no GPU/L1 placement was targeted for L2 backing'
 assert '[GNN_PLACEMENT_METADATA_MISS]' not in lm, 'placement metadata miss detected'
 assert 'Initialized LMCache L0 arena' not in lm, 'L0 unexpectedly initialized'
 if aware:

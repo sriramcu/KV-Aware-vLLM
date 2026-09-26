@@ -1238,6 +1238,68 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         lmcache_hit_end_tokens = lookup_start_tokens + ret
 
+        # Mutual-prefix lookups are submitted against the VPC boundary that
+        # existed at submission time. The lookup is asynchronous, so ordinary
+        # VPC eviction/reclamation can shorten the local prefix before the
+        # result is consumed. In that case the external suffix no longer
+        # touches the current local prefix and admitting it would create an
+        # invalid hole:
+        #
+        #   submission: [ VPC ............ ][ LMCache suffix ........ ]
+        #   completion: [ VPC ]   GAP       [ LMCache suffix ........ ]
+        #
+        # Fail closed instead of trying to splice across that gap. Release the
+        # read reservations acquired by the ranged lookup, discard its result,
+        # and let this request recompute locally. Once vLLM admits the request,
+        # update_state_after_alloc() moves BYPASS_LMCACHE back to READY so the
+        # normal store path remains intact.
+        if (
+            self._mutual_prefix_enabled
+            and ret > 0
+            and num_computed_tokens < lookup_start_tokens
+        ):
+            logger.warning(
+                "[MP_MUTUAL_PREFIX_STALE_BRIDGE] request=%s "
+                "lookup_start_tokens=%d current_vllm_hit_tokens=%d "
+                "lmcache_hit_end_tokens=%d lookup_age_s=%.3f "
+                "action=recompute",
+                request.request_id,
+                lookup_start_tokens,
+                num_computed_tokens,
+                lmcache_hit_end_tokens,
+                lookup_age_s,
+            )
+            self.scheduler_adapter.free_lookup_locks(
+                token_ids=tracker.get_token_ids(),
+                start=lookup_start_tokens,
+                end=lmcache_hit_end_tokens,
+                request_id=request.request_id,
+                cache_salt=tracker.cache_salt,
+                request_configs=tracker.request_configs,
+            )
+            self.scheduler_adapter.cleanup_lookup_result(request.request_id)
+            tracker.num_vllm_hit_tokens = (
+                num_computed_tokens
+                // self._hit_alignment_tokens
+                * self._hit_alignment_tokens
+            )
+            tracker.num_lmcache_hit_tokens = 0
+            tracker.state = LMCacheMPRequestState.BYPASS_LMCACHE
+            if self._chthm_debug:
+                logger.info(
+                    "[MP_CHTHM_ADMIT] request=%s decision=stale_mutual_bridge "
+                    "prompt_tokens=%d vllm_hit_tokens=%d "
+                    "lmcache_hit_tokens=%d external_load_tokens=0 "
+                    "lookup_start_tokens=%d lookup_age_s=%.3f",
+                    request.request_id,
+                    len(request.all_token_ids),
+                    tracker.num_vllm_hit_tokens,
+                    lmcache_hit_end_tokens,
+                    lookup_start_tokens,
+                    lookup_age_s,
+                )
+            return 0, False
+
         # Freshness gate before Stage-2 admission.  L1 read reservations are
         # acquired during Stage 1 (including the initial L1 lock pass), so a
         # very old completed lookup can already be unsafe to consume even

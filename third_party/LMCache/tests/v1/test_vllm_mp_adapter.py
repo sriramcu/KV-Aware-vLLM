@@ -1119,3 +1119,70 @@ def test_recovery_reports_the_ring_re_registration_result(fake_adapter, ring_ok)
     adapter.register_kv_caches({"layer.0": fake_tensor})
 
     assert adapter._reregister_kv_caches_callback() is ring_ok
+
+
+def test_mutual_prefix_rejects_stale_vpc_bridge_and_releases_suffix_locks() -> None:
+    """A ranged LMCache hit must not bridge across a VPC prefix that shrank."""
+    pytest.importorskip("vllm")
+
+    # Third Party
+    from vllm.v1.request import RequestStatus
+
+    # First Party
+    from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector
+    from lmcache.integration.vllm.lmcache_mp_metadata import (
+        LMCacheMPRequestState,
+        LMCacheMPRequestTracker,
+    )
+
+    class _Request:
+        def __init__(self) -> None:
+            self.request_id = "req-mutual-race"
+            self.status = RequestStatus.WAITING
+            self.num_computed_tokens = 96
+            self.num_preemptions = 0
+            self.cache_salt = ""
+            self.prompt_token_ids = list(range(6000))
+            self.all_token_ids = list(range(6000))
+            self.mm_features: list[object] = []
+
+    request = _Request()
+    tracker = LMCacheMPRequestTracker(request)  # type: ignore[arg-type]
+    tracker.lookup_started_at = time.monotonic() - 1.0
+    # Lookup was submitted while VPC reached 3296 tokens, so its ranged
+    # LMCache key began at the containing 512-token boundary.
+    tracker.lmcache_lookup_start_tokens = 3072
+
+    connector = LMCacheMPConnector.__new__(LMCacheMPConnector)
+    connector.request_trackers = {request.request_id: tracker}
+    connector.scheduler_adapter = MagicMock(name="scheduler_adapter")
+    connector.scheduler_adapter.lmcache_tokens_per_chunk = 512
+    connector.scheduler_adapter.check_lookup_result.return_value = 2048
+    connector._connector_stats = MagicMock(name="connector_stats")
+    connector._vpc_sufficient_bypass_enabled = False
+    connector._mutual_prefix_enabled = True
+    connector._stage1_result_freshness_guard_s = 270.0
+    connector._hit_alignment_tokens = 16
+    connector._chthm_debug = False
+
+    matched_tokens, load_async = connector.get_num_new_matched_tokens(
+        request,
+        num_computed_tokens=96,  # VPC has shrunk below the 3072 lookup start.
+    )
+
+    assert (matched_tokens, load_async) == (0, False)
+    connector.scheduler_adapter.free_lookup_locks.assert_called_once_with(
+        token_ids=tracker.get_token_ids(),
+        start=3072,
+        end=5120,
+        request_id=request.request_id,
+        cache_salt="",
+        request_configs=tracker.request_configs,
+    )
+    connector.scheduler_adapter.cleanup_lookup_result.assert_called_once_with(
+        request.request_id
+    )
+    assert tracker.state == LMCacheMPRequestState.BYPASS_LMCACHE
+    assert tracker.num_vllm_hit_tokens == 96
+    assert tracker.num_lmcache_hit_tokens == 0
+    assert tracker.num_stored_tokens == 0

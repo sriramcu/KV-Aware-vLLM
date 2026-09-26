@@ -695,6 +695,133 @@ def emit_output_consistency(
     return summary
 
 
+def wait_for_lmcache_store_barrier(
+    *,
+    status_url: str,
+    timeout_s: float,
+    poll_s: float,
+    stable_polls: int,
+) -> dict[str, Any]:
+    """Wait until cold-phase host writes and L2 stores are fully drained.
+
+    A single zero observation is not sufficient because worker-side GPU->L1
+    commits can arrive shortly after the cold HTTP responses have completed.
+    The barrier therefore requires the LMCache store controller to have no
+    listener backlog, no in-flight L2 store tasks, and no L1 write-locked
+    objects for ``stable_polls`` consecutive observations.
+    """
+    if timeout_s <= 0:
+        raise ValueError("store barrier timeout must be > 0")
+    if poll_s <= 0:
+        raise ValueError("store barrier poll interval must be > 0")
+    if stable_polls < 1:
+        raise ValueError("store barrier stable_polls must be >= 1")
+
+    started = time.monotonic()
+    stable = 0
+    polls = 0
+    peak_pending = 0
+    peak_in_flight = 0
+    peak_write_locked = 0
+    last_status: dict[str, Any] | None = None
+    log_every_polls = max(1, int(round(30.0 / poll_s)))
+
+    print(
+        "[SC_STORE_BARRIER_START] "
+        f"url={status_url} timeout_s={timeout_s:.1f} "
+        f"poll_s={poll_s:.2f} stable_polls={stable_polls}",
+        flush=True,
+    )
+
+    while True:
+        elapsed = time.monotonic() - started
+        if elapsed > timeout_s:
+            raise TimeoutError(
+                "LMCache cold->warm store barrier timed out after "
+                f"{elapsed:.1f}s; last_status={last_status}"
+            )
+
+        response = requests.get(
+            status_url, timeout=min(30.0, max(5.0, poll_s * 5))
+        )
+        response.raise_for_status()
+        status = response.json()
+        last_status = status
+        storage = status.get("storage_manager", {})
+        store = storage.get("store_controller", {})
+        l1 = storage.get("l1_manager", {})
+
+        if not status.get("is_healthy", False):
+            raise RuntimeError(
+                "LMCache became unhealthy while waiting at the cold->warm "
+                f"store barrier: {status}"
+            )
+
+        pending = int(store.get("pending_keys_count", -1))
+        in_flight = int(store.get("in_flight_task_count", -1))
+        completed_stores = int(store.get("completed_store_task_count", -1))
+        failed_stores = int(store.get("failed_store_task_count", -1))
+        write_locked = int(l1.get("write_locked_count", -1))
+        if min(
+            pending, in_flight, completed_stores, failed_stores, write_locked
+        ) < 0:
+            raise RuntimeError(
+                "LMCache /status is missing store-barrier fields: "
+                f"store={store}, l1={l1}"
+            )
+        if failed_stores:
+            raise RuntimeError(
+                "LMCache reported failed L2 store task(s) before warm: "
+                f"failed_store_task_count={failed_stores}; store={store}"
+            )
+
+        polls += 1
+        peak_pending = max(peak_pending, pending)
+        peak_in_flight = max(peak_in_flight, in_flight)
+        peak_write_locked = max(peak_write_locked, write_locked)
+
+        drained = pending == 0 and in_flight == 0 and write_locked == 0
+        stable = stable + 1 if drained else 0
+        if (
+            polls == 1
+            or polls % log_every_polls == 0
+            or stable == stable_polls
+        ):
+            print(
+                "[SC_STORE_BARRIER_POLL] "
+                f"elapsed_s={elapsed:.2f} pending_keys={pending} "
+                f"inflight_stores={in_flight} completed_stores={completed_stores} "
+                f"failed_stores={failed_stores} l1_write_locked={write_locked} "
+                f"stable={stable}/{stable_polls}",
+                flush=True,
+            )
+
+        if stable >= stable_polls:
+            result = {
+                "enabled": True,
+                "status_url": status_url,
+                "elapsed_s": time.monotonic() - started,
+                "polls": polls,
+                "stable_polls": stable_polls,
+                "peak_pending_keys": peak_pending,
+                "peak_in_flight_stores": peak_in_flight,
+                "peak_l1_write_locked": peak_write_locked,
+                "completed_store_tasks": completed_stores,
+                "failed_store_tasks": failed_stores,
+                "final_pending_keys": pending,
+                "final_in_flight_stores": in_flight,
+                "final_l1_write_locked": write_locked,
+            }
+            print(
+                "[SC_STORE_BARRIER_DONE] "
+                + json.dumps(result, sort_keys=True, separators=(",", ":")),
+                flush=True,
+            )
+            return result
+
+        time.sleep(poll_s)
+
+
 def parse_arguments():
     parser = argparse.ArgumentParser()
 
@@ -768,6 +895,32 @@ def parse_arguments():
         "--between_phases_seconds",
         type=float,
         default=2.0,
+    )
+    parser.add_argument(
+        "--between_phases_store_barrier",
+        action="store_true",
+        help=(
+            "Before warm replay, wait for LMCache StoreController pending and "
+            "in-flight L2 stores plus L1 write locks to remain at zero."
+        ),
+    )
+    parser.add_argument(
+        "--lmcache_status_url",
+        default="http://127.0.0.1:8080/status",
+        help="LMCache MP /status endpoint used by the cold->warm store barrier.",
+    )
+    parser.add_argument("--store_barrier_timeout_s", type=float, default=7200.0)
+    parser.add_argument("--store_barrier_poll_s", type=float, default=1.0)
+    parser.add_argument("--store_barrier_stable_polls", type=int, default=5)
+    parser.add_argument(
+        "--store_barrier_result_path",
+        default="",
+        help="Optional JSON path for cold->warm store-barrier measurements.",
+    )
+    parser.add_argument(
+        "--metrics_after_barrier_path",
+        default="",
+        help="Optional vLLM /metrics snapshot after the store barrier and before warm.",
     )
     parser.add_argument("--output_dir", required=True)
     parser.add_argument(
@@ -990,6 +1143,31 @@ def main():
         metrics_path.write_text(response.text, encoding="utf-8")
         print(f"[SC_METRICS_AFTER_COLD] path={metrics_path}", flush=True)
 
+    store_barrier = {"enabled": False}
+    if args.between_phases_store_barrier:
+        store_barrier = wait_for_lmcache_store_barrier(
+            status_url=args.lmcache_status_url,
+            timeout_s=args.store_barrier_timeout_s,
+            poll_s=args.store_barrier_poll_s,
+            stable_polls=args.store_barrier_stable_polls,
+        )
+        if args.store_barrier_result_path:
+            barrier_path = Path(args.store_barrier_result_path)
+            barrier_path.parent.mkdir(parents=True, exist_ok=True)
+            barrier_path.write_text(
+                json.dumps(store_barrier, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+        if args.metrics_after_barrier_path:
+            metrics_url = args.server_url.rstrip("/") + "/metrics"
+            response = requests.get(metrics_url, timeout=30.0)
+            response.raise_for_status()
+            metrics_path = Path(args.metrics_after_barrier_path)
+            metrics_path.parent.mkdir(parents=True, exist_ok=True)
+            metrics_path.write_text(response.text, encoding="utf-8")
+            print(f"[SC_METRICS_AFTER_BARRIER] path={metrics_path}", flush=True)
+
     if args.between_phases_seconds > 0:
         print(
             f"Waiting {args.between_phases_seconds:.2f}s "
@@ -1087,6 +1265,7 @@ def main():
     summary = {
         "manifest": manifest,
         "cold": cold_summary,
+        "store_barrier": store_barrier,
         "warm": warm_summary,
         "output_consistency": consistency,
     }

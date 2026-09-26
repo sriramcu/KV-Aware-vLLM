@@ -23,7 +23,34 @@ LINEARRAG_ROOT="${REPO}/Hierarchical_KV/LinearRAG"
 
 RUN_ROOT=/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro
 GRID_LABEL="${GRID_LABEL:-l1_${LMCACHE_L1_SIZE_GB:-40}_pf_${LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT:-8}}"
-RUN_DIR="${RUN_ROOT}/h100_l0off_grid_${GRID_LABEL}_${SLURM_JOB_ID}"
+
+# Interactive reruns inside one srun allocation reuse SLURM_JOB_ID. Reserve a
+# unique result directory atomically while keeping the job ID at the very end
+# of the basename so existing folder-discovery aliases continue to work:
+#   run_name_20908
+#   2_run_name_20908
+#   3_run_name_20908
+reserve_unique_run_dir() {
+    local base="$1"
+    local parent name candidate n=1
+    parent="$(dirname -- "$base")"
+    name="$(basename -- "$base")"
+    mkdir -p "$parent"
+    while :; do
+        if (( n == 1 )); then
+            candidate="$base"
+        else
+            candidate="${parent}/${n}_${name}"
+        fi
+        if mkdir "$candidate" 2>/dev/null; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+        ((n += 1))
+    done
+}
+
+RUN_DIR="$(reserve_unique_run_dir "${RUN_ROOT}/h100_l0off_grid_${GRID_LABEL}_${SLURM_JOB_ID}")"
 LOG_DIR="${RUN_DIR}/logs"
 RESULT_DIR="${RUN_DIR}/results"
 
@@ -78,7 +105,14 @@ ENABLE_VPC="${ENABLE_VPC:-1}"
 KV_VPC_SUFFICIENT_BYPASS="${KV_VPC_SUFFICIENT_BYPASS:-0}"
 KV_MUTUAL_PREFIX="${KV_MUTUAL_PREFIX:-0}"
 
-for name in KV_VPC_SUFFICIENT_BYPASS KV_MUTUAL_PREFIX; do
+# Optional true cold->warm persistence barrier. Disabled by default so the
+# current PF/worker grid remains behavior-identical.
+KV_COLD_WARM_STORE_BARRIER="${KV_COLD_WARM_STORE_BARRIER:-0}"
+KV_STORE_BARRIER_TIMEOUT_S="${KV_STORE_BARRIER_TIMEOUT_S:-7200}"
+KV_STORE_BARRIER_POLL_S="${KV_STORE_BARRIER_POLL_S:-1}"
+KV_STORE_BARRIER_STABLE_POLLS="${KV_STORE_BARRIER_STABLE_POLLS:-5}"
+
+for name in KV_VPC_SUFFICIENT_BYPASS KV_MUTUAL_PREFIX KV_COLD_WARM_STORE_BARRIER; do
     value="${!name}"
     [[ "$value" == "0" || "$value" == "1" ]] || {
         echo "ERROR: $name must be 0 or 1, got $value" >&2
@@ -291,6 +325,7 @@ echo "MP CHTHM debug:      ${LMCACHE_MP_CHTHM_DEBUG}"
 echo "prefix diagnostics:  ${LMCACHE_MP_PREFIX_DIAGNOSTICS}"
 echo "VPC bypass:          ${KV_VPC_SUFFICIENT_BYPASS}"
 echo "mutual prefix:       ${KV_MUTUAL_PREFIX}"
+echo "store barrier:       ${KV_COLD_WARM_STORE_BARRIER}"
 echo "fs workers:          shared=${KV_FS_SHARED_WORKERS:-$LMCACHE_L2_WORKERS} lookup=${KV_FS_LOOKUP_WORKERS:-0} retrieve=${KV_FS_RETRIEVE_WORKERS:-0} store=${KV_FS_STORE_WORKERS:-0} delete=${KV_FS_DELETE_WORKERS:-0}"
 echo "============================================================"
 
@@ -651,6 +686,10 @@ cat > "${RUN_DIR}/run_config.json" <<EOF
   "lmcache_mp_prefix_diagnostics": ${LMCACHE_MP_PREFIX_DIAGNOSTICS},
   "vpc_sufficient_bypass": ${KV_VPC_SUFFICIENT_BYPASS},
   "mutual_prefix": ${KV_MUTUAL_PREFIX},
+  "cold_warm_store_barrier": ${KV_COLD_WARM_STORE_BARRIER},
+  "store_barrier_timeout_s": ${KV_STORE_BARRIER_TIMEOUT_S},
+  "store_barrier_poll_s": ${KV_STORE_BARRIER_POLL_S},
+  "store_barrier_stable_polls": ${KV_STORE_BARRIER_STABLE_POLLS},
   "fs_per_op_workers": ${KV_FS_PER_OP_WORKERS:-0},
   "fs_shared_workers": ${KV_FS_SHARED_WORKERS:-$LMCACHE_L2_WORKERS},
   "fs_lookup_workers": ${KV_FS_LOOKUP_WORKERS:-0},
@@ -882,8 +921,21 @@ DRIVER_ARGS=(
     --top_p "$TOP_P"
     --min_tokens "$MIN_TOKENS"
     --max_tokens "$MAX_TOKENS"
+    --metrics_after_cold_path "${RUN_DIR}/metrics_after_cold.txt"
     --output_dir "$RESULT_DIR"
 )
+
+if [[ "$KV_COLD_WARM_STORE_BARRIER" == "1" ]]; then
+    DRIVER_ARGS+=(
+        --between_phases_store_barrier
+        --lmcache_status_url http://127.0.0.1:8080/status
+        --store_barrier_timeout_s "$KV_STORE_BARRIER_TIMEOUT_S"
+        --store_barrier_poll_s "$KV_STORE_BARRIER_POLL_S"
+        --store_barrier_stable_polls "$KV_STORE_BARRIER_STABLE_POLLS"
+        --store_barrier_result_path "${RUN_DIR}/store_barrier.json"
+        --metrics_after_barrier_path "${RUN_DIR}/metrics_after_barrier.txt"
+    )
+fi
 
 if [[ -n "$QUESTIONS_JSON" ]]; then
     DRIVER_ARGS+=(--questions_json "$QUESTIONS_JSON")
@@ -897,6 +949,18 @@ then
     echo "Project workload failed"
     tail -n 300 "${LOG_DIR}/driver.log" || true
     exit 50
+fi
+
+if [[ "$KV_COLD_WARM_STORE_BARRIER" == "1" ]]; then
+    python - "${RESULT_DIR}/summary.json" "${RUN_DIR}/store_barrier.json" <<'PY'
+import json, pathlib, sys
+summary=json.load(open(sys.argv[1])); barrier=json.load(open(sys.argv[2]))
+assert summary.get('store_barrier', {}).get('enabled') is True, summary.get('store_barrier')
+assert barrier.get('final_pending_keys') == 0, barrier
+assert barrier.get('final_in_flight_stores') == 0, barrier
+assert barrier.get('final_l1_write_locked') == 0, barrier
+print('[SC_STORE_BARRIER_ASSERT] PASS', barrier)
+PY
 fi
 
 # Give asynchronous store activity a short drain window before inspection.

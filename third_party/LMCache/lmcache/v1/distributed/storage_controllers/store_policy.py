@@ -8,6 +8,7 @@ The store policy makes two decisions after data is written to L1:
 """
 
 # Standard
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
@@ -252,7 +253,21 @@ class GNNDynamicStorePolicy(StorePolicy):
     Logical disk/L2 objects are committed to L2 and their L1 staging copies are
     removed. Whether logical GPU/L0 objects are copied to host at all is decided
     independently by ``LMCACHE_GNN_L1_BACKING`` in the transfer path.
+
+    When ``LMCACHE_GNN_L2_BACKING=1``, every host-resident GNN prompt chunk is
+    also written to every configured L2 adapter.  This is deliberately a
+    *backing* mode rather than a placement rewrite: GPU/L0 and CPU/L1 chunks
+    remain persistent in L1 after the L2 commit, while true disk/L2 chunks keep
+    the existing staging behavior and are deleted from L1 after commit.
     """
+
+    def __init__(self) -> None:
+        value = os.getenv("LMCACHE_GNN_L2_BACKING", "0").strip().lower()
+        self._l2_backing = value in {"1", "true", "yes", "on"}
+        logger.info(
+            "[GNN_DYNAMIC_L2_BACKING_INIT] enabled=%s",
+            self._l2_backing,
+        )
 
     def select_store_targets(
         self,
@@ -261,26 +276,53 @@ class GNNDynamicStorePolicy(StorePolicy):
     ) -> dict[int, list[ObjectKey]]:
         from lmcache.v1.distributed.placement_metadata import get_chunk_placement
 
-        l2_keys = [key for key in keys if get_chunk_placement(key.chunk_hash) == "L2"]
-        persistent_l1 = len(keys) - len(l2_keys)
+        placements = {
+            key: get_chunk_placement(key.chunk_hash)
+            for key in keys
+        }
+        if self._l2_backing:
+            l2_keys = list(keys)
+        else:
+            l2_keys = [key for key in keys if placements[key] == "L2"]
+        persistent_l1 = sum(1 for key in keys if placements[key] != "L2")
+        backing_targets = sum(1 for key in l2_keys if placements[key] != "L2")
         logger.info(
             "[GNN_DYNAMIC_L2_POLICY] candidates=%d persistent_l1=%d "
-            "l2_targets=%d adapters=%d",
+            "l2_targets=%d backing_targets=%d l2_backing=%s adapters=%d",
             len(keys),
             persistent_l1,
             len(l2_keys),
+            backing_targets,
+            self._l2_backing,
             len(adapters),
         )
         return {ad.index: list(l2_keys) for ad in adapters if l2_keys}
 
     def select_l1_deletions(self, keys: list[ObjectKey]) -> list[ObjectKey]:
+        if self._l2_backing:
+            from lmcache.v1.distributed.placement_metadata import get_chunk_placement
+
+            # In backing mode, only true L2 placements use L1 as staging.
+            # GPU/L0 and CPU/L1 objects keep their existing persistent L1 copy
+            # even though an additional durable L2 copy now exists.
+            deletions = [
+                key
+                for key in keys
+                if get_chunk_placement(key.chunk_hash) == "L2"
+            ]
+        else:
+            deletions = list(keys)
+
         if keys:
             logger.info(
-                "[GNN_DYNAMIC_L2_COMMIT] l2_keys=%d delete_l1_staging=%d",
+                "[GNN_DYNAMIC_L2_COMMIT] l2_keys=%d delete_l1_staging=%d "
+                "keep_l1_backing=%d l2_backing=%s",
                 len(keys),
-                len(keys),
+                len(deletions),
+                len(keys) - len(deletions),
+                self._l2_backing,
             )
-        return list(keys)
+        return deletions
 
 
 register_store_policy("gnn_dynamic", GNNDynamicStorePolicy)

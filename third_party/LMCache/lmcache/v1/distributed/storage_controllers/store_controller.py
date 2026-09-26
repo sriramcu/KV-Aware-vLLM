@@ -267,8 +267,12 @@ class StoreController(StorageControllerInterface):
         # within a single adapter, not across adapters.
         self._in_flight_tasks: dict[tuple[int, L2TaskId], InFlightStoreTask] = {}
 
-        # Shadow counter for status reporting (updated in background loop)
+        # Shadow counters for status reporting (updated in background loop).
+        # Completion/failure counters make cold->warm persistence barriers able
+        # to fail closed instead of treating a failed-but-drained queue as safe.
         self._status_in_flight_count: int = 0
+        self._status_completed_store_count: int = 0
+        self._status_failed_store_count: int = 0
 
         StoreController._gauge_target = self
         if not StoreController._gauge_registered:
@@ -337,6 +341,8 @@ class StoreController(StorageControllerInterface):
             "thread_alive": is_healthy,
             "pending_keys_count": self._listener.pending_count(),
             "in_flight_task_count": self._status_in_flight_count,
+            "completed_store_task_count": self._status_completed_store_count,
+            "failed_store_task_count": self._status_failed_store_count,
             "num_l2_adapters": len(self._l2_adapters),
             "num_active_adapters": len(self._l2_adapters) - num_draining,
             "num_draining_adapters": num_draining,
@@ -793,6 +799,7 @@ class StoreController(StorageControllerInterface):
             "bytes_transferred": task.l2_bytes_transferred,
         }
         if success:
+            self._status_completed_store_count += 1
             self._event_bus.publish(
                 Event(
                     event_type=EventType.L2_STORE_COMPLETED,
@@ -814,6 +821,7 @@ class StoreController(StorageControllerInterface):
             if delete_keys:
                 l1_mgr.delete(delete_keys)
         else:
+            self._status_failed_store_count += 1
             self._event_bus.publish(
                 Event(
                     event_type=EventType.L2_STORE_COMPLETED,
