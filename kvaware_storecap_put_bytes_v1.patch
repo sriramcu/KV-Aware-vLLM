@@ -1,0 +1,369 @@
+diff --git a/scripts/run_h100_q650_storecap.sbatch b/scripts/run_h100_q650_storecap.sbatch
+new file mode 100755
+index 0000000..5ca7b26
+--- /dev/null
++++ b/scripts/run_h100_q650_storecap.sbatch
+@@ -0,0 +1,14 @@
++#!/usr/bin/env bash
++#SBATCH --job-name=kvaware-storecap-q650
++#SBATCH --partition=gpu-h100-dchen
++#SBATCH --nodes=1
++#SBATCH --ntasks=1
++#SBATCH --cpus-per-task=16
++#SBATCH --gres=gpu:2
++#SBATCH --time=06:00:00
++#SBATCH --output=/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/logs/%x_%j.out
++#SBATCH --error=/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/logs/%x_%j.err
++
++set -Eeuo pipefail
++REPO="${REPO:-/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM}"
++exec bash "$REPO/scripts/run_h100_q650_storecap.sh"
+diff --git a/scripts/run_h100_q650_storecap.sh b/scripts/run_h100_q650_storecap.sh
+new file mode 100755
+index 0000000..011db5f
+--- /dev/null
++++ b/scripts/run_h100_q650_storecap.sh
+@@ -0,0 +1,67 @@
++#!/usr/bin/env bash
++# Thin launcher for the matched H100 Q650 write-admission-cap experiment.
++# Run inside an existing 2xH100 srun allocation, or via the companion sbatch.
++set -Eeuo pipefail
++
++REPO="${REPO:-/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM}"
++ARM="${ARM:-}"
++L1_GB="${L1_GB:-300}"
++STORE_CAP_GB="${STORE_CAP_GB:-100}"
++PF="${PF:-2}"
++
++case "$ARM" in
++  gnn|nognn) ;;
++  *)
++    echo "ERROR: set ARM=gnn or ARM=nognn" >&2
++    exit 2
++    ;;
++esac
++
++# Matched serving/storage settings selected by the 20923--20928 grid.
++export LMCACHE_L1_SIZE_GB="$L1_GB"
++export LMCACHE_MP_MAX_INFLIGHT_STORE_GB="$STORE_CAP_GB"
++export LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT="$PF"
++export KV_FS_PER_OP_WORKERS=1
++export KV_FS_SHARED_WORKERS=5
++export KV_FS_LOOKUP_WORKERS=1
++export KV_FS_RETRIEVE_WORKERS=2
++export KV_FS_STORE_WORKERS=0
++export KV_FS_DELETE_WORKERS=0
++export KV_VPC_SUFFICIENT_BYPASS=1
++export KV_MUTUAL_PREFIX=1
++export KV_STAGE1_STARVATION_FALLBACK=1
++export KV_STAGE1_OCCUPANCY_FALLBACK=0
++export LMCACHE_MP_PREFIX_DIAGNOSTICS=1
++export LMCACHE_MP_CONGESTION_DEBUG=1
++export LMCACHE_MP_CHTHM_DEBUG=1
++export LMCACHE_MP_STAGE1_FRESHNESS_GUARD_S=270
++export KV_COLD_WARM_STORE_BARRIER=1
++
++# Make the chosen cap obvious in stdout even if an older run_config schema is used.
++echo "===== Q650 STORE-CAP LAUNCH ====="
++echo "arm:                 $ARM"
++echo "L1 GiB:              $L1_GB"
++echo "max in-flight PUT:   $STORE_CAP_GB GiB"
++echo "prefetch PF:         $PF"
++echo "workers:             5 shared + 2 retrieve + 1 lookup"
++echo "barrier:             ON"
++echo "================================="
++
++case "$ARM" in
++  gnn)
++    # Experiment requested after 20934: preserve GNN-selected fast-tier chunks
++    # in L1, do NOT create full L2 safety backing, and bound only true L2 PUTs.
++    export KV_GNN_AWARE_VPC=1
++    export KV_GNN_L1_BACKING=1
++    export KV_GNN_L2_BACKING=0
++    export EXPERIMENT_LABEL="${EXPERIMENT_LABEL:-gnn_mutual_storecap${STORE_CAP_GB}g_l1${L1_GB}_l1back_l2backoff_pf${PF}_s5_r2}"
++    exec bash "$REPO/scripts/run_h100_shortq_gnn_dynamic_vpc_q650.sbatch"
++    ;;
++  nognn)
++    export GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.65}"
++    export MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
++    export ENABLE_VPC=1
++    export GRID_LABEL="${GRID_LABEL:-nognn_mutual_storecap${STORE_CAP_GB}g_l1${L1_GB}_pf${PF}_s5_r2}"
++    exec bash "$REPO/scripts/run_h100_l0off_q650_l1_prefetch_grid_cleanall.sbatch"
++    ;;
++esac
+diff --git a/third_party/LMCache/lmcache/v1/distributed/storage_controllers/store_controller.py b/third_party/LMCache/lmcache/v1/distributed/storage_controllers/store_controller.py
+index 55c3fe6..533d9f5 100644
+--- a/third_party/LMCache/lmcache/v1/distributed/storage_controllers/store_controller.py
++++ b/third_party/LMCache/lmcache/v1/distributed/storage_controllers/store_controller.py
+@@ -194,6 +194,9 @@ class InFlightStoreTask:
+     submitted_at: float = 0.0
+     """Monotonic submit timestamp for optional congestion diagnostics."""
+ 
++    source_bytes: int = 0
++    """L1 bytes held on behalf of this in-flight L2 store task."""
++
+ 
+ # Main class
+ 
+@@ -247,6 +250,22 @@ class StoreController(StorageControllerInterface):
+         self._congestion_debug = (
+             os.getenv("LMCACHE_MP_CONGESTION_DEBUG", "0") == "1"
+         )
++        store_cap_gb_raw = os.getenv(
++            "LMCACHE_MP_MAX_INFLIGHT_STORE_GB", "0"
++        ).strip()
++        try:
++            store_cap_gb = float(store_cap_gb_raw)
++        except ValueError as exc:
++            raise ValueError(
++                "LMCACHE_MP_MAX_INFLIGHT_STORE_GB must be a non-negative number, "
++                f"got {store_cap_gb_raw!r}"
++            ) from exc
++        if store_cap_gb < 0:
++            raise ValueError(
++                "LMCACHE_MP_MAX_INFLIGHT_STORE_GB must be >= 0, "
++                f"got {store_cap_gb}"
++            )
++        self._max_inflight_store_bytes = int(store_cap_gb * 1024**3)
+ 
+         # Adapters that are being drained and will be removed after all
+         # the in-flight operations are done.
+@@ -271,8 +290,19 @@ class StoreController(StorageControllerInterface):
+         # Completion/failure counters make cold->warm persistence barriers able
+         # to fail closed instead of treating a failed-but-drained queue as safe.
+         self._status_in_flight_count: int = 0
++        self._status_in_flight_bytes: int = 0
+         self._status_completed_store_count: int = 0
+         self._status_failed_store_count: int = 0
++        self._status_store_cap_skipped_key_count: int = 0
++        self._status_store_cap_skipped_bytes: int = 0
++
++        logger.info(
++            "[MP_STORE_CAP_INIT] max_inflight_store_gb=%.3f "
++            "max_inflight_store_bytes=%d enabled=%s",
++            store_cap_gb,
++            self._max_inflight_store_bytes,
++            self._max_inflight_store_bytes > 0,
++        )
+ 
+         StoreController._gauge_target = self
+         if not StoreController._gauge_registered:
+@@ -341,6 +371,10 @@ class StoreController(StorageControllerInterface):
+             "thread_alive": is_healthy,
+             "pending_keys_count": self._listener.pending_count(),
+             "in_flight_task_count": self._status_in_flight_count,
++            "in_flight_store_bytes": self._status_in_flight_bytes,
++            "max_in_flight_store_bytes": self._max_inflight_store_bytes,
++            "store_cap_skipped_key_count": self._status_store_cap_skipped_key_count,
++            "store_cap_skipped_bytes": self._status_store_cap_skipped_bytes,
+             "completed_store_task_count": self._status_completed_store_count,
+             "failed_store_task_count": self._status_failed_store_count,
+             "num_l2_adapters": len(self._l2_adapters),
+@@ -674,6 +708,69 @@ class StoreController(StorageControllerInterface):
+             if not successful_keys:
+                 continue
+ 
++            # Optional write-side admission cap. This bounds the total bytes whose
++            # L1 objects are being held for outstanding L2 PUTs. It is deliberately
++            # independent of PrefetchController/PF, which only gates the read path.
++            # A value of 0 preserves the historical unbounded behavior.
++            total_candidate_bytes = (
++                successful_objs[0].get_size() * len(successful_objs)
++            )
++            skipped_keys: list[ObjectKey] = []
++            skipped_bytes = 0
++            if self._max_inflight_store_bytes > 0:
++                object_bytes = successful_objs[0].get_size()
++                remaining_bytes = max(
++                    0,
++                    self._max_inflight_store_bytes - self._status_in_flight_bytes,
++                )
++                admit_count = min(
++                    len(successful_keys),
++                    remaining_bytes // object_bytes,
++                )
++                if admit_count < len(successful_keys):
++                    skipped_keys = successful_keys[admit_count:]
++                    skipped_bytes = object_bytes * len(skipped_keys)
++                    skipped_objs = successful_objs[admit_count:]
++                    successful_keys = successful_keys[:admit_count]
++                    successful_objs = successful_objs[:admit_count]
++
++                    # These reservations were acquired above only so we could get
++                    # the MemoryObj size and enforce a byte-accurate cap. Release
++                    # them immediately for the skipped subset.
++                    l1_mgr.finish_read(skipped_keys)
++
++                    # Preserve each policy's ownership semantics when the L2 PUT
++                    # is intentionally skipped. Default/no-GNN keeps L1; GNN true
++                    # L2 staging is deleted rather than accidentally becoming a
++                    # persistent L1 object.
++                    delete_keys = (
++                        self._policy.select_l1_deletions_on_store_skip(skipped_keys)
++                    )
++                    if delete_keys:
++                        l1_mgr.delete(delete_keys)
++
++                    self._status_store_cap_skipped_key_count += len(skipped_keys)
++                    self._status_store_cap_skipped_bytes += skipped_bytes
++                    logger.info(
++                        "[MP_STORE_CAP_SKIP] adapter=%d skipped_keys=%d "
++                        "skipped_bytes=%d candidate_bytes=%d inflight_bytes=%d "
++                        "cap_bytes=%d admitted_keys=%d",
++                        adapter_index,
++                        len(skipped_keys),
++                        skipped_bytes,
++                        total_candidate_bytes,
++                        self._status_in_flight_bytes,
++                        self._max_inflight_store_bytes,
++                        len(successful_keys),
++                    )
++                    # Keep the local name alive only long enough to make it clear
++                    # that skipped MemoryObjs are intentionally not submitted.
++                    del skipped_objs
++
++            if not successful_keys:
++                continue
++
++            total_bytes = successful_objs[0].get_size() * len(successful_objs)
+             adapter = self._l2_adapters[adapter_index]
+             try:
+                 task_id = adapter.submit_store_task(successful_keys, successful_objs)
+@@ -691,13 +788,14 @@ class StoreController(StorageControllerInterface):
+                 keys=successful_keys,
+                 read_locked_keys=list(successful_keys),
+                 submitted_at=time.monotonic(),
++                source_bytes=total_bytes,
+             )
+             self._status_in_flight_count += 1
++            self._status_in_flight_bytes += total_bytes
+ 
+             # All objects for a single store task share one layout (L1
+             # allocates uniform MemoryObjs per chunk), so total bytes is
+             # size * count — avoids summing N identical values.
+-            total_bytes = successful_objs[0].get_size() * len(successful_objs)
+             self._event_bus.publish(
+                 Event(
+                     event_type=EventType.L2_STORE_SUBMITTED,
+@@ -723,12 +821,15 @@ class StoreController(StorageControllerInterface):
+             if self._congestion_debug:
+                 logger.info(
+                     "[MP_STORE_SUBMIT] adapter=%d task=%d keys=%d bytes=%d "
+-                    "inflight_after=%d listener_pending=%d",
++                    "inflight_after=%d inflight_bytes=%d cap_bytes=%d "
++                    "listener_pending=%d",
+                     adapter_index,
+                     task_id,
+                     len(successful_keys),
+                     total_bytes,
+                     self._status_in_flight_count,
++                    self._status_in_flight_bytes,
++                    self._max_inflight_store_bytes,
+                     self._listener.pending_count(),
+                 )
+ 
+@@ -776,11 +877,15 @@ class StoreController(StorageControllerInterface):
+         l1_mgr.finish_read(task.read_locked_keys)
+         del self._in_flight_tasks[task_key]
+         self._status_in_flight_count -= 1
++        self._status_in_flight_bytes = max(
++            0, self._status_in_flight_bytes - task.source_bytes
++        )
+ 
+         if self._congestion_debug:
+             logger.info(
+                 "[MP_STORE_DONE] adapter=%d task=%d success=%s keys=%d "
+-                "bytes=%d service_s=%.6f inflight_after=%d listener_pending=%d",
++                "bytes=%d service_s=%.6f inflight_after=%d inflight_bytes=%d "
++                "cap_bytes=%d listener_pending=%d",
+                 adapter_index,
+                 task_id,
+                 success,
+@@ -788,6 +893,8 @@ class StoreController(StorageControllerInterface):
+                 task.l2_bytes_transferred,
+                 time.monotonic() - task.submitted_at,
+                 self._status_in_flight_count,
++                self._status_in_flight_bytes,
++                self._max_inflight_store_bytes,
+                 self._listener.pending_count(),
+             )
+ 
+@@ -854,3 +961,4 @@ class StoreController(StorageControllerInterface):
+             )
+             l1_mgr.finish_read(task.read_locked_keys)
+         self._in_flight_tasks.clear()
++        self._status_in_flight_bytes = 0
+diff --git a/third_party/LMCache/lmcache/v1/distributed/storage_controllers/store_policy.py b/third_party/LMCache/lmcache/v1/distributed/storage_controllers/store_policy.py
+index 2f60093..146f924 100644
+--- a/third_party/LMCache/lmcache/v1/distributed/storage_controllers/store_policy.py
++++ b/third_party/LMCache/lmcache/v1/distributed/storage_controllers/store_policy.py
+@@ -95,6 +95,20 @@ class StorePolicy(ABC):
+             Keys to delete from L1. Empty list means keep all.
+         """
+ 
++    def select_l1_deletions_on_store_skip(
++        self,
++        keys: list[ObjectKey],
++    ) -> list[ObjectKey]:
++        """Decide which L1 keys to delete when an L2 store is intentionally skipped.
++
++        The default mirrors ``select_l1_deletions``. This preserves the
++        ownership semantics of existing policies: cache-like policies keep
++        their L1 copy, while policies that use L1 only as an L2 staging buffer
++        drop the skipped staging copy instead of accidentally promoting it to
++        persistent L1.
++        """
++        return self.select_l1_deletions(keys)
++
+ 
+ # -----------------------------------------------------------------------------
+ # Registry: store policy name -> policy class
+@@ -242,6 +256,17 @@ class GNNExclusiveStorePolicy(StorePolicy):
+             logger.info("[GNN_EXCLUSIVE_L2_COMMIT] l2_keys=%d delete_l1_staging=%d", len(keys), len(keys))
+         return list(keys)
+ 
++    def select_l1_deletions_on_store_skip(
++        self, keys: list[ObjectKey]
++    ) -> list[ObjectKey]:
++        if keys:
++            logger.info(
++                "[GNN_EXCLUSIVE_L2_SKIP] skipped_l2_keys=%d delete_l1_staging=%d",
++                len(keys),
++                len(keys),
++            )
++        return list(keys)
++
+ 
+ register_store_policy("gnn_exclusive", GNNExclusiveStorePolicy)
+ 
+@@ -324,5 +349,30 @@ class GNNDynamicStorePolicy(StorePolicy):
+             )
+         return deletions
+ 
++    def select_l1_deletions_on_store_skip(
++        self, keys: list[ObjectKey]
++    ) -> list[ObjectKey]:
++        if self._l2_backing:
++            from lmcache.v1.distributed.placement_metadata import get_chunk_placement
++
++            deletions = [
++                key
++                for key in keys
++                if get_chunk_placement(key.chunk_hash) == "L2"
++            ]
++        else:
++            deletions = list(keys)
++
++        if keys:
++            logger.info(
++                "[GNN_DYNAMIC_L2_SKIP] skipped_l2_keys=%d delete_l1_staging=%d "
++                "keep_l1=%d l2_backing=%s",
++                len(keys),
++                len(deletions),
++                len(keys) - len(deletions),
++                self._l2_backing,
++            )
++        return deletions
++
+ 
+ register_store_policy("gnn_dynamic", GNNDynamicStorePolicy)

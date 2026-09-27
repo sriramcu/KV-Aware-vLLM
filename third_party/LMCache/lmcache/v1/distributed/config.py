@@ -342,7 +342,10 @@ class StorageManagerConfig:
     """ The L2 prefetch policy name. """
 
     prefetch_max_in_flight: int = 8
-    """ Maximum number of concurrent prefetch requests. """
+    """ Maximum number of concurrent L2 load requests. """
+
+    prefetch_lookup_max_in_flight: int | None = None
+    """ Maximum concurrent L2 lookup requests when phase separation is enabled. """
 
     periodic_notifier_interval_ms: int = 5
     """ Interval (ms) for the periodic event notifier heartbeat. """
@@ -667,7 +670,21 @@ def add_storage_manager_args(
         "--l2-prefetch-max-in-flight",
         type=int,
         default=8,
-        help="Maximum number of concurrent prefetch requests. Default is 8.",
+        help=(
+            "Maximum number of concurrent L2 load requests. When "
+            "--l2-lookup-max-in-flight is omitted, this retains the legacy "
+            "whole-prefetch request limit. Default is 8."
+        ),
+    )
+    policy_group.add_argument(
+        "--l2-lookup-max-in-flight",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of concurrent L2 lookup phases. Setting this "
+            "enables independent lookup/load concurrency; omit it to retain "
+            "the legacy shared prefetch limit."
+        ),
     )
     policy_group.add_argument(
         "--periodic-notifier-interval-ms",
@@ -774,6 +791,7 @@ def parse_args_to_config(
         store_policy=args.l2_store_policy,
         prefetch_policy=args.l2_prefetch_policy,
         prefetch_max_in_flight=args.l2_prefetch_max_in_flight,
+        prefetch_lookup_max_in_flight=args.l2_lookup_max_in_flight,
         periodic_notifier_interval_ms=args.periodic_notifier_interval_ms,
     )
     return config

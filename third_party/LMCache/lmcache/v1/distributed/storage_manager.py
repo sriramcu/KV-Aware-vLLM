@@ -165,6 +165,7 @@ class StorageManager:
             adapter_descriptors=list(self._adapter_descriptors.values()),
             policy=create_prefetch_policy(config.prefetch_policy),
             max_in_flight=config.prefetch_max_in_flight,
+            lookup_max_in_flight=config.prefetch_lookup_max_in_flight,
         )
         self._prefetch_controller.start()
 

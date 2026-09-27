@@ -822,6 +822,77 @@ def wait_for_lmcache_store_barrier(
         time.sleep(poll_s)
 
 
+def snapshot_lmcache_l1_for_warm(
+    *,
+    status_url: str,
+    output_path: Path,
+) -> dict[str, Any]:
+    """Capture L1 composition after the cold store barrier, before warm."""
+    response = requests.get(status_url, timeout=30.0)
+    response.raise_for_status()
+    status = response.json()
+    if not status.get("is_healthy", False):
+        raise RuntimeError(
+            "LMCache unhealthy while taking warm-start L1 snapshot: "
+            f"{status}"
+        )
+
+    l1 = status.get("storage_manager", {}).get("l1_manager", {})
+    required = (
+        "total_object_count",
+        "write_locked_count",
+        "read_locked_count",
+        "temporary_count",
+        "object_bytes",
+        "write_locked_bytes",
+        "read_locked_bytes",
+        "temporary_bytes",
+        "persistent_object_bytes",
+        "persistent_unlocked_bytes",
+        "memory_used_bytes",
+        "memory_total_bytes",
+        "memory_configured_bytes",
+    )
+    missing = [name for name in required if name not in l1]
+    if missing:
+        raise RuntimeError(
+            "LMCache /status missing warm-start L1 footprint fields "
+            f"{missing}: l1={l1}"
+        )
+
+    snapshot = {
+        "captured_at_unix_s": time.time(),
+        "status_url": status_url,
+        **{name: l1[name] for name in required},
+    }
+    for name in (
+        "object_bytes",
+        "write_locked_bytes",
+        "read_locked_bytes",
+        "temporary_bytes",
+        "persistent_object_bytes",
+        "persistent_unlocked_bytes",
+        "memory_used_bytes",
+        "memory_total_bytes",
+        "memory_configured_bytes",
+    ):
+        snapshot[name.replace("_bytes", "_gib")] = (
+            float(snapshot[name]) / (1024.0 ** 3)
+        )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(snapshot, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(
+        "[SC_L1_WARM_START] "
+        + json.dumps(snapshot, sort_keys=True, separators=(",", ":")),
+        flush=True,
+    )
+    return snapshot
+
+
 def parse_arguments():
     parser = argparse.ArgumentParser()
 
@@ -1144,6 +1215,7 @@ def main():
         print(f"[SC_METRICS_AFTER_COLD] path={metrics_path}", flush=True)
 
     store_barrier = {"enabled": False}
+    l1_warm_start: dict[str, Any] | None = None
     if args.between_phases_store_barrier:
         store_barrier = wait_for_lmcache_store_barrier(
             status_url=args.lmcache_status_url,
@@ -1167,6 +1239,14 @@ def main():
             metrics_path.parent.mkdir(parents=True, exist_ok=True)
             metrics_path.write_text(response.text, encoding="utf-8")
             print(f"[SC_METRICS_AFTER_BARRIER] path={metrics_path}", flush=True)
+
+        # The store barrier has now drained write-owned L1 state. Capture the
+        # actual warm-start L1 composition before the optional inter-phase
+        # sleep or any warm request is submitted.
+        l1_warm_start = snapshot_lmcache_l1_for_warm(
+            status_url=args.lmcache_status_url,
+            output_path=out_dir / "l1_warm_start.json",
+        )
 
     if args.between_phases_seconds > 0:
         print(
@@ -1266,6 +1346,7 @@ def main():
         "manifest": manifest,
         "cold": cold_summary,
         "store_barrier": store_barrier,
+        "l1_warm_start": l1_warm_start,
         "warm": warm_summary,
         "output_consistency": consistency,
     }

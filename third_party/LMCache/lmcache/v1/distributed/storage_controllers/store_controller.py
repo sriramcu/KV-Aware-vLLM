@@ -194,6 +194,9 @@ class InFlightStoreTask:
     submitted_at: float = 0.0
     """Monotonic submit timestamp for optional congestion diagnostics."""
 
+    source_bytes: int = 0
+    """L1 bytes held on behalf of this in-flight L2 store task."""
+
 
 # Main class
 
@@ -247,6 +250,22 @@ class StoreController(StorageControllerInterface):
         self._congestion_debug = (
             os.getenv("LMCACHE_MP_CONGESTION_DEBUG", "0") == "1"
         )
+        store_cap_gb_raw = os.getenv(
+            "LMCACHE_MP_MAX_INFLIGHT_STORE_GB", "0"
+        ).strip()
+        try:
+            store_cap_gb = float(store_cap_gb_raw)
+        except ValueError as exc:
+            raise ValueError(
+                "LMCACHE_MP_MAX_INFLIGHT_STORE_GB must be a non-negative number, "
+                f"got {store_cap_gb_raw!r}"
+            ) from exc
+        if store_cap_gb < 0:
+            raise ValueError(
+                "LMCACHE_MP_MAX_INFLIGHT_STORE_GB must be >= 0, "
+                f"got {store_cap_gb}"
+            )
+        self._max_inflight_store_bytes = int(store_cap_gb * 1024**3)
 
         # Adapters that are being drained and will be removed after all
         # the in-flight operations are done.
@@ -271,8 +290,19 @@ class StoreController(StorageControllerInterface):
         # Completion/failure counters make cold->warm persistence barriers able
         # to fail closed instead of treating a failed-but-drained queue as safe.
         self._status_in_flight_count: int = 0
+        self._status_in_flight_bytes: int = 0
         self._status_completed_store_count: int = 0
         self._status_failed_store_count: int = 0
+        self._status_store_cap_skipped_key_count: int = 0
+        self._status_store_cap_skipped_bytes: int = 0
+
+        logger.info(
+            "[MP_STORE_CAP_INIT] max_inflight_store_gb=%.3f "
+            "max_inflight_store_bytes=%d enabled=%s",
+            store_cap_gb,
+            self._max_inflight_store_bytes,
+            self._max_inflight_store_bytes > 0,
+        )
 
         StoreController._gauge_target = self
         if not StoreController._gauge_registered:
@@ -341,6 +371,10 @@ class StoreController(StorageControllerInterface):
             "thread_alive": is_healthy,
             "pending_keys_count": self._listener.pending_count(),
             "in_flight_task_count": self._status_in_flight_count,
+            "in_flight_store_bytes": self._status_in_flight_bytes,
+            "max_in_flight_store_bytes": self._max_inflight_store_bytes,
+            "store_cap_skipped_key_count": self._status_store_cap_skipped_key_count,
+            "store_cap_skipped_bytes": self._status_store_cap_skipped_bytes,
             "completed_store_task_count": self._status_completed_store_count,
             "failed_store_task_count": self._status_failed_store_count,
             "num_l2_adapters": len(self._l2_adapters),
@@ -674,6 +708,69 @@ class StoreController(StorageControllerInterface):
             if not successful_keys:
                 continue
 
+            # Optional write-side admission cap. This bounds the total bytes whose
+            # L1 objects are being held for outstanding L2 PUTs. It is deliberately
+            # independent of PrefetchController/PF, which only gates the read path.
+            # A value of 0 preserves the historical unbounded behavior.
+            total_candidate_bytes = (
+                successful_objs[0].get_size() * len(successful_objs)
+            )
+            skipped_keys: list[ObjectKey] = []
+            skipped_bytes = 0
+            if self._max_inflight_store_bytes > 0:
+                object_bytes = successful_objs[0].get_size()
+                remaining_bytes = max(
+                    0,
+                    self._max_inflight_store_bytes - self._status_in_flight_bytes,
+                )
+                admit_count = min(
+                    len(successful_keys),
+                    remaining_bytes // object_bytes,
+                )
+                if admit_count < len(successful_keys):
+                    skipped_keys = successful_keys[admit_count:]
+                    skipped_bytes = object_bytes * len(skipped_keys)
+                    skipped_objs = successful_objs[admit_count:]
+                    successful_keys = successful_keys[:admit_count]
+                    successful_objs = successful_objs[:admit_count]
+
+                    # These reservations were acquired above only so we could get
+                    # the MemoryObj size and enforce a byte-accurate cap. Release
+                    # them immediately for the skipped subset.
+                    l1_mgr.finish_read(skipped_keys)
+
+                    # Preserve each policy's ownership semantics when the L2 PUT
+                    # is intentionally skipped. Default/no-GNN keeps L1; GNN true
+                    # L2 staging is deleted rather than accidentally becoming a
+                    # persistent L1 object.
+                    delete_keys = (
+                        self._policy.select_l1_deletions_on_store_skip(skipped_keys)
+                    )
+                    if delete_keys:
+                        l1_mgr.delete(delete_keys)
+
+                    self._status_store_cap_skipped_key_count += len(skipped_keys)
+                    self._status_store_cap_skipped_bytes += skipped_bytes
+                    logger.info(
+                        "[MP_STORE_CAP_SKIP] adapter=%d skipped_keys=%d "
+                        "skipped_bytes=%d candidate_bytes=%d inflight_bytes=%d "
+                        "cap_bytes=%d admitted_keys=%d",
+                        adapter_index,
+                        len(skipped_keys),
+                        skipped_bytes,
+                        total_candidate_bytes,
+                        self._status_in_flight_bytes,
+                        self._max_inflight_store_bytes,
+                        len(successful_keys),
+                    )
+                    # Keep the local name alive only long enough to make it clear
+                    # that skipped MemoryObjs are intentionally not submitted.
+                    del skipped_objs
+
+            if not successful_keys:
+                continue
+
+            total_bytes = successful_objs[0].get_size() * len(successful_objs)
             adapter = self._l2_adapters[adapter_index]
             try:
                 task_id = adapter.submit_store_task(successful_keys, successful_objs)
@@ -691,13 +788,14 @@ class StoreController(StorageControllerInterface):
                 keys=successful_keys,
                 read_locked_keys=list(successful_keys),
                 submitted_at=time.monotonic(),
+                source_bytes=total_bytes,
             )
             self._status_in_flight_count += 1
+            self._status_in_flight_bytes += total_bytes
 
             # All objects for a single store task share one layout (L1
             # allocates uniform MemoryObjs per chunk), so total bytes is
             # size * count — avoids summing N identical values.
-            total_bytes = successful_objs[0].get_size() * len(successful_objs)
             self._event_bus.publish(
                 Event(
                     event_type=EventType.L2_STORE_SUBMITTED,
@@ -723,12 +821,15 @@ class StoreController(StorageControllerInterface):
             if self._congestion_debug:
                 logger.info(
                     "[MP_STORE_SUBMIT] adapter=%d task=%d keys=%d bytes=%d "
-                    "inflight_after=%d listener_pending=%d",
+                    "inflight_after=%d inflight_bytes=%d cap_bytes=%d "
+                    "listener_pending=%d",
                     adapter_index,
                     task_id,
                     len(successful_keys),
                     total_bytes,
                     self._status_in_flight_count,
+                    self._status_in_flight_bytes,
+                    self._max_inflight_store_bytes,
                     self._listener.pending_count(),
                 )
 
@@ -776,11 +877,15 @@ class StoreController(StorageControllerInterface):
         l1_mgr.finish_read(task.read_locked_keys)
         del self._in_flight_tasks[task_key]
         self._status_in_flight_count -= 1
+        self._status_in_flight_bytes = max(
+            0, self._status_in_flight_bytes - task.source_bytes
+        )
 
         if self._congestion_debug:
             logger.info(
                 "[MP_STORE_DONE] adapter=%d task=%d success=%s keys=%d "
-                "bytes=%d service_s=%.6f inflight_after=%d listener_pending=%d",
+                "bytes=%d service_s=%.6f inflight_after=%d inflight_bytes=%d "
+                "cap_bytes=%d listener_pending=%d",
                 adapter_index,
                 task_id,
                 success,
@@ -788,6 +893,8 @@ class StoreController(StorageControllerInterface):
                 task.l2_bytes_transferred,
                 time.monotonic() - task.submitted_at,
                 self._status_in_flight_count,
+                self._status_in_flight_bytes,
+                self._max_inflight_store_bytes,
                 self._listener.pending_count(),
             )
 
@@ -854,3 +961,4 @@ class StoreController(StorageControllerInterface):
             )
             l1_mgr.finish_read(task.read_locked_keys)
         self._in_flight_tasks.clear()
+        self._status_in_flight_bytes = 0

@@ -95,6 +95,20 @@ class StorePolicy(ABC):
             Keys to delete from L1. Empty list means keep all.
         """
 
+    def select_l1_deletions_on_store_skip(
+        self,
+        keys: list[ObjectKey],
+    ) -> list[ObjectKey]:
+        """Decide which L1 keys to delete when an L2 store is intentionally skipped.
+
+        The default mirrors ``select_l1_deletions``. This preserves the
+        ownership semantics of existing policies: cache-like policies keep
+        their L1 copy, while policies that use L1 only as an L2 staging buffer
+        drop the skipped staging copy instead of accidentally promoting it to
+        persistent L1.
+        """
+        return self.select_l1_deletions(keys)
+
 
 # -----------------------------------------------------------------------------
 # Registry: store policy name -> policy class
@@ -242,6 +256,17 @@ class GNNExclusiveStorePolicy(StorePolicy):
             logger.info("[GNN_EXCLUSIVE_L2_COMMIT] l2_keys=%d delete_l1_staging=%d", len(keys), len(keys))
         return list(keys)
 
+    def select_l1_deletions_on_store_skip(
+        self, keys: list[ObjectKey]
+    ) -> list[ObjectKey]:
+        if keys:
+            logger.info(
+                "[GNN_EXCLUSIVE_L2_SKIP] skipped_l2_keys=%d delete_l1_staging=%d",
+                len(keys),
+                len(keys),
+            )
+        return list(keys)
+
 
 register_store_policy("gnn_exclusive", GNNExclusiveStorePolicy)
 
@@ -317,6 +342,31 @@ class GNNDynamicStorePolicy(StorePolicy):
             logger.info(
                 "[GNN_DYNAMIC_L2_COMMIT] l2_keys=%d delete_l1_staging=%d "
                 "keep_l1_backing=%d l2_backing=%s",
+                len(keys),
+                len(deletions),
+                len(keys) - len(deletions),
+                self._l2_backing,
+            )
+        return deletions
+
+    def select_l1_deletions_on_store_skip(
+        self, keys: list[ObjectKey]
+    ) -> list[ObjectKey]:
+        if self._l2_backing:
+            from lmcache.v1.distributed.placement_metadata import get_chunk_placement
+
+            deletions = [
+                key
+                for key in keys
+                if get_chunk_placement(key.chunk_hash) == "L2"
+            ]
+        else:
+            deletions = list(keys)
+
+        if keys:
+            logger.info(
+                "[GNN_DYNAMIC_L2_SKIP] skipped_l2_keys=%d delete_l1_staging=%d "
+                "keep_l1=%d l2_backing=%s",
                 len(keys),
                 len(deletions),
                 len(keys) - len(deletions),

@@ -913,13 +913,30 @@ class L1Manager:
         write_locked = 0
         read_locked = 0
         temporary = 0
+        object_bytes = 0
+        write_locked_bytes = 0
+        read_locked_bytes = 0
+        temporary_bytes = 0
+        persistent_bytes = 0
+        persistent_unlocked_bytes = 0
         for entry in self._objects.values():
-            if entry.write_lock.is_locked():
+            size_bytes = int(entry.memory_obj.get_size())
+            object_bytes += size_bytes
+            is_write_locked = entry.write_lock.is_locked()
+            is_read_locked = entry.read_lock.is_locked()
+            if is_write_locked:
                 write_locked += 1
-            if entry.read_lock.is_locked():
+                write_locked_bytes += size_bytes
+            if is_read_locked:
                 read_locked += 1
+                read_locked_bytes += size_bytes
             if entry.is_temporary:
                 temporary += 1
+                temporary_bytes += size_bytes
+            else:
+                persistent_bytes += size_bytes
+                if not is_write_locked and not is_read_locked:
+                    persistent_unlocked_bytes += size_bytes
         used, total = self._memory_manager.get_memory_usage()
         # ``memory_total_bytes`` is what the allocator currently backs (the
         # grown heap on the lazy tier); this is the declared size. Summed to
@@ -930,6 +947,12 @@ class L1Manager:
             "write_locked_count": write_locked,
             "read_locked_count": read_locked,
             "temporary_count": temporary,
+            "object_bytes": object_bytes,
+            "write_locked_bytes": write_locked_bytes,
+            "read_locked_bytes": read_locked_bytes,
+            "temporary_bytes": temporary_bytes,
+            "persistent_object_bytes": persistent_bytes,
+            "persistent_unlocked_bytes": persistent_unlocked_bytes,
             "memory_used_bytes": used,
             "memory_total_bytes": total,
             "memory_configured_bytes": self._configured_capacity_bytes,

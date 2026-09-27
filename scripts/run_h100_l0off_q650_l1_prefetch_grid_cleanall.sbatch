@@ -74,13 +74,15 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-8000}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.65}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
 LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT="${LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT:-8}"
+LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT="${LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT:-}"
 
 # Match the legacy project chunk size rather than the 256-token smoke-test size.
 LMCACHE_CHUNK_SIZE="${LMCACHE_CHUNK_SIZE:-512}"
 LMCACHE_L1_SIZE_GB="${LMCACHE_L1_SIZE_GB:-40}"
 LMCACHE_MAX_WORKERS="${LMCACHE_MAX_WORKERS:-8}"
 LMCACHE_L2_WORKERS="${LMCACHE_L2_WORKERS:-8}"
-LMCACHE_MP_TIMEOUT="${LMCACHE_MP_TIMEOUT:-30}"
+LMCACHE_MP_TIMEOUT="${LMCACHE_MP_TIMEOUT:-120}"
+LMCACHE_MP_HEARTBEAT_INTERVAL="${LMCACHE_MP_HEARTBEAT_INTERVAL:-40}"
 
 # Dataset-first interface. No QUESTIONS_JSON is needed for normal use.
 DATASET_NAME="${DATASET_NAME:-medical}"
@@ -759,12 +761,20 @@ PY
 )
 echo "fs_native adapter: $L2_ADAPTER_JSON"
 
+LMCACHE_LOOKUP_PF_ARGS=()
+if [[ -n "$LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT" ]]; then
+    LMCACHE_LOOKUP_PF_ARGS+=(
+        --l2-lookup-max-in-flight "$LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT"
+    )
+fi
+
 lmcache server \
     --host localhost \
     --port 5556 \
     --chunk-size "$LMCACHE_CHUNK_SIZE" \
     --l1-size-gb "$LMCACHE_L1_SIZE_GB" \
     --l2-prefetch-max-in-flight "$LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT" \
+    "${LMCACHE_LOOKUP_PF_ARGS[@]}" \
     --eviction-policy LRU \
     --max-workers "$LMCACHE_MAX_WORKERS" \
     --l2-adapter "$L2_ADAPTER_JSON" \
@@ -788,13 +798,15 @@ echo
 echo "===== START VLLM SERVER ====="
 
 KV_TRANSFER_CONFIG=$(
-python - "$LMCACHE_MP_TIMEOUT" "$KV_VPC_SUFFICIENT_BYPASS" "$KV_MUTUAL_PREFIX" <<'PY'
+python - "$LMCACHE_MP_TIMEOUT" "$LMCACHE_MP_HEARTBEAT_INTERVAL" \
+    "$KV_VPC_SUFFICIENT_BYPASS" "$KV_MUTUAL_PREFIX" <<'PY'
 import json
 import sys
 
 timeout = float(sys.argv[1])
-vpc_sufficient_bypass = bool(int(sys.argv[2]))
-mutual_prefix = bool(int(sys.argv[3]))
+heartbeat_interval = float(sys.argv[2])
+vpc_sufficient_bypass = bool(int(sys.argv[3]))
+mutual_prefix = bool(int(sys.argv[4]))
 
 print(
     json.dumps(
@@ -807,6 +819,7 @@ print(
                 "lmcache.mp.host": "tcp://localhost",
                 "lmcache.mp.port": 5556,
                 "lmcache.mp.mq_timeout": timeout,
+                "lmcache.mp.heartbeat_interval": heartbeat_interval,
                 "lmcache.mp.lookup_timeout": 0.0,
                 "lmcache.mp.starvation_fallback": True,
                 "lmcache.mp.vpc_sufficient_bypass": vpc_sufficient_bypass,

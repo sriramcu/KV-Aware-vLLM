@@ -1,0 +1,291 @@
+diff --git a/experiments/mp_nognn_project.py b/experiments/mp_nognn_project.py
+index 7442a27..73dc11f 100755
+--- a/experiments/mp_nognn_project.py
++++ b/experiments/mp_nognn_project.py
+@@ -822,6 +822,77 @@ def wait_for_lmcache_store_barrier(
+         time.sleep(poll_s)
+ 
+ 
++def snapshot_lmcache_l1_for_warm(
++    *,
++    status_url: str,
++    output_path: Path,
++) -> dict[str, Any]:
++    """Capture L1 composition after the cold store barrier, before warm."""
++    response = requests.get(status_url, timeout=30.0)
++    response.raise_for_status()
++    status = response.json()
++    if not status.get("is_healthy", False):
++        raise RuntimeError(
++            "LMCache unhealthy while taking warm-start L1 snapshot: "
++            f"{status}"
++        )
++
++    l1 = status.get("storage_manager", {}).get("l1_manager", {})
++    required = (
++        "total_object_count",
++        "write_locked_count",
++        "read_locked_count",
++        "temporary_count",
++        "object_bytes",
++        "write_locked_bytes",
++        "read_locked_bytes",
++        "temporary_bytes",
++        "persistent_object_bytes",
++        "persistent_unlocked_bytes",
++        "memory_used_bytes",
++        "memory_total_bytes",
++        "memory_configured_bytes",
++    )
++    missing = [name for name in required if name not in l1]
++    if missing:
++        raise RuntimeError(
++            "LMCache /status missing warm-start L1 footprint fields "
++            f"{missing}: l1={l1}"
++        )
++
++    snapshot = {
++        "captured_at_unix_s": time.time(),
++        "status_url": status_url,
++        **{name: l1[name] for name in required},
++    }
++    for name in (
++        "object_bytes",
++        "write_locked_bytes",
++        "read_locked_bytes",
++        "temporary_bytes",
++        "persistent_object_bytes",
++        "persistent_unlocked_bytes",
++        "memory_used_bytes",
++        "memory_total_bytes",
++        "memory_configured_bytes",
++    ):
++        snapshot[name.replace("_bytes", "_gib")] = (
++            float(snapshot[name]) / (1024.0 ** 3)
++        )
++
++    output_path.parent.mkdir(parents=True, exist_ok=True)
++    output_path.write_text(
++        json.dumps(snapshot, indent=2) + "\n",
++        encoding="utf-8",
++    )
++    print(
++        "[SC_L1_WARM_START] "
++        + json.dumps(snapshot, sort_keys=True, separators=(",", ":")),
++        flush=True,
++    )
++    return snapshot
++
++
+ def parse_arguments():
+     parser = argparse.ArgumentParser()
+ 
+@@ -1144,6 +1215,7 @@ def main():
+         print(f"[SC_METRICS_AFTER_COLD] path={metrics_path}", flush=True)
+ 
+     store_barrier = {"enabled": False}
++    l1_warm_start: dict[str, Any] | None = None
+     if args.between_phases_store_barrier:
+         store_barrier = wait_for_lmcache_store_barrier(
+             status_url=args.lmcache_status_url,
+@@ -1168,6 +1240,14 @@ def main():
+             metrics_path.write_text(response.text, encoding="utf-8")
+             print(f"[SC_METRICS_AFTER_BARRIER] path={metrics_path}", flush=True)
+ 
++        # The store barrier has now drained write-owned L1 state. Capture the
++        # actual warm-start L1 composition before the optional inter-phase
++        # sleep or any warm request is submitted.
++        l1_warm_start = snapshot_lmcache_l1_for_warm(
++            status_url=args.lmcache_status_url,
++            output_path=out_dir / "l1_warm_start.json",
++        )
++
+     if args.between_phases_seconds > 0:
+         print(
+             f"Waiting {args.between_phases_seconds:.2f}s "
+@@ -1266,6 +1346,7 @@ def main():
+         "manifest": manifest,
+         "cold": cold_summary,
+         "store_barrier": store_barrier,
++        "l1_warm_start": l1_warm_start,
+         "warm": warm_summary,
+         "output_consistency": consistency,
+     }
+diff --git a/scripts/run_h100_l0off_q650_l1_prefetch_grid_cleanall.sbatch b/scripts/run_h100_l0off_q650_l1_prefetch_grid_cleanall.sbatch
+index 7286ef9..4b8dc6d 100644
+--- a/scripts/run_h100_l0off_q650_l1_prefetch_grid_cleanall.sbatch
++++ b/scripts/run_h100_l0off_q650_l1_prefetch_grid_cleanall.sbatch
+@@ -81,7 +81,8 @@ LMCACHE_CHUNK_SIZE="${LMCACHE_CHUNK_SIZE:-512}"
+ LMCACHE_L1_SIZE_GB="${LMCACHE_L1_SIZE_GB:-40}"
+ LMCACHE_MAX_WORKERS="${LMCACHE_MAX_WORKERS:-8}"
+ LMCACHE_L2_WORKERS="${LMCACHE_L2_WORKERS:-8}"
+-LMCACHE_MP_TIMEOUT="${LMCACHE_MP_TIMEOUT:-30}"
++LMCACHE_MP_TIMEOUT="${LMCACHE_MP_TIMEOUT:-120}"
++LMCACHE_MP_HEARTBEAT_INTERVAL="${LMCACHE_MP_HEARTBEAT_INTERVAL:-40}"
+ 
+ # Dataset-first interface. No QUESTIONS_JSON is needed for normal use.
+ DATASET_NAME="${DATASET_NAME:-medical}"
+@@ -797,13 +798,15 @@ echo
+ echo "===== START VLLM SERVER ====="
+ 
+ KV_TRANSFER_CONFIG=$(
+-python - "$LMCACHE_MP_TIMEOUT" "$KV_VPC_SUFFICIENT_BYPASS" "$KV_MUTUAL_PREFIX" <<'PY'
++python - "$LMCACHE_MP_TIMEOUT" "$LMCACHE_MP_HEARTBEAT_INTERVAL" \
++    "$KV_VPC_SUFFICIENT_BYPASS" "$KV_MUTUAL_PREFIX" <<'PY'
+ import json
+ import sys
+ 
+ timeout = float(sys.argv[1])
+-vpc_sufficient_bypass = bool(int(sys.argv[2]))
+-mutual_prefix = bool(int(sys.argv[3]))
++heartbeat_interval = float(sys.argv[2])
++vpc_sufficient_bypass = bool(int(sys.argv[3]))
++mutual_prefix = bool(int(sys.argv[4]))
+ 
+ print(
+     json.dumps(
+@@ -816,6 +819,7 @@ print(
+                 "lmcache.mp.host": "tcp://localhost",
+                 "lmcache.mp.port": 5556,
+                 "lmcache.mp.mq_timeout": timeout,
++                "lmcache.mp.heartbeat_interval": heartbeat_interval,
+                 "lmcache.mp.lookup_timeout": 0.0,
+                 "lmcache.mp.starvation_fallback": True,
+                 "lmcache.mp.vpc_sufficient_bypass": vpc_sufficient_bypass,
+diff --git a/scripts/run_h100_q650_storecap.sh b/scripts/run_h100_q650_storecap.sh
+index 9bec155..69b36fa 100755
+--- a/scripts/run_h100_q650_storecap.sh
++++ b/scripts/run_h100_q650_storecap.sh
+@@ -9,6 +9,8 @@ L1_GB="${L1_GB:-300}"
+ STORE_CAP_GB="${STORE_CAP_GB:-100}"
+ PF="${PF:-2}"
+ LOOKUP_PF="${LOOKUP_PF:-16}"
++MQ_TIMEOUT="${MQ_TIMEOUT:-120}"
++HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-40}"
+ 
+ case "$ARM" in
+   gnn|nognn) ;;
+@@ -23,6 +25,8 @@ export LMCACHE_L1_SIZE_GB="$L1_GB"
+ export LMCACHE_MP_MAX_INFLIGHT_STORE_GB="$STORE_CAP_GB"
+ export LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT="$PF"
+ export LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT="$LOOKUP_PF"
++export LMCACHE_MP_TIMEOUT="$MQ_TIMEOUT"
++export LMCACHE_MP_HEARTBEAT_INTERVAL="$HEARTBEAT_INTERVAL"
+ export KV_FS_PER_OP_WORKERS=1
+ export KV_FS_SHARED_WORKERS=5
+ export KV_FS_LOOKUP_WORKERS=1
+@@ -45,7 +49,9 @@ echo "arm:                 $ARM"
+ echo "L1 GiB:              $L1_GB"
+ echo "max in-flight PUT:   $STORE_CAP_GB GiB"
+ echo "GET/load PF:        $PF"
+-echo "lookup PF:          $LOOKUP_PF"
++echo "lookup PF:           $LOOKUP_PF"
++echo "MQ timeout:          $MQ_TIMEOUT s"
++echo "heartbeat interval:  $HEARTBEAT_INTERVAL s"
+ echo "workers:             5 shared + 2 retrieve + 1 lookup"
+ echo "barrier:             ON"
+ echo "================================="
+diff --git a/scripts/run_shortq_gnn_dynamic_vpc_common.sh b/scripts/run_shortq_gnn_dynamic_vpc_common.sh
+index 7416a97..54b7ed6 100755
+--- a/scripts/run_shortq_gnn_dynamic_vpc_common.sh
++++ b/scripts/run_shortq_gnn_dynamic_vpc_common.sh
+@@ -16,7 +16,8 @@ LMCACHE_L1_SIZE_GB="${LMCACHE_L1_SIZE_GB:-200}"
+ LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT="${LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT:-2}"
+ LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT="${LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT:-}"
+ LMCACHE_MAX_WORKERS="${LMCACHE_MAX_WORKERS:-8}"
+-LMCACHE_MP_TIMEOUT=30
++LMCACHE_MP_TIMEOUT="${LMCACHE_MP_TIMEOUT:-120}"
++LMCACHE_MP_HEARTBEAT_INTERVAL="${LMCACHE_MP_HEARTBEAT_INTERVAL:-40}"
+ FEATURE_MODEL=meta-llama/Llama-3.1-8B-Instruct
+ CHECKPOINT="${REPO}/Hierarchical_KV/shortq_placement/model.pt"
+ GNN_INFERENCE_BATCH_SIZE="${GNN_INFERENCE_BATCH_SIZE:-1}"
+@@ -391,12 +392,14 @@ LMCACHE_PID=$!
+ wait_tcp 5556 "$LMCACHE_PID" 240 || { tail -200 "${LOG_DIR}/lmcache.log"; exit 30; }
+ curl -sf http://127.0.0.1:8080/metrics > "${RUN_DIR}/lmcache_metrics_before.txt" || true
+ 
+-KV_CONFIG=$(python - "$LMCACHE_MP_TIMEOUT" "$KV_STAGE1_STARVATION_FALLBACK" \
+-  "$KV_STAGE1_OCCUPANCY_FALLBACK" "$KV_STAGE1_OCCUPANCY_LOW_FRACTION" \
++KV_CONFIG=$(python - "$LMCACHE_MP_TIMEOUT" "$LMCACHE_MP_HEARTBEAT_INTERVAL" \
++  "$KV_STAGE1_STARVATION_FALLBACK" "$KV_STAGE1_OCCUPANCY_FALLBACK" \
++  "$KV_STAGE1_OCCUPANCY_LOW_FRACTION" \
+   "$KV_STAGE1_OCCUPANCY_TARGET_FRACTION" "$KV_STAGE1_OCCUPANCY_GRACE_S" \
+   "$KV_VPC_SUFFICIENT_BYPASS" "$KV_MUTUAL_PREFIX" <<'PY'
+ import json,sys
+ timeout=float(sys.argv[1])
++heartbeat_interval=float(sys.argv[2])
+ print(json.dumps({
+   'kv_connector':'LMCacheMPConnector',
+   'kv_connector_module_path':'lmcache.integration.vllm.lmcache_mp_connector',
+@@ -406,14 +409,15 @@ print(json.dumps({
+     'lmcache.mp.host':'tcp://localhost',
+     'lmcache.mp.port':5556,
+     'lmcache.mp.mq_timeout':timeout,
++    'lmcache.mp.heartbeat_interval':heartbeat_interval,
+     'lmcache.mp.lookup_timeout':0.0,
+-    'lmcache.mp.starvation_fallback':bool(int(sys.argv[2])),
+-    'lmcache.mp.occupancy_fallback':bool(int(sys.argv[3])),
+-    'lmcache.mp.occupancy_low_fraction':float(sys.argv[4]),
+-    'lmcache.mp.occupancy_target_fraction':float(sys.argv[5]),
+-    'lmcache.mp.occupancy_grace_s':float(sys.argv[6]),
+-    'lmcache.mp.vpc_sufficient_bypass':bool(int(sys.argv[7])),
+-    'lmcache.mp.mutual_prefix':bool(int(sys.argv[8])),
++    'lmcache.mp.starvation_fallback':bool(int(sys.argv[3])),
++    'lmcache.mp.occupancy_fallback':bool(int(sys.argv[4])),
++    'lmcache.mp.occupancy_low_fraction':float(sys.argv[5]),
++    'lmcache.mp.occupancy_target_fraction':float(sys.argv[6]),
++    'lmcache.mp.occupancy_grace_s':float(sys.argv[7]),
++    'lmcache.mp.vpc_sufficient_bypass':bool(int(sys.argv[8])),
++    'lmcache.mp.mutual_prefix':bool(int(sys.argv[9])),
+   },
+ }))
+ PY
+diff --git a/third_party/LMCache/lmcache/v1/distributed/l1_manager.py b/third_party/LMCache/lmcache/v1/distributed/l1_manager.py
+index e44a0d1..3e93efa 100644
+--- a/third_party/LMCache/lmcache/v1/distributed/l1_manager.py
++++ b/third_party/LMCache/lmcache/v1/distributed/l1_manager.py
+@@ -913,13 +913,30 @@ class L1Manager:
+         write_locked = 0
+         read_locked = 0
+         temporary = 0
++        object_bytes = 0
++        write_locked_bytes = 0
++        read_locked_bytes = 0
++        temporary_bytes = 0
++        persistent_bytes = 0
++        persistent_unlocked_bytes = 0
+         for entry in self._objects.values():
+-            if entry.write_lock.is_locked():
++            size_bytes = int(entry.memory_obj.get_size())
++            object_bytes += size_bytes
++            is_write_locked = entry.write_lock.is_locked()
++            is_read_locked = entry.read_lock.is_locked()
++            if is_write_locked:
+                 write_locked += 1
+-            if entry.read_lock.is_locked():
++                write_locked_bytes += size_bytes
++            if is_read_locked:
+                 read_locked += 1
++                read_locked_bytes += size_bytes
+             if entry.is_temporary:
+                 temporary += 1
++                temporary_bytes += size_bytes
++            else:
++                persistent_bytes += size_bytes
++                if not is_write_locked and not is_read_locked:
++                    persistent_unlocked_bytes += size_bytes
+         used, total = self._memory_manager.get_memory_usage()
+         # ``memory_total_bytes`` is what the allocator currently backs (the
+         # grown heap on the lazy tier); this is the declared size. Summed to
+@@ -930,6 +947,12 @@ class L1Manager:
+             "write_locked_count": write_locked,
+             "read_locked_count": read_locked,
+             "temporary_count": temporary,
++            "object_bytes": object_bytes,
++            "write_locked_bytes": write_locked_bytes,
++            "read_locked_bytes": read_locked_bytes,
++            "temporary_bytes": temporary_bytes,
++            "persistent_object_bytes": persistent_bytes,
++            "persistent_unlocked_bytes": persistent_unlocked_bytes,
+             "memory_used_bytes": used,
+             "memory_total_bytes": total,
+             "memory_configured_bytes": self._configured_capacity_bytes,

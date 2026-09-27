@@ -13,8 +13,10 @@ REQUEST_ORDER_SEED=0
 WARM_ORDER=reverse
 LMCACHE_CHUNK_SIZE=512
 LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT="${LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT:-2}"
+LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT="${LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT:-}"
 LMCACHE_MAX_WORKERS="${LMCACHE_MAX_WORKERS:-8}"
-LMCACHE_MP_TIMEOUT=30
+LMCACHE_MP_TIMEOUT="${LMCACHE_MP_TIMEOUT:-120}"
+LMCACHE_MP_HEARTBEAT_INTERVAL="${LMCACHE_MP_HEARTBEAT_INTERVAL:-40}"
 FEATURE_MODEL=meta-llama/Llama-3.1-8B-Instruct
 CHECKPOINT="${REPO}/Hierarchical_KV/shortq_placement/model.pt"
 GNN_INFERENCE_BATCH_SIZE="${GNN_INFERENCE_BATCH_SIZE:-1}"
@@ -23,6 +25,7 @@ GNN_INFERENCE_BATCH_SIZE="${GNN_INFERENCE_BATCH_SIZE:-1}"
 # KV_GNN_AWARE_VPC=0; only the learned retention bias is disabled.
 KV_GNN_AWARE_VPC="${KV_GNN_AWARE_VPC:-1}"
 KV_GNN_L1_BACKING="${KV_GNN_L1_BACKING:-1}"
+LMCACHE_L1_SIZE_GB="${LMCACHE_L1_SIZE_GB:-200}"
 # Optional durability experiment: back every host-resident GNN prompt chunk to
 # L2 while preserving its original VPC/L1 placement. Disabled by default so
 # existing grid runs are unchanged.
@@ -90,7 +93,7 @@ case "$PROFILE" in
     CUDA_HOME=/usr/local/cuda-13.1
     MODEL=meta-llama/Llama-3.3-70B-Instruct
     TP=2; QUANTIZATION=fp8; GPU_UTIL=0.65; MAX_SEQS=16
-    L1_GB=200
+    L1_GB="$LMCACHE_L1_SIZE_GB"
     NUM_QUESTIONS="${NUM_QUESTIONS:-96}"
     SUBMISSION_BATCH_SIZE="${SUBMISSION_BATCH_SIZE:-$NUM_QUESTIONS}"
     MIN_TOKENS="${MIN_TOKENS:-32}"; MAX_TOKENS="${MAX_TOKENS:-128}"
@@ -102,7 +105,7 @@ case "$PROFILE" in
     CUDA_HOME=/usr/local/cuda-13.1
     MODEL=meta-llama/Llama-3.3-70B-Instruct
     TP=2; QUANTIZATION=fp8; GPU_UTIL=0.65; MAX_SEQS=16
-    L1_GB=200
+    L1_GB="$LMCACHE_L1_SIZE_GB"
     NUM_QUESTIONS=650; SUBMISSION_BATCH_SIZE=650
     MIN_TOKENS=128; MAX_TOKENS=512
     RUN_LABEL=h100_shortq_gnn_dynamic_vpc_q650
@@ -371,22 +374,32 @@ PY
 )
 echo "fs_native adapter: $L2_JSON"
 
+LMCACHE_LOOKUP_PF_ARGS=()
+if [[ -n "$LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT" ]]; then
+  LMCACHE_LOOKUP_PF_ARGS+=(
+    --l2-lookup-max-in-flight "$LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT"
+  )
+fi
+
 echo "===== START LMCACHE (L0 OFF) ====="
 lmcache server --host localhost --port 5556 --chunk-size "$LMCACHE_CHUNK_SIZE" \
   --l1-size-gb "$L1_GB" \
   --l2-prefetch-max-in-flight "$LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT" \
+  "${LMCACHE_LOOKUP_PF_ARGS[@]}" \
   --l2-store-policy gnn_dynamic --eviction-policy LRU --max-workers "$LMCACHE_MAX_WORKERS" \
   --l2-adapter "$L2_JSON" > "${LOG_DIR}/lmcache.log" 2>&1 &
 LMCACHE_PID=$!
 wait_tcp 5556 "$LMCACHE_PID" 240 || { tail -200 "${LOG_DIR}/lmcache.log"; exit 30; }
 curl -sf http://127.0.0.1:8080/metrics > "${RUN_DIR}/lmcache_metrics_before.txt" || true
 
-KV_CONFIG=$(python - "$LMCACHE_MP_TIMEOUT" "$KV_STAGE1_STARVATION_FALLBACK" \
-  "$KV_STAGE1_OCCUPANCY_FALLBACK" "$KV_STAGE1_OCCUPANCY_LOW_FRACTION" \
+KV_CONFIG=$(python - "$LMCACHE_MP_TIMEOUT" "$LMCACHE_MP_HEARTBEAT_INTERVAL" \
+  "$KV_STAGE1_STARVATION_FALLBACK" "$KV_STAGE1_OCCUPANCY_FALLBACK" \
+  "$KV_STAGE1_OCCUPANCY_LOW_FRACTION" \
   "$KV_STAGE1_OCCUPANCY_TARGET_FRACTION" "$KV_STAGE1_OCCUPANCY_GRACE_S" \
   "$KV_VPC_SUFFICIENT_BYPASS" "$KV_MUTUAL_PREFIX" <<'PY'
 import json,sys
 timeout=float(sys.argv[1])
+heartbeat_interval=float(sys.argv[2])
 print(json.dumps({
   'kv_connector':'LMCacheMPConnector',
   'kv_connector_module_path':'lmcache.integration.vllm.lmcache_mp_connector',
@@ -396,14 +409,15 @@ print(json.dumps({
     'lmcache.mp.host':'tcp://localhost',
     'lmcache.mp.port':5556,
     'lmcache.mp.mq_timeout':timeout,
+    'lmcache.mp.heartbeat_interval':heartbeat_interval,
     'lmcache.mp.lookup_timeout':0.0,
-    'lmcache.mp.starvation_fallback':bool(int(sys.argv[2])),
-    'lmcache.mp.occupancy_fallback':bool(int(sys.argv[3])),
-    'lmcache.mp.occupancy_low_fraction':float(sys.argv[4]),
-    'lmcache.mp.occupancy_target_fraction':float(sys.argv[5]),
-    'lmcache.mp.occupancy_grace_s':float(sys.argv[6]),
-    'lmcache.mp.vpc_sufficient_bypass':bool(int(sys.argv[7])),
-    'lmcache.mp.mutual_prefix':bool(int(sys.argv[8])),
+    'lmcache.mp.starvation_fallback':bool(int(sys.argv[3])),
+    'lmcache.mp.occupancy_fallback':bool(int(sys.argv[4])),
+    'lmcache.mp.occupancy_low_fraction':float(sys.argv[5]),
+    'lmcache.mp.occupancy_target_fraction':float(sys.argv[6]),
+    'lmcache.mp.occupancy_grace_s':float(sys.argv[7]),
+    'lmcache.mp.vpc_sufficient_bypass':bool(int(sys.argv[8])),
+    'lmcache.mp.mutual_prefix':bool(int(sys.argv[9])),
   },
 }))
 PY
