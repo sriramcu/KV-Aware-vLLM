@@ -942,7 +942,7 @@ def parse_arguments():
 
     parser.add_argument(
         "--warm_order",
-        choices=("same", "reverse"),
+        choices=("same", "reverse", "random"),
         default="reverse",
     )
 
@@ -1097,6 +1097,9 @@ def main():
         warm_source_indices = list(
             range(num_requests - 1, -1, -1)
         )
+    elif args.warm_order == "random":
+        warm_source_indices = list(range(num_requests))
+        random.Random(args.request_order_seed).shuffle(warm_source_indices)
     else:
         warm_source_indices = list(range(num_requests))
 

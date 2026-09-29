@@ -83,6 +83,7 @@ LMCACHE_MAX_WORKERS="${LMCACHE_MAX_WORKERS:-8}"
 LMCACHE_L2_WORKERS="${LMCACHE_L2_WORKERS:-8}"
 LMCACHE_MP_TIMEOUT="${LMCACHE_MP_TIMEOUT:-120}"
 LMCACHE_MP_HEARTBEAT_INTERVAL="${LMCACHE_MP_HEARTBEAT_INTERVAL:-40}"
+LMCACHE_EVICTION_RATIO="${LMCACHE_EVICTION_RATIO:-0.2}"
 
 # Dataset-first interface. No QUESTIONS_JSON is needed for normal use.
 DATASET_NAME="${DATASET_NAME:-medical}"
@@ -776,6 +777,7 @@ lmcache server \
     --l2-prefetch-max-in-flight "$LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT" \
     "${LMCACHE_LOOKUP_PF_ARGS[@]}" \
     --eviction-policy LRU \
+    --eviction-ratio "$LMCACHE_EVICTION_RATIO" \
     --max-workers "$LMCACHE_MAX_WORKERS" \
     --l2-adapter "$L2_ADAPTER_JSON" \
     > "${LOG_DIR}/lmcache.log" 2>&1 &
