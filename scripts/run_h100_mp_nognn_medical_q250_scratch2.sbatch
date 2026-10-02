@@ -73,7 +73,7 @@ MAX_TOKENS="${MAX_TOKENS:-512}"
 TOP_P="${TOP_P:-0.95}"
 
 # Real project baseline: VPC enabled. Set ENABLE_VPC=0 only for targeted
-# isolation experiments later (especially during L0 validation).
+# isolation experiments later.
 ENABLE_VPC="${ENABLE_VPC:-1}"
 
 # Preserve legacy compiled-mode intent by default. Set to 1 if debugging.

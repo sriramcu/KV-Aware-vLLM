@@ -13,8 +13,8 @@ def dormant_lookup(chunk_hash_hex: str) -> str | None:
     return None
 
 
-def dormant_store(chunk_hash_hex: str, tier: str) -> None:
-    del chunk_hash_hex, tier
+def dormant_store(chunk_hash_hex: str, placement: str) -> None:
+    del chunk_hash_hex, placement
 
 
 _selected_lookup = dormant_lookup
@@ -25,5 +25,5 @@ def lookup_prediction(chunk_hash_hex: str) -> str | None:
     return _selected_lookup(chunk_hash_hex)
 
 
-def store_prediction(chunk_hash_hex: str, tier: str) -> None:
-    _selected_store(chunk_hash_hex, tier)
+def store_prediction(chunk_hash_hex: str, placement: str) -> None:
+    _selected_store(chunk_hash_hex, placement)

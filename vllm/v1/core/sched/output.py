@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+# [SC] Project-specific changes in this upstream file are marked with [SC];
+# see repo-root docs/SC_MODIFICATIONS.md for rationale and provenance.
+
 from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING
@@ -144,7 +147,11 @@ class CachedRequestData:
     new_block_ids: list[tuple[list[int], ...] | None]
     num_computed_tokens: list[int]
     num_output_tokens: list[int]
-    # V2 load-failure recovery only: requests whose computed-token position was
+    # [SC] V2 KV-load-failure rewind metadata. Upstream context:
+    # https://github.com/vllm-project/vllm/issues/49250
+    # https://github.com/vllm-project/vllm/pull/49252
+    # https://github.com/vllm-project/vllm/pull/53298
+    # Requests whose computed-token position was
     # explicitly moved backwards by the scheduler. The worker must restore
     # device-side request state to this accepted scheduler state before forward.
     rewound_req_ids: set[str] | None = None
@@ -201,6 +208,7 @@ class CachedRequestData:
             new_block_ids=[],
             num_computed_tokens=[],
             num_output_tokens=[],
+            # [SC] Empty rewind metadata on the normal fast path.
             rewound_req_ids=set(),
             rewound_all_token_ids={},
         )

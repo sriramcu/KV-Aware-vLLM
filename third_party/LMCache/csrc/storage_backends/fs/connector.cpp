@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
+// [SC] Project-specific changes in this upstream file are marked with [SC];
+// see repo-root docs/SC_MODIFICATIONS.md for rationale and provenance.
+
 #include "connector.h"
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
+// [SC] Move WorkerPoolConfig into ConnectorBase without copying.
 #include <utility>
 
 namespace lmcache {
@@ -147,6 +151,7 @@ static bool try_enable_odirect(int& flags, const void* buf, size_t len,
 // FSConnector
 // ---------------------------------------------------------------
 
+// [SC] Forward the optional dedicated lane topology to ConnectorBase.
 FSConnector::FSConnector(std::string base_path, int num_workers,
                          std::string relative_tmp_dir, bool use_odirect,
                          size_t read_ahead_size,

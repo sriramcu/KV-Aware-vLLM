@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# [SC] Project-specific changes in this upstream file are marked with [SC];
+# see repo-root docs/SC_MODIFICATIONS.md for rationale and provenance.
+
 """
 L2 adapter that wraps any pybind-wrapped C++ IStorageConnector (native client).
 
@@ -23,6 +26,7 @@ from __future__ import annotations
 # Standard
 from collections import defaultdict
 from typing import Any
+# [SC] Optional congestion/prefix diagnostics for native L2 operations.
 import os
 import select
 import threading
@@ -116,6 +120,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         self._client_fd: int = int(native_client.event_fd())
         self._type_name: str = type_name or type(native_client).__name__
         self._extra_status: dict[str, Any] = dict(extra_status or {})
+        # [SC] Instrument queue/service timing without changing I/O admission.
         self._congestion_debug = (
             os.getenv("LMCACHE_MP_CONGESTION_DEBUG", "0") == "1"
         )
@@ -171,7 +176,8 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         # demux thread can fire ``_notify_keys_stored(keys, sizes)``.
         self._pending_store_sizes: dict[int, tuple[list[ObjectKey], list[int]]] = {}
 
-        # Optional prefix-hole diagnostics. Track keys whose native SET is
+        # [SC] Optional zero-extra-I/O prefix-hole diagnostics.
+        # Track keys whose native SET is
         # still outstanding so an EXISTS miss can be classified without issuing
         # any extra filesystem I/O. The completed lookup debug state is consumed
         # atomically with the normal lookup result by PrefetchController.
@@ -195,6 +201,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         )
         self._demux_thread.start()
 
+    # [SC] Diagnostic helpers; all call sites are gated by debug flags.
     def _pending_counts_locked(self) -> tuple[int, int, int, int]:
         """Return pending (store, lookup, load, total) under ``self._lock``."""
         stores = lookups = loads = 0
@@ -270,6 +277,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                 None,
             )
             self._pending_store_sizes[future_id] = (list(keys), per_key_sizes)
+            # [SC] Track pending-store overlap for prefix-hole diagnostics.
             if self._prefix_diag:
                 for key in keys:
                     self._pending_store_key_refcounts[key] += 1
@@ -317,6 +325,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         with self._lock:
             return self._completed_lookups.pop(task_id, None)
 
+    # [SC] Atomically consume normal lookup state plus optional diagnostics.
     def query_lookup_and_lock_result_with_debug(
         self, task_id: L2TaskId
     ) -> tuple[Bitmap, Bitmap | None, Bitmap | None] | None:
@@ -362,6 +371,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         with self._lock:
             task_id = self._get_next_task_id()
             future_id = int(self._client.submit_batch_get(key_strings, memviews))
+            # [SC] Record native GET submission timing when diagnostics are enabled.
             self._pending_ops[future_id] = (
                 self._OP_LOAD,
                 task_id,
@@ -402,6 +412,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         with self._lock:
             task_id = self._get_next_task_id()
             future_id = int(self._client.submit_batch_delete(key_strings))
+            # [SC] Record native DELETE submission timing when diagnostics are enabled.
             self._pending_ops[future_id] = (
                 self._OP_DELETE,
                 task_id,
@@ -546,6 +557,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                         lookup_keys,
                     ) = entry
 
+                    # [SC] Completion-side service/queue instrumentation.
                     if self._congestion_debug:
                         submitted_at = self._debug_submit_at.pop(fid, None)
                         service_s = (
@@ -617,6 +629,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                                     bitmap.set(i)
                                     if lookup_keys is not None:
                                         self._locked_keys[lookup_keys[i]] += 1
+                        # [SC] Snapshot pending/ever-stored state with the normal EXISTS result.
                         if self._prefix_diag and lookup_keys is not None:
                             pending_store = Bitmap(num_keys)
                             ever_stored = Bitmap(num_keys)

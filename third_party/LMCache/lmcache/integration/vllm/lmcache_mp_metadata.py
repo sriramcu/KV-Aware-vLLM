@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# [SC] Project-specific changes in this upstream file are marked with [SC];
+# see repo-root docs/SC_MODIFICATIONS.md for rationale and provenance.
+
 # Standard
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
@@ -56,6 +59,7 @@ class LMCacheMPRequestTracker:
     # during generation. Keyed by engine_group_idx; non-HMA models use 0.
     allocated_block_ids: dict[int, list[int]] = field(default_factory=dict)
 
+    # [SC] Prompt boundary for Short-Q prompt-only persistence.
     # Original prompt length captured when the tracker is created. Unlike
     # all_token_ids, this does not grow during decode. Placement experiments
     # can use it to prevent a prompt-tail chunk that becomes complete only
@@ -82,6 +86,7 @@ class LMCacheMPRequestTracker:
     request_configs: dict[str, Any] | None = None
     max_offload_tokens: int | None = None
     lookup_started_at: float | None = None
+    # [SC] Mutual-prefix external lookup offset after the local vLLM prefix.
     lmcache_lookup_start_tokens: int | None = None
 
     mm_adjusted_prompt_ids: list[int] = field(default_factory=list)
@@ -94,6 +99,7 @@ class LMCacheMPRequestTracker:
             "lmcache.max_offload_tokens"
         )
         self.lookup_started_at = None
+        # [SC] Reset request-local mutual-prefix state and preserve prompt size.
         self.lmcache_lookup_start_tokens = None
         self.all_token_ids = request.all_token_ids
         self.num_prompt_tokens = len(request.prompt_token_ids)
@@ -205,6 +211,7 @@ class LMCacheMPRequestMetadata:
         lmcache_tokens_per_chunk: int,
         group_tokens_per_block: list[int],
         *,
+        # [SC] Short-Q store path may restrict persistence to complete prompt chunks.
         prompt_only: bool = False,
     ) -> "LMCacheMPRequestMetadata | None":
         """
@@ -217,6 +224,7 @@ class LMCacheMPRequestMetadata:
                 paged chunk (one block ID) of that group, i.e. the group's
                 KV cache spec ``block_size``. Must each divide
                 ``lmcache_tokens_per_chunk`` (hybrid models can mix different values).
+            # [SC] Short-Q dynamic persistence constraint.
             prompt_only: if True, never store beyond the last LMCache chunk
                 that was already complete in the original prompt. This keeps
                 generated tokens from completing and persisting a previously
@@ -267,6 +275,8 @@ class LMCacheMPRequestMetadata:
             computed_tokens,
         )
         if prompt_only:
+            # [SC] Never let decode complete and persist a partial prompt-tail
+            # chunk that had no prompt-time Short-Q placement decision.
             # Only persist chunks whose full token content was present in the
             # original prompt. Example: a 5,545-token prompt contains ten
             # complete 512-token chunks plus a 425-token tail. Decode may later

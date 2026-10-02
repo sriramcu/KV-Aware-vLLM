@@ -487,7 +487,7 @@ def main():
         str(i): gnn_pred_to_block_tiers(pred)
         for i, pred in enumerate(gnn_predictions)
     } 
-    with open("/tmp/kv_importance_tiers.json", "w", encoding="utf-8") as f:
+    with open("/tmp/kv_importance_placements.json", "w", encoding="utf-8") as f:
         json.dump(importance_sidecar, f, indent=2)
     print("all gnn predictions saved -> gnn_prompt_predictions.pt", flush=True)
 
@@ -506,10 +506,9 @@ def main():
     hook.install()
 
     lmcache_connector = "LMCacheConnectorV1"
-    os.environ["VLLM_KV_IMPORTANCE_TIERS"] = "/tmp/kv_importance_tiers.json"
+    os.environ["VLLM_KV_IMPORTANCE_PLACEMENTS"] = "/tmp/kv_importance_placements.json"
     os.environ["GNN_KV_BLOCK_SIZE"] = str(16)
     
-    os.environ["VLLM_KV_IMPORTANCE_ENABLE"] = "0"
    
     # llm_inputs = [llm_inputs[0]] * 1000
 

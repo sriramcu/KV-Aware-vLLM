@@ -2,7 +2,7 @@
 """Precompute request-conditioned Short-Q chunk placement for MP experiments.
 
 Runtime metadata is deliberately minimal: a JSON object mapping rolling LMCache
-chunk-hash hex strings to final L0/L1/L2 decisions. Rich diagnostics (including
+chunk-hash hex strings to final gpu/cpu/disk decisions. Rich diagnostics (including
 per-occurrence request-conditioned predictions and timing) are saved separately
 and are never consumed by the runtime placement path.
 """
@@ -36,7 +36,8 @@ from experiments.mp_nognn_project import (  # noqa: E402
 )
 from Hierarchical_KV.shortq_placement.block_prediction import get_block_predictions  # noqa: E402
 from Hierarchical_KV.shortq_placement.chunk_voting import (
-    make_block_tier_vote,
+    make_block_placement_vote,
+    selected_vote_config,
     selected_vote_policy_name,
     vote_chunk_placement,
 )
@@ -51,9 +52,9 @@ from Hierarchical_KV.shortq_placement.prediction_cache import (  # noqa: E402
     store_prediction,
 )
 from Hierarchical_KV.shortq_placement.runtime_metadata import write_runtime_metadata  # noqa: E402
-from Hierarchical_KV.shortq_placement.tier_mapping import (  # noqa: E402
+from Hierarchical_KV.shortq_placement.placement_mapping import (  # noqa: E402
     CLASS_NAMES,
-    map_block_predictions_to_tiers,
+    map_block_predictions_to_placements,
 )
 from lmcache.v1.multiprocess.token_hasher import TokenHasher  # noqa: E402
 
@@ -85,7 +86,7 @@ def parse_args() -> argparse.Namespace:
         default="",
         help=(
             "Optional JSON output mapping reordered request index to native "
-            "16-token block importance tiers for GNN-aware vLLM VPC."
+            "16-token block importance labels for GNN-aware vLLM VPC."
         ),
     )
     p.add_argument("--placement_trace", required=True)
@@ -93,12 +94,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--timing_trace", required=True)
     p.add_argument("--summary", required=True)
     p.add_argument(
+        "--smoke_force_min_unique_per_placement",
         "--smoke_force_min_unique_per_tier",
+        dest="smoke_force_min_unique_per_placement",
         type=int,
         default=0,
         help=(
             "Smoke-only validation aid. If >0, deterministically override the minimal "
-            "number of runtime hash entries needed to exercise every L0/L1/L2 path. "
+            "number of runtime hash entries needed to exercise every gpu/cpu/disk placement path. "
             "Raw GNN candidate predictions remain unchanged in the diagnostic traces."
         ),
     )
@@ -217,7 +220,7 @@ def _block_features_batch(
 
 def _counter_dict(values: list[str]) -> dict[str, int]:
     c = Counter(values)
-    return {k: int(c.get(k, 0)) for k in ("L0", "L1", "L2")}
+    return {k: int(c.get(k, 0)) for k in ("gpu", "cpu", "disk")}
 
 
 def _sync(device: torch.device) -> None:
@@ -268,15 +271,13 @@ def _write_vpc_importance_sidecar(
     Short-Q votes at 512-token LMCache chunk granularity. vLLM's physical APC
     blocks remain 16 tokens, so every full logical chunk contributes the same
     label to ``blocks_per_chunk`` consecutive native blocks. The final resolved
-    runtime tier is used so shared hashes have stable semantics across requests.
+    runtime placement is used so shared hashes have stable semantics across requests.
     """
-    tier_to_importance = {"L0": "gpu", "L1": "cpu", "L2": "disk"}
     per_request: dict[str, dict[str, str]] = {}
     for row in occurrences:
         request_idx = str(int(row["request_order_index"]))
         chunk_idx = int(row["chunk_index"])
-        tier = str(row["runtime_tier"])
-        importance = tier_to_importance[tier]
+        importance = str(row["runtime_placement"])
         request_map = per_request.setdefault(request_idx, {})
         start = chunk_idx * blocks_per_chunk
         for block_idx in range(start, start + blocks_per_chunk):
@@ -290,29 +291,29 @@ def _write_vpc_importance_sidecar(
     )
 
 
-def _force_smoke_tier_coverage(
-    runtime: dict[str, str], min_unique_per_tier: int
+def _force_smoke_placement_coverage(
+    runtime: dict[str, str], min_unique_per_placement: int
 ) -> list[dict[str, str]]:
     """Deterministically force minimal path coverage for smoke tests only."""
-    if min_unique_per_tier <= 0:
+    if min_unique_per_placement <= 0:
         return []
-    required = min_unique_per_tier * 3
+    required = min_unique_per_placement * 3
     if len(runtime) < required:
         raise RuntimeError(
-            f"smoke tier coverage requires at least {required} unique hashes, got {len(runtime)}"
+            f"smoke placement coverage requires at least {required} unique hashes, got {len(runtime)}"
         )
     counts = Counter(runtime.values())
     overrides: list[dict[str, str]] = []
     ordered_hashes = list(runtime.keys())  # insertion order = first-seen request order
-    for target in ("L0", "L1", "L2"):
-        while counts[target] < min_unique_per_tier:
-            donor_tiers = sorted(
-                (tier for tier in ("L0", "L1", "L2") if counts[tier] > min_unique_per_tier),
-                key=lambda tier: (-counts[tier], tier),
+    for target in ("gpu", "cpu", "disk"):
+        while counts[target] < min_unique_per_placement:
+            donor_placements = sorted(
+                (placement for placement in ("gpu", "cpu", "disk") if counts[placement] > min_unique_per_placement),
+                key=lambda placement: (-counts[placement], placement),
             )
-            if not donor_tiers:
+            if not donor_placements:
                 raise RuntimeError(f"cannot force smoke coverage for {target}; counts={dict(counts)}")
-            donor = donor_tiers[0]
+            donor = donor_placements[0]
             chosen = next(h for h in ordered_hashes if runtime[h] == donor)
             runtime[chosen] = target
             counts[donor] -= 1
@@ -389,10 +390,13 @@ def main() -> None:
 
     hasher = TokenHasher(chunk_size=args.chunk_size, hash_algorithm="blake3")
     runtime: dict[str, str] = {}
+    vote_config = selected_vote_config()
+    vote_policy_name = selected_vote_policy_name()
+
     occurrences: list[dict[str, Any]] = []
     hash_prediction_rows: list[dict[str, Any]] = []
     timing_rows: list[dict[str, Any]] = []
-    occurrence_tiers: list[str] = []
+    occurrence_placements: list[str] = []
     candidate_by_hash: dict[str, Counter[str]] = defaultdict(Counter)
     conflict_occurrences = 0
     cache_hits = 0
@@ -521,9 +525,9 @@ def main() -> None:
             ).tolist()
             class_occurrences.update(int(x) for x in class_ids)
             
-            # Preserve the normal argmax-derived L0/L1/L2 tier for every block,
+            # Preserve the normal argmax-derived gpu/cpu/disk placement for every block,
             # but attach whether CPU was among that block's top-2 class logits.
-            base_mapped = map_block_predictions_to_tiers(class_ids)
+            base_mapped = map_block_predictions_to_placements(class_ids)
 
             cpu_class_id = CLASS_NAMES.index("cpu")
 
@@ -539,11 +543,11 @@ def main() -> None:
             )
 
             mapped = [
-                make_block_tier_vote(
-                    tier,
+                make_block_placement_vote(
+                    placement,
                     cpu_top2=cpu_top2_flags[i],
                 )
-                for i, tier in enumerate(base_mapped)
+                for i, placement in enumerate(base_mapped)
             ]
 
             hashes = hasher.compute_chunk_hashes(serving_ids)
@@ -560,12 +564,14 @@ def main() -> None:
                 else:
                     lo = chunk_index * blocks_per_chunk
                     hi = lo + blocks_per_chunk
-                    block_tiers = mapped[lo:hi]
-                    if len(block_tiers) != blocks_per_chunk:
+                    block_placements = mapped[lo:hi]
+                    if len(block_placements) != blocks_per_chunk:
                         raise RuntimeError(
                             "full LMCache chunk did not have 32 aligned block predictions"
                         )
-                    candidate = vote_chunk_placement(block_tiers)
+                    candidate = vote_chunk_placement(
+                        block_placements, config=vote_config, policy=vote_policy_name
+                    )
                     store_prediction(h, candidate)
                 previous = runtime.get(h)
                 resolved = resolve_duplicate(previous, candidate)
@@ -574,11 +580,11 @@ def main() -> None:
                     conflict_occurrences += 1
                 runtime[h] = resolved
                 candidate_by_hash[h][candidate] += 1
-                occurrence_tiers.append(candidate)
+                occurrence_placements.append(candidate)
                 class_slice = class_ids[
                     chunk_index * blocks_per_chunk : (chunk_index + 1) * blocks_per_chunk
                 ]
-                tier_slice = mapped[
+                placement_slice = mapped[
                     chunk_index * blocks_per_chunk : (chunk_index + 1) * blocks_per_chunk
                 ]
                 occurrences.append(
@@ -587,14 +593,14 @@ def main() -> None:
                         "request_order_index": request_order_index,
                         "chunk_index": chunk_index,
                         "chunk_hash": h,
-                        "candidate_tier": candidate,
-                        "runtime_tier": resolved,
+                        "candidate_placement": candidate,
+                        "runtime_placement": resolved,
                         "duplicate_conflict": conflict,
                         "block_class_counts": {
                             CLASS_NAMES[i]: sum(1 for x in class_slice if int(x) == i)
                             for i in range(4)
                         },
-                        "block_tier_counts": _counter_dict(tier_slice),
+                        "block_placement_counts": _counter_dict(placement_slice),
                     }
                 )
                 hash_prediction_rows.append(
@@ -646,19 +652,19 @@ def main() -> None:
         int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else None
     )
 
-    smoke_overrides = _force_smoke_tier_coverage(
-        runtime, args.smoke_force_min_unique_per_tier
+    smoke_overrides = _force_smoke_placement_coverage(
+        runtime, args.smoke_force_min_unique_per_placement
     )
     override_hashes = {row["chunk_hash"] for row in smoke_overrides}
     for row in occurrences:
-        row["runtime_tier"] = runtime[row["chunk_hash"]]
+        row["runtime_placement"] = runtime[row["chunk_hash"]]
         row["smoke_runtime_override"] = row["chunk_hash"] in override_hashes
     for row in hash_prediction_rows:
-        row["runtime_tier"] = runtime[row["chunk_hash"]]
+        row["runtime_placement"] = runtime[row["chunk_hash"]]
         row["smoke_runtime_override"] = row["chunk_hash"] in override_hashes
     if smoke_overrides:
         print(
-            f"[SHORTQ_SMOKE_TIER_OVERRIDE] count={len(smoke_overrides)} "
+            f"[SHORTQ_SMOKE_PLACEMENT_OVERRIDE] count={len(smoke_overrides)} "
             f"details={json.dumps(smoke_overrides, sort_keys=True)}",
             flush=True,
         )
@@ -716,21 +722,24 @@ def main() -> None:
         "prediction_cache_mode": "dormant",
         "prediction_cache_hits": cache_hits,
         "block_policy": "argmax_class_logits",
-        "class_to_tier_mapping": {"drop": "L2", "disk": "L2", "cpu": "L1", "gpu": "L0"},
-        "chunk_vote": selected_vote_policy_name(),
+        "class_to_placement_mapping": {"drop": "disk", "disk": "disk", "cpu": "cpu", "gpu": "gpu"},
+        "chunk_vote": {
+            "policy": vote_policy_name,
+            "config": vote_config.__dict__,
+        },
         "duplicate_resolution": "first_seen_wins",
         "block_class_counts": {CLASS_NAMES[i]: int(class_occurrences[i]) for i in range(4)},
         "chunk_occurrences": len(occurrences),
         "unique_chunk_hashes": len(runtime),
-        "occurrence_candidate_tier_counts": _counter_dict(occurrence_tiers),
-        "unique_runtime_tier_counts": _counter_dict(list(runtime.values())),
+        "occurrence_candidate_placement_counts": _counter_dict(occurrence_placements),
+        "unique_runtime_placement_counts": _counter_dict(list(runtime.values())),
         "repeated_hashes": repeated_hashes,
         "conflicting_hashes": conflicting_hashes,
         "conflicting_hash_fraction_among_repeated": (
             conflicting_hashes / repeated_hashes if repeated_hashes else 0.0
         ),
         "conflict_occurrences": conflict_occurrences,
-        "smoke_force_min_unique_per_tier": args.smoke_force_min_unique_per_tier,
+        "smoke_force_min_unique_per_placement": args.smoke_force_min_unique_per_placement,
         "smoke_runtime_overrides": smoke_overrides,
         "runtime_metadata": str(runtime_path),
         "vpc_importance_sidecar": args.vpc_importance_sidecar or None,

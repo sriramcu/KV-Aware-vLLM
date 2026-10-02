@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# [SC] Project-specific changes in this upstream file are marked with [SC];
+# see repo-root docs/SC_MODIFICATIONS.md for rationale and provenance.
+
 """Unit tests for the fs_native L2 adapter config (no native extension required).
 
 ``max_capacity_gb`` only declares capacity for usage accounting; eviction runs
@@ -65,6 +68,7 @@ class TestFSNativeCapacityHelpText:
         assert "max L2 capacity" not in help_text
 
 
+# [SC] Pin self-enabling fs_native per-operation worker-lane config.
 class TestFSNativePerOpWorkers:
     def test_per_op_workers_parse(self):
         cfg, warnings = _from_dict(

@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# [SC] Project-specific changes in this upstream file are marked with [SC];
+# see repo-root docs/SC_MODIFICATIONS.md for rationale and provenance.
+
 """
 Prefetch Controller: asynchronously prefetches data from L2 adapters into L1.
 
@@ -46,7 +49,8 @@ serves.
 """
 
 # Standard
-from collections import Counter, defaultdict
+# [SC] deque backs the split-phase FIFO; os/time gate diagnostics.
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from itertools import groupby
 from operator import attrgetter
@@ -185,6 +189,7 @@ PrefetchRequestId = int
 
 class PrefetchPhase(enum.Enum):
     LOOKUP = enum.auto()
+    # [SC] Lookup-complete requests wait here without consuming a lookup slot.
     WAITING_FOR_LOAD = enum.auto()
     PLAN_AND_LOAD = enum.auto()
 
@@ -218,6 +223,7 @@ class InFlightPrefetchRequest:
     lookup_results: dict[int, Bitmap] = field(default_factory=dict)
     # Optional zero-I/O prefix diagnostics captured at native EXISTS completion.
     # These are adapter_idx -> key-index bitmaps.
+    # [SC] Zero-I/O prefix-hole diagnostic state.
     lookup_pending_store: dict[int, Bitmap] = field(default_factory=dict)
     lookup_ever_stored: dict[int, Bitmap] = field(default_factory=dict)
     # L2 read locks currently held (adapter_idx -> key indices).
@@ -248,12 +254,12 @@ class InFlightPrefetchRequest:
     # Optional congestion diagnostics.  These timestamps are populated for
     # every request (three float assignments) but are only logged when
     # LMCACHE_MP_CONGESTION_DEBUG=1.
+    # [SC] Phase timestamps support optional congestion tracing.
     submitted_at: float = 0.0
     lookup_started_at: float = 0.0
     lookup_done_at: float = 0.0
     load_started_at: float = 0.0
     planned_hit_length: int = 0
-    planned_found_bitmap: Bitmap | None = None
 
     def all_lookups_done(self) -> bool:
         return len(self.pending_lookup_tasks) == 0
@@ -282,9 +288,10 @@ class PrefetchController(StorageControllerInterface):
         l2_adapters: List of L2 adapter instances.
         adapter_descriptors: Descriptors for each L2 adapter (same order).
         policy: The prefetch policy for load plan decisions.
-        max_in_flight: Maximum number of concurrent L2 load requests.
+        # [SC] Split read admission keeps lookup discovery independent of slow loads.
+        max_in_flight: Maximum concurrent L2 load phases (legacy public API name).
         lookup_max_in_flight: Optional independent lookup-phase limit. When
-            omitted, the legacy shared whole-request limit is retained.
+            omitted, the upstream whole-request limit is retained.
     """
 
     # Singleton dispatch for the in-flight load gauges: tests may construct
@@ -301,6 +308,7 @@ class PrefetchController(StorageControllerInterface):
         adapter_descriptors: list[AdapterDescriptor],
         policy: PrefetchPolicy,
         max_in_flight: int = 8,
+        # [SC] Optional independent lookup-phase admission limit.
         lookup_max_in_flight: int | None = None,
     ) -> None:
         self._l1_manager = l1_manager
@@ -312,15 +320,18 @@ class PrefetchController(StorageControllerInterface):
             desc.index: desc for desc in adapter_descriptors
         }
         self._policy = policy
-        self._max_in_flight = max_in_flight
-        self._separate_phase_limits = lookup_max_in_flight is not None
+        # [SC] Separate the short lookup phase from the slow GET/load phase.
+        # With no lookup limit configured we intentionally preserve upstream
+        # whole-request admission semantics.
+        self._load_max_in_flight = max_in_flight
+        self._split_phase_limits = lookup_max_in_flight is not None
         self._lookup_max_in_flight = (
             lookup_max_in_flight
             if lookup_max_in_flight is not None
             else max_in_flight
         )
-        if self._max_in_flight <= 0:
-            raise ValueError("max_in_flight must be > 0")
+        if self._load_max_in_flight <= 0:
+            raise ValueError("load_max_in_flight must be > 0")
         if self._lookup_max_in_flight <= 0:
             raise ValueError("lookup_max_in_flight must be > 0")
         self._congestion_debug = (
@@ -332,11 +343,11 @@ class PrefetchController(StorageControllerInterface):
         self._debug_submit_times: dict[PrefetchRequestId, float] = {}
 
         logger.info(
-            "[MP_PREFETCH_LIMITS] separate_phase_limits=%s "
+            "[MP_PREFETCH_LIMITS] split_phase_limits=%s "
             "lookup_max_in_flight=%d load_max_in_flight=%d",
-            self._separate_phase_limits,
+            self._split_phase_limits,
             self._lookup_max_in_flight,
-            self._max_in_flight,
+            self._load_max_in_flight,
         )
 
         # Adapters that are being drained and will be removed after all
@@ -352,7 +363,8 @@ class PrefetchController(StorageControllerInterface):
         # In-flight request tracking (background thread only)
         self._in_flight_requests: dict[PrefetchRequestId, InFlightPrefetchRequest] = {}
         self._pending_queue: list[tuple[PrefetchRequestId, PrefetchRequestSpec]] = []
-        self._pending_load_queue: list[PrefetchRequestId] = []
+        # [SC] FIFO for lookup-complete requests awaiting a load slot.
+        self._pending_load_queue: deque[PrefetchRequestId] = deque()
 
         # Shadow counters for status reporting (updated in background loop)
         self._status_in_flight_count: int = 0
@@ -370,10 +382,6 @@ class PrefetchController(StorageControllerInterface):
         # Thread-safe lookup results (background -> external)
         self._lookup_results_lock = threading.Lock()
         self._completed_lookups: dict[PrefetchRequestId, int] = {}
-        # Optional lookup-phase found bitmap. Legacy callers only need the
-        # prefix count; the L0 union path needs sparse positions so it can map
-        # them back into the original L0/L1/L2 chunk order.
-        self._completed_lookup_bitmaps: dict[PrefetchRequestId, Bitmap] = {}
 
         # Thread-safe prefetch results (background -> external).  The condition
         # variable lets a WAIT_PREFETCH_STATUS handler block until a result is
@@ -484,6 +492,7 @@ class PrefetchController(StorageControllerInterface):
             request_id = self._next_request_id
             self._next_request_id += 1
             self._submission_queue.append((request_id, spec))
+            # [SC] Record enqueue time only when diagnostics are enabled.
             if self._congestion_debug:
                 self._debug_submit_times[request_id] = time.monotonic()
         self._submission_efd.notify()
@@ -513,19 +522,6 @@ class PrefetchController(StorageControllerInterface):
         with self._lookup_results_lock:
             return self._completed_lookups.get(request_id, None)
 
-    def peek_lookup_result_bitmap(
-        self, request_id: PrefetchRequestId
-    ) -> Bitmap | None:
-        """Return lookup-phase found positions without consuming the result.
-
-        The legacy API reports only a prefix count. The persistent-L0 union
-        path submits sparse local-tier misses to L2 and needs their actual
-        found positions to compute the model-wide union prefix before the
-        L2 -> L1 load finishes.
-        """
-        with self._lookup_results_lock:
-            return self._completed_lookup_bitmaps.get(request_id)
-
     def query_prefetch_result(self, request_id: PrefetchRequestId) -> Bitmap | None:
         """
         Query the result of a prefetch request.
@@ -551,7 +547,6 @@ class PrefetchController(StorageControllerInterface):
         if result is not None:
             with self._lookup_results_lock:
                 self._completed_lookups.pop(request_id, None)
-                self._completed_lookup_bitmaps.pop(request_id, None)
         return result
 
     def wait_prefetch_result(
@@ -587,10 +582,10 @@ class PrefetchController(StorageControllerInterface):
         return {
             "is_healthy": is_healthy,
             "thread_alive": is_healthy,
-            "max_in_flight": self._max_in_flight,
-            "load_max_in_flight": self._max_in_flight,
+            # [SC] Expose split-phase queue/admission state.
+            "load_max_in_flight": self._load_max_in_flight,
             "lookup_max_in_flight": self._lookup_max_in_flight,
-            "separate_phase_limits": self._separate_phase_limits,
+            "split_phase_limits": self._split_phase_limits,
             "submission_queue_size": submission_queue_size,
             "pending_queue_size": self._status_pending_count,
             "pending_load_queue_size": self._status_pending_load_count,
@@ -800,6 +795,7 @@ class PrefetchController(StorageControllerInterface):
                             request.request_id,
                         )
 
+            # [SC] Admit queued loads independently from new lookups.
             try:
                 self._start_pending_loads()
             except Exception:
@@ -888,13 +884,14 @@ class PrefetchController(StorageControllerInterface):
         self._pending_queue.extend(items)
         self._status_pending_count += len(items)
 
+    # [SC] Lookup admission is independent when a lookup limit is configured.
     def _start_pending_requests(self) -> None:
         """Start pending lookup phases while their admission limit allows."""
         while self._pending_queue:
-            if self._separate_phase_limits:
+            if self._split_phase_limits:
                 if self._status_lookup_phase_count >= self._lookup_max_in_flight:
                     break
-            elif len(self._in_flight_requests) >= self._max_in_flight:
+            elif len(self._in_flight_requests) >= self._load_max_in_flight:
                 break
             request_id, spec = self._pending_queue.pop(0)
             self._status_pending_count -= 1
@@ -902,13 +899,13 @@ class PrefetchController(StorageControllerInterface):
 
     def _start_pending_loads(self) -> None:
         """Start queued L2 loads up to the independent load limit."""
-        if not self._separate_phase_limits:
+        if not self._split_phase_limits:
             return
         while (
             self._pending_load_queue
-            and self._status_load_phase_count < self._max_in_flight
+            and self._status_load_phase_count < self._load_max_in_flight
         ):
-            request_id = self._pending_load_queue.pop(0)
+            request_id = self._pending_load_queue.popleft()
             request = self._in_flight_requests.get(request_id)
             if request is None or request.phase is not PrefetchPhase.WAITING_FOR_LOAD:
                 continue
@@ -977,6 +974,7 @@ class PrefetchController(StorageControllerInterface):
     ) -> None:
         """Read-lock L1-resident keys, then submit lookup_and_lock to all
         live (non-draining) adapters for a new request."""
+        # [SC] Phase timing begins at lookup admission.
         now = time.monotonic()
         submitted_at = self._debug_submit_times.pop(request_id, now)
         l1_readlocks = self._lock_l1_keys(
@@ -996,22 +994,23 @@ class PrefetchController(StorageControllerInterface):
             lookup_started_at=now,
         )
 
+        # [SC] Optional admission-queue trace.
         if self._congestion_debug:
             logger.info(
                 "[MP_PREFETCH_ADMIT] request=%d queue_wait_s=%.6f keys=%d "
                 "pending_after=%d inflight_before=%d max_in_flight=%d "
                 "lookup_active_before=%d lookup_max_in_flight=%d "
-                "load_active=%d separate_phase_limits=%s l1_locked_keys=%d",
+                "load_active=%d split_phase_limits=%s l1_locked_keys=%d",
                 request_id,
                 now - submitted_at,
                 len(spec.keys),
                 self._status_pending_count,
                 self._status_in_flight_count,
-                self._max_in_flight,
+                self._load_max_in_flight,
                 self._status_lookup_phase_count,
                 self._lookup_max_in_flight,
                 self._status_load_phase_count,
-                self._separate_phase_limits,
+                self._split_phase_limits,
                 l1_readlocks.popcount(),
             )
 
@@ -1051,6 +1050,7 @@ class PrefetchController(StorageControllerInterface):
     # =========================================================================
     # Load phase
     # =========================================================================
+    # [SC] Finish lookup/discovery before separately admitting slow L2 GET.
     def _transition_to_load_phase(self, request: InFlightPrefetchRequest) -> None:
         """Prepare the L2 load plan, then queue or start the load phase."""
         now = time.monotonic()
@@ -1105,6 +1105,7 @@ class PrefetchController(StorageControllerInterface):
             request.attn_desc,
         )
 
+        # [SC] Diagnose prefix holes from already-captured state; no extra I/O.
         if self._prefix_diag:
             raw_l2 = merge_bitmaps(request.lookup_results.values(), num_keys)
             pending_store = merge_bitmaps(
@@ -1214,19 +1215,15 @@ class PrefetchController(StorageControllerInterface):
 
         request.load_plan = trimmed_plan
         request.planned_hit_length = hit_length
-        request.planned_found_bitmap = (
-            union_bitmap if request.policy is TrimPolicy.SPARSE else None
-        )
-
         # Free L2 lookup locks outside the eventual load plan immediately.
         self._release_l2_locks(request, keep=request.load_plan)
 
-        if not self._separate_phase_limits:
+        if not self._split_phase_limits:
             self._start_load_phase(request)
             return
 
-        # Independent limits: a completed lookup releases its lookup slot and
-        # waits in a separate FIFO until a GET/load slot becomes available.
+        # [SC] Independent limits: a completed lookup releases its lookup slot
+        # and waits in a separate FIFO until a GET/load slot becomes available.
         request.phase = PrefetchPhase.WAITING_FOR_LOAD
         self._status_lookup_phase_count -= 1
         self._status_pending_load_count += 1
@@ -1238,7 +1235,7 @@ class PrefetchController(StorageControllerInterface):
                 request.request_id,
                 self._status_pending_load_count,
                 self._status_load_phase_count,
-                self._max_in_flight,
+                self._load_max_in_flight,
                 self._status_lookup_phase_count,
             )
 
@@ -1265,7 +1262,7 @@ class PrefetchController(StorageControllerInterface):
                 max(0.0, now - request.lookup_done_at),
                 self._status_pending_load_count,
                 self._status_load_phase_count,
-                self._max_in_flight,
+                self._load_max_in_flight,
             )
 
         num_keys = len(request.keys)
@@ -1278,11 +1275,7 @@ class PrefetchController(StorageControllerInterface):
             return
 
         self._submit_load_tasks(request, request.load_plan)
-        self._report_lookup_hit(
-            request,
-            request.planned_hit_length,
-            request.planned_found_bitmap,
-        )
+        self._report_lookup_hit(request, request.planned_hit_length)
 
     def _reserve_load_buffers(
         self,
@@ -1444,28 +1437,18 @@ class PrefetchController(StorageControllerInterface):
         )
 
     def _update_lookup_results(
-        self,
-        request_id: PrefetchRequestId,
-        prefix_hit_count: int,
-        found_bitmap: Bitmap | None = None,
+        self, request_id: PrefetchRequestId, prefix_hit_count: int
     ) -> None:
-        """Store lookup-phase prefix count and optional sparse found positions."""
+        """Store the prefix-hit count from the lookup phase."""
         with self._lookup_results_lock:
             self._completed_lookups[request_id] = prefix_hit_count
-            if found_bitmap is not None:
-                self._completed_lookup_bitmaps[request_id] = found_bitmap
 
     def _report_lookup_hit(
-        self,
-        request: InFlightPrefetchRequest,
-        prefix_hit_count: int,
-        found_bitmap: Bitmap | None = None,
+        self, request: InFlightPrefetchRequest, prefix_hit_count: int
     ) -> None:
         """Store the lookup-phase hit and publish its completion event."""
         request.hit_reported = True
-        self._update_lookup_results(
-            request.request_id, prefix_hit_count, found_bitmap
-        )
+        self._update_lookup_results(request.request_id, prefix_hit_count)
         self._event_bus.publish(
             Event(
                 event_type=EventType.L2_PREFETCH_LOOKUP_COMPLETED,
@@ -1492,6 +1475,7 @@ class PrefetchController(StorageControllerInterface):
             if request.all_lookups_done():
                 self._transition_to_load_phase(request)
         elif request.phase == PrefetchPhase.WAITING_FOR_LOAD:
+            # [SC] No adapter polling while waiting only on local load admission.
             return
         elif request.phase == PrefetchPhase.PLAN_AND_LOAD:
             self._poll_load_results(request, phase_adapters)
@@ -1508,6 +1492,7 @@ class PrefetchController(StorageControllerInterface):
             if adapter_idx not in signaled_adapters:
                 continue
             task_id = request.pending_lookup_tasks[adapter_idx]
+            # [SC] Atomically consume optional prefix diagnostics with EXISTS.
             adapter = self._l2_adapters[adapter_idx]
             debug_query = getattr(
                 adapter, "query_lookup_and_lock_result_with_debug", None
@@ -1692,12 +1677,9 @@ class PrefetchController(StorageControllerInterface):
         # already reported at submit time (so the engine never waits on the
         # load) and is not re-reported.
         if not request.hit_reported:
-            self._report_lookup_hit(
-                request,
-                hit_length,
-                result_bitmap if request.policy is TrimPolicy.SPARSE else None,
-            )
+            self._report_lookup_hit(request, hit_length)
 
+        # [SC] Optional end-to-end phase timing trace.
         if self._congestion_debug:
             now = time.monotonic()
             lookup_end = request.lookup_done_at or request.load_started_at or now
@@ -1783,6 +1765,7 @@ class PrefetchController(StorageControllerInterface):
             if removed.phase == PrefetchPhase.LOOKUP:
                 self._status_lookup_phase_count -= 1
             elif removed.phase == PrefetchPhase.WAITING_FOR_LOAD:
+                # [SC] Remove abandoned/completed requests from the local load FIFO.
                 self._status_pending_load_count -= 1
                 try:
                     self._pending_load_queue.remove(request_id)
@@ -1816,5 +1799,6 @@ class PrefetchController(StorageControllerInterface):
                 len(request.keys),
             )
         self._in_flight_requests.clear()
+        # [SC] Split-phase queue is controller-owned and cleared at shutdown.
         self._pending_load_queue.clear()
         self._status_pending_load_count = 0

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# [SC] Extended forced-recovery regression harness; see https://github.com/vllm-project/vllm/issues/49250 and https://github.com/vllm-project/vllm/pull/53298.
 import argparse
 import json
 
@@ -12,6 +13,7 @@ def read_prompts():
 
 
 def main():
+    # [SC] Keep recovery-test knobs explicit so sync/async and FA controls are reproducible.
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="meta-llama/Llama-3.2-1B-Instruct")
     parser.add_argument("--storage", default="local_storage")

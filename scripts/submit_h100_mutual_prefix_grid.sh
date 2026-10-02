@@ -4,8 +4,7 @@ set -Eeuo pipefail
 # Six-run mutual-prefix grid. Both arms use the same scheduler/storage semantics:
 #   - mutual prefix ON
 #   - VPC-sufficient bypass ON
-#   - legacy Stage-1 starvation fallback ON
-#   - occupancy fallback OFF
+#   - two-pass Stage-1 starvation fallback ON
 #   - prefix diagnostics ON
 # Only the learned GNN placement/VPC-retention policy differs between arms.
 #
@@ -14,19 +13,17 @@ set -Eeuo pipefail
 # filesystem-pressure comparisons easier to interpret.
 
 GNN_SCRIPT="scripts/run_h100_shortq_gnn_dynamic_vpc_q650.sbatch"
-NOGNN_SCRIPT="scripts/run_h100_l0off_q650_l1_prefetch_grid_cleanall.sbatch"
+NOGNN_SCRIPT="scripts/run_h100_mp_nognn_q650_current_cleanall.sbatch"
 DEPENDENCY_TYPE="${DEPENDENCY_TYPE:-afterany}"
 DRY_RUN="${DRY_RUN:-0}"
 
 common_exports=(
-  KV_FS_PER_OP_WORKERS=1
   KV_FS_LOOKUP_WORKERS=1
   KV_FS_STORE_WORKERS=0
   KV_FS_DELETE_WORKERS=0
   KV_VPC_SUFFICIENT_BYPASS=1
   KV_MUTUAL_PREFIX=1
   KV_STAGE1_STARVATION_FALLBACK=1
-  KV_STAGE1_OCCUPANCY_FALLBACK=0
   LMCACHE_MP_PREFIX_DIAGNOSTICS=1
   LMCACHE_MP_CONGESTION_DEBUG=1
   LMCACHE_MP_CHTHM_DEBUG=1
@@ -50,7 +47,7 @@ submit_one() {
   local script run_label
   local -a exports=("${common_exports[@]}")
   exports+=(
-    "LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT=${pf}"
+    "LMCACHE_L2_LOAD_MAX_IN_FLIGHT=${pf}"
     "KV_FS_SHARED_WORKERS=${shared}"
     "KV_FS_RETRIEVE_WORKERS=${retrieve}"
   )

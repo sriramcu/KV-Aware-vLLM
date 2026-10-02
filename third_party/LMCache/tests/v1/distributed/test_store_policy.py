@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# [SC] Project-specific changes in this upstream file are marked with [SC];
+# see repo-root docs/SC_MODIFICATIONS.md for rationale and provenance.
+
 """
 Unit tests for store policy interface and DefaultStorePolicy.
 
@@ -119,10 +122,11 @@ class TestDefaultStorePolicyDeletions:
         assert result == []
 
 
+# [SC] KV-Aware semantic placement/store-budget regression coverage.
 class TestGNNDynamicStorePolicyL2Backing:
     """GNN L2 backing preserves placement while adding a durable copy."""
 
-    def test_backing_targets_every_key_but_only_deletes_true_l2(
+    def test_backing_targets_every_key_but_only_deletes_true_disk(
         self, monkeypatch
     ):
         from lmcache.v1.distributed import placement_metadata
@@ -132,9 +136,9 @@ class TestGNNDynamicStorePolicyL2Backing:
 
         keys = [make_object_key(i) for i in range(3)]
         placements = {
-            keys[0].chunk_hash: "L0",
-            keys[1].chunk_hash: "L1",
-            keys[2].chunk_hash: "L2",
+            keys[0].chunk_hash: "gpu",
+            keys[1].chunk_hash: "cpu",
+            keys[2].chunk_hash: "disk",
         }
         monkeypatch.setattr(
             placement_metadata,
@@ -149,7 +153,7 @@ class TestGNNDynamicStorePolicyL2Backing:
         assert result[0] == keys
         assert policy.select_l1_deletions(keys) == [keys[2]]
 
-    def test_default_dynamic_policy_keeps_selective_l2_behavior(
+    def test_default_dynamic_policy_keeps_selective_disk_behavior(
         self, monkeypatch
     ):
         from lmcache.v1.distributed import placement_metadata
@@ -159,9 +163,9 @@ class TestGNNDynamicStorePolicyL2Backing:
 
         keys = [make_object_key(i) for i in range(3)]
         placements = {
-            keys[0].chunk_hash: "L0",
-            keys[1].chunk_hash: "L1",
-            keys[2].chunk_hash: "L2",
+            keys[0].chunk_hash: "gpu",
+            keys[1].chunk_hash: "cpu",
+            keys[2].chunk_hash: "disk",
         }
         monkeypatch.setattr(
             placement_metadata,
@@ -175,3 +179,23 @@ class TestGNNDynamicStorePolicyL2Backing:
 
         assert result[0] == [keys[2]]
         assert policy.select_l1_deletions([keys[2]]) == [keys[2]]
+    def test_store_budget_skip_deletes_only_disk_staging(self, monkeypatch):
+        from lmcache.v1.distributed import placement_metadata
+        from lmcache.v1.distributed.storage_controllers.store_policy import (
+            GNNDynamicStorePolicy,
+        )
+
+        keys = [make_object_key(i) for i in range(3)]
+        placements = {
+            keys[0].chunk_hash: "gpu",
+            keys[1].chunk_hash: "cpu",
+            keys[2].chunk_hash: "disk",
+        }
+        monkeypatch.setattr(
+            placement_metadata,
+            "get_chunk_placement",
+            lambda chunk_hash: placements[chunk_hash],
+        )
+
+        policy = GNNDynamicStorePolicy()
+        assert policy.select_l1_deletions_on_store_skip(keys) == [keys[2]]

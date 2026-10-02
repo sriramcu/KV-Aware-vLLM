@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
+// [SC] Project-specific changes in this upstream file are marked with [SC];
+// see repo-root docs/SC_MODIFICATIONS.md for rationale and provenance.
+
 #pragma once
 
 #include "../connector_base.h"
@@ -34,6 +37,7 @@ struct WorkerFSConn {
 
 class FSConnector : public ConnectorBase<WorkerFSConn> {
  public:
+  // [SC] Expose ConnectorBase per-operation worker lanes to fs_native.
   FSConnector(std::string base_path, int num_workers,
               std::string relative_tmp_dir = "", bool use_odirect = false,
               size_t read_ahead_size = 0,

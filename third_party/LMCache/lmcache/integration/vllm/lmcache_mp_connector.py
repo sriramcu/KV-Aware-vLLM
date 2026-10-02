@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# [SC] Project-specific changes in this upstream file are marked with [SC];
+# see repo-root docs/SC_MODIFICATIONS.md for rationale and provenance.
+
 # Standard
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 import math
+# [SC] Environment-gated diagnostics/freshness controls for project experiments.
 import os
 import sys
 import time
@@ -466,12 +470,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
     - lmcache.mp.mq_timeout: timeout (seconds) for message queue requests.
     - lmcache.mp.heartbeat_interval: interval (seconds) between server
       heartbeat pings.
+    # [SC] Project connector controls below are local extensions.
     - lmcache.mp.lookup_timeout: optional fixed Stage-1 lookup deadline in
       seconds. The patched adapter defaults this to 0.0 (disabled).
     - lmcache.mp.starvation_fallback: expose the project scheduler's Stage-1
       starvation fallback. Enabled by default in this research branch.
-    - lmcache.mp.occupancy_fallback: allow the scheduler's Stage-1 occupancy
-      watchdog to abandon old lookups when execution slots stay under-filled.
     - lmcache.mp.vpc_sufficient_bypass: skip Stage-1 entirely when vLLM's
       local prefix is already at least as long as the largest full LMCache
       chunk prefix that could exist for the request.
@@ -495,6 +498,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         # Request IDs that vLLM has already declared finished.  LMCache may still
         # produce an asynchronous receive completion for one of these requests later.
         # Such a completion must never be forwarded back to the scheduler.
+        # [SC] Ignore late async receive completions for engine-finished requests.
+        # Upstream context: https://github.com/vllm-project/vllm/issues/49089
+        # https://github.com/vllm-project/vllm/pull/49278
         self._engine_finished_req_ids: set[str] = set()
 
         # Fail fast, before the server handshake below.
@@ -517,14 +523,12 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 "lmcache.mp.eager_prefetch", False
             )
         )
+        # [SC] Project two-pass scheduler fallback; connector exposes a safe
+        # Stage-1-only logical abandon operation. Related timeout/recompute RFC:
+        # https://github.com/LMCache/LMCache/issues/4945
         self._stage1_starvation_fallback_enabled: bool = bool(
             vllm_config.kv_transfer_config.get_from_extra_config(
                 "lmcache.mp.starvation_fallback", True
-            )
-        )
-        self._stage1_occupancy_fallback_enabled: bool = bool(
-            vllm_config.kv_transfer_config.get_from_extra_config(
-                "lmcache.mp.occupancy_fallback", False
             )
         )
         self._vpc_sufficient_bypass_enabled: bool = bool(
@@ -532,6 +536,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 "lmcache.mp.vpc_sufficient_bypass", False
             )
         )
+        # [SC] Mutual prefix: [vLLM local prefix] | [LMCache suffix].
         self._mutual_prefix_enabled: bool = bool(
             vllm_config.kv_transfer_config.get_from_extra_config(
                 "lmcache.mp.mutual_prefix", False
@@ -544,14 +549,13 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             )
         if self.role == KVConnectorRole.SCHEDULER:
             logger.info(
-                "[MP_STAGE1_POLICY_CONFIG] starvation=%s occupancy=%s "
+                "[MP_STAGE1_POLICY_CONFIG] starvation=%s "
                 "vpc_sufficient_bypass=%s mutual_prefix=%s",
                 self._stage1_starvation_fallback_enabled,
-                self._stage1_occupancy_fallback_enabled,
                 self._vpc_sufficient_bypass_enabled,
                 self._mutual_prefix_enabled,
             )
-        # Optional research guard: a Stage-1 LOOKUP/PREFETCH may hold L1 read
+        # [SC] Optional freshness guard: a Stage-1 LOOKUP/PREFETCH may hold L1 read
         # reservations from near the beginning of the lookup.  If Stage 1
         # itself lasts close to or beyond the L1 read-lock TTL, admitting the
         # completed hit into Stage 2 can immediately fail in unsafe_read().
@@ -561,19 +565,12 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             os.getenv("LMCACHE_MP_STAGE1_FRESHNESS_GUARD_S", "0")
         )
         self._chthm_debug = os.getenv("LMCACHE_MP_CHTHM_DEBUG", "0") == "1"
-        # Both GNN placement modes are prompt-KV placement experiments. The
-        # GNN sidecars contain decisions only for chunks that are complete in
-        # the original prompt, so do not allow decode tokens to complete a
-        # partial prompt-tail chunk and turn it into an unpredicted store.
-        # Keep this independent of physical L0: dynamic-VPC mode needs the same
-        # prompt-only persistence invariant even when L0 is completely disabled.
+        # [SC] Short-Q metadata covers only complete original-prompt chunks.
+        # Prevent decode tokens from completing an unpredicted prompt-tail chunk.
         _true_values = {"1", "true", "yes", "on"}
-        self._gnn_prompt_only_store = any(
-            os.getenv(name, "0").strip().lower() in _true_values
-            for name in (
-                "LMCACHE_GNN_EXCLUSIVE_PLACEMENT",
-                "LMCACHE_GNN_DYNAMIC_STORE",
-            )
+        self._gnn_prompt_only_store = (
+            os.getenv("LMCACHE_GNN_DYNAMIC_STORE", "0").strip().lower()
+            in _true_values
         )
         if self._gnn_prompt_only_store and self.role == KVConnectorRole.SCHEDULER:
             logger.info(
@@ -982,7 +979,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
     def get_finished(
         self, finished_req_ids: set[str]
-        ) -> tuple[set[str] | None, set[str] | None]:
+    ) -> tuple[set[str] | None, set[str] | None]:
+        # [SC] Filter late async receive completions after engine teardown.
+        # Upstream context:
+        # https://github.com/vllm-project/vllm/issues/49089
+        # https://github.com/vllm-project/vllm/pull/49278
         self._engine_finished_req_ids.update(finished_req_ids)
 
         finished_sending, finished_recving = (
@@ -1073,6 +1074,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             if self.lazy_offload:
                 self._lazy_offload_manager.bind_block_pool(gpu_block_pool)
 
+    # [SC] Safe Stage-1-only logical abandon hook for the two-pass scheduler rule.
     def abandon_stage1_lookup(self, request_id: str) -> bool:
         """Logically abandon one still-pending Stage-1 lookup.
 
@@ -1083,10 +1085,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         """
         if self.role != KVConnectorRole.SCHEDULER:
             return False
-        if not (
-            self._stage1_starvation_fallback_enabled
-            or self._stage1_occupancy_fallback_enabled
-        ):
+        if not self._stage1_starvation_fallback_enabled:
             return False
         return self.scheduler_adapter.abandon_stage1_lookup(request_id)
 
@@ -1161,6 +1160,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             tracker.state = LMCacheMPRequestState.BYPASS_LMCACHE
             return 0, False
 
+        # [SC] VPC-sufficient bypass: avoid an external lookup that cannot
+        # extend the complete-chunk local prefix.
         # Optional fast-path for dynamic VPC experiments. LMCache persists
         # complete ``lmcache_tokens_per_chunk`` prompt chunks. If the local
         # vLLM/VPC prefix already reaches the last complete LMCache chunk
@@ -1202,6 +1203,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         if tracker.lookup_started_at is None:
             tracker.lookup_started_at = time.monotonic()
+        # [SC] Mutual-prefix bridge starts LMCache at the current local-prefix
+        # chunk boundary instead of requiring LMCache to duplicate the head.
         if tracker.lmcache_lookup_start_tokens is None:
             if self._mutual_prefix_enabled:
                 chunk_tokens = self.scheduler_adapter.lmcache_tokens_per_chunk
@@ -1238,6 +1241,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         lmcache_hit_end_tokens = lookup_start_tokens + ret
 
+        # [SC] Revalidate the mutual-prefix bridge when async lookup completes.
         # Mutual-prefix lookups are submitted against the VPC boundary that
         # existed at submission time. The lookup is asynchronous, so ordinary
         # VPC eviction/reclamation can shorten the local prefix before the
@@ -1300,6 +1304,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 )
             return 0, False
 
+        # [SC] Freshness gate before Stage-2 admission; prevents consuming
+        # ancient Stage-1 reservations after their useful read lifetime.
         # Freshness gate before Stage-2 admission.  L1 read reservations are
         # acquired during Stage 1 (including the initial L1 lock pass), so a
         # very old completed lookup can already be unsafe to consume even
@@ -1357,6 +1363,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         )
 
         if ret == 0:
+            # [SC] Optional conditional-hierarchy admission trace.
             if self._chthm_debug:
                 logger.info(
                     "[MP_CHTHM_ADMIT] request=%s decision=miss "
@@ -1504,6 +1511,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                     free_end = tracker.num_vllm_hit_tokens
 
                 if free_end > 0:
+                    # [SC] Ranged mutual-prefix lookup locks start at the local-prefix boundary.
                     self.scheduler_adapter.free_lookup_locks(
                         token_ids=tracker.get_token_ids(),
                         start=tracker.lmcache_lookup_start_tokens or 0,
@@ -1748,6 +1756,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             num_new_tokens = scheduler_output.num_scheduled_tokens[new_request.req_id]
             request_tracker.increase_num_scheduled_tokens(num_new_tokens)
 
+            # [SC] GNN dynamic persistence is prompt-only to avoid decode-completed tail chunks.
             r_meta = LMCacheMPRequestMetadata.GetStoreMetadata(
                 request_tracker,
                 lmcache_tokens_per_chunk,
@@ -1782,6 +1791,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             num_new_tokens = scheduler_output.num_scheduled_tokens[request_id]
             request_tracker.increase_num_scheduled_tokens(num_new_tokens)
 
+            # [SC] GNN dynamic persistence is prompt-only to avoid decode-completed tail chunks.
             r_meta = LMCacheMPRequestMetadata.GetStoreMetadata(
                 request_tracker,
                 lmcache_tokens_per_chunk,

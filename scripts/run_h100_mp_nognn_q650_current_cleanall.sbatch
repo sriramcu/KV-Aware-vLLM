@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=kvaware-l0off-grid
+#SBATCH --job-name=kvaware-nognn-q650
 #SBATCH --partition=gpu-h100-dchen
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -22,8 +22,35 @@ CUDA_HOME=/usr/local/cuda-13.1
 LINEARRAG_ROOT="${REPO}/Hierarchical_KV/LinearRAG"
 
 RUN_ROOT=/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro
-GRID_LABEL="${GRID_LABEL:-l1_${LMCACHE_L1_SIZE_GB:-40}_seq_${MAX_NUM_SEQS:-16}}"
-RUN_DIR="${RUN_ROOT}/h100_l0off_grid_${GRID_LABEL}_${SLURM_JOB_ID}"
+GRID_LABEL="${GRID_LABEL:-l1_${LMCACHE_L1_SIZE_GB:-200}_lpf_${LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT:-16}_gpf_${LMCACHE_L2_LOAD_MAX_IN_FLIGHT:-2}}"
+
+# Interactive reruns inside one srun allocation reuse SLURM_JOB_ID. Reserve a
+# unique result directory atomically while keeping the job ID at the very end
+# of the basename so existing folder-discovery aliases continue to work:
+#   run_name_20908
+#   2_run_name_20908
+#   3_run_name_20908
+reserve_unique_run_dir() {
+    local base="$1"
+    local parent name candidate n=1
+    parent="$(dirname -- "$base")"
+    name="$(basename -- "$base")"
+    mkdir -p "$parent"
+    while :; do
+        if (( n == 1 )); then
+            candidate="$base"
+        else
+            candidate="${parent}/${n}_${name}"
+        fi
+        if mkdir "$candidate" 2>/dev/null; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+        ((n += 1))
+    done
+}
+
+RUN_DIR="$(reserve_unique_run_dir "${RUN_ROOT}/h100_nognn_q650_${GRID_LABEL}_${SLURM_JOB_ID}")"
 LOG_DIR="${RUN_DIR}/logs"
 RESULT_DIR="${RUN_DIR}/results"
 
@@ -46,13 +73,18 @@ TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-2}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-8000}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.65}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
+LMCACHE_L2_LOAD_MAX_IN_FLIGHT="${LMCACHE_L2_LOAD_MAX_IN_FLIGHT:-${LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT:-2}}"
+LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT="${LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT:-16}"
+LMCACHE_MP_MAX_INFLIGHT_STORE_GB="${LMCACHE_MP_MAX_INFLIGHT_STORE_GB:-0}"
 
 # Match the legacy project chunk size rather than the 256-token smoke-test size.
 LMCACHE_CHUNK_SIZE="${LMCACHE_CHUNK_SIZE:-512}"
-LMCACHE_L1_SIZE_GB="${LMCACHE_L1_SIZE_GB:-40}"
+LMCACHE_L1_SIZE_GB="${LMCACHE_L1_SIZE_GB:-200}"
 LMCACHE_MAX_WORKERS="${LMCACHE_MAX_WORKERS:-8}"
 LMCACHE_L2_WORKERS="${LMCACHE_L2_WORKERS:-8}"
-LMCACHE_MP_TIMEOUT="${LMCACHE_MP_TIMEOUT:-30}"
+LMCACHE_MP_TIMEOUT="${LMCACHE_MP_TIMEOUT:-120}"
+LMCACHE_MP_HEARTBEAT_INTERVAL="${LMCACHE_MP_HEARTBEAT_INTERVAL:-40}"
+LMCACHE_EVICTION_RATIO="${LMCACHE_EVICTION_RATIO:-0.2}"
 
 # Dataset-first interface. No QUESTIONS_JSON is needed for normal use.
 DATASET_NAME="${DATASET_NAME:-medical}"
@@ -72,8 +104,33 @@ MAX_TOKENS="${MAX_TOKENS:-512}"
 TOP_P="${TOP_P:-0.95}"
 
 # Real project baseline: VPC enabled. Set ENABLE_VPC=0 only for targeted
-# isolation experiments later (especially during L0 validation).
+# isolation experiments.
 ENABLE_VPC="${ENABLE_VPC:-1}"
+KV_VPC_SUFFICIENT_BYPASS="${KV_VPC_SUFFICIENT_BYPASS:-0}"
+KV_MUTUAL_PREFIX="${KV_MUTUAL_PREFIX:-0}"
+KV_STAGE1_STARVATION_FALLBACK="${KV_STAGE1_STARVATION_FALLBACK:-1}"
+
+# Dedicated lane counts are self-enabling. Zero means use the shared pool.
+KV_FS_SHARED_WORKERS="${KV_FS_SHARED_WORKERS:-5}"
+KV_FS_LOOKUP_WORKERS="${KV_FS_LOOKUP_WORKERS:-1}"
+KV_FS_RETRIEVE_WORKERS="${KV_FS_RETRIEVE_WORKERS:-2}"
+KV_FS_STORE_WORKERS="${KV_FS_STORE_WORKERS:-0}"
+KV_FS_DELETE_WORKERS="${KV_FS_DELETE_WORKERS:-0}"
+
+# Optional true cold->warm persistence barrier. Disabled by default so the
+# current PF/worker grid remains behavior-identical.
+KV_COLD_WARM_STORE_BARRIER="${KV_COLD_WARM_STORE_BARRIER:-0}"
+KV_STORE_BARRIER_TIMEOUT_S="${KV_STORE_BARRIER_TIMEOUT_S:-7200}"
+KV_STORE_BARRIER_POLL_S="${KV_STORE_BARRIER_POLL_S:-1}"
+KV_STORE_BARRIER_STABLE_POLLS="${KV_STORE_BARRIER_STABLE_POLLS:-5}"
+
+for name in KV_VPC_SUFFICIENT_BYPASS KV_MUTUAL_PREFIX KV_STAGE1_STARVATION_FALLBACK KV_COLD_WARM_STORE_BARRIER; do
+    value="${!name}"
+    [[ "$value" == "0" || "$value" == "1" ]] || {
+        echo "ERROR: $name must be 0 or 1, got $value" >&2
+        exit 2
+    }
+done
 
 # Preserve legacy compiled-mode intent by default. Set to 1 if debugging.
 ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
@@ -112,10 +169,16 @@ export LMCACHE_KV_ACCOUNTING_DEBUG="${LMCACHE_KV_ACCOUNTING_DEBUG:-1}"
 export LMCACHE_PREFETCH_LIFETIME_DEBUG="${LMCACHE_PREFETCH_LIFETIME_DEBUG:-1}"
 export LMCACHE_PREFETCH_LIFETIME_WARN_S="${LMCACHE_PREFETCH_LIFETIME_WARN_S:-30}"
 
-# This grid is explicitly the L0-OFF baseline.  The L0 server feature is
-# disabled by default because this script never passes --l0-enable; also
-# neutralize the temporary smoke-store environment flag if inherited.
-export LMCACHE_L0_SMOKE_STORE=0
+# Optional Stage-1 freshness guard and post-hoc research diagnostics added for
+# the 200-GiB PF sensitivity follow-up.  Keep them opt-in at script level so
+# historical invocations remain behavior-compatible; pass them via sbatch
+# --export for the new runs.
+export LMCACHE_MP_STAGE1_FRESHNESS_GUARD_S="${LMCACHE_MP_STAGE1_FRESHNESS_GUARD_S:-0}"
+export LMCACHE_MP_CONGESTION_DEBUG="${LMCACHE_MP_CONGESTION_DEBUG:-0}"
+export LMCACHE_MP_CONGESTION_LOG_EVERY="${LMCACHE_MP_CONGESTION_LOG_EVERY:-25}"
+export LMCACHE_MP_CONGESTION_SLOW_S="${LMCACHE_MP_CONGESTION_SLOW_S:-5}"
+export LMCACHE_MP_CHTHM_DEBUG="${LMCACHE_MP_CHTHM_DEBUG:-0}"
+export LMCACHE_MP_PREFIX_DIAGNOSTICS="${LMCACHE_MP_PREFIX_DIAGNOSTICS:-0}"
 
 LMCACHE_PID=""
 VLLM_PID=""
@@ -142,6 +205,18 @@ cleanup() {
         done
         kill -KILL "${LMCACHE_PID}" 2>/dev/null || true
         wait "${LMCACHE_PID}" 2>/dev/null || true
+    fi
+
+    if [[ -f "${REPO}/scripts/analyze_mp_congestion_chthm.py" ]] && \
+       { [[ "${LMCACHE_MP_CONGESTION_DEBUG:-0}" == "1" ]] || \
+         [[ "${LMCACHE_MP_CHTHM_DEBUG:-0}" == "1" ]]; }; then
+        echo "[$(date -Is)] writing post-hoc MP diagnostics"
+        python "${REPO}/scripts/analyze_mp_congestion_chthm.py" \
+            --lmcache-log "${LOG_DIR}/lmcache.log" \
+            --vllm-log "${LOG_DIR}/vllm.log" \
+            --results-dir "${RESULT_DIR}" \
+            --output "${RUN_DIR}/mp_diag_summary.json" \
+            > "${RUN_DIR}/mp_diag_summary.txt" 2>&1 || true
     fi
 
     echo "[$(date -Is)] cleanup finished"
@@ -246,10 +321,21 @@ echo "quantization:        online FP8"
 echo "VPC enabled:         ${ENABLE_VPC}"
 echo "LMCache chunk:       ${LMCACHE_CHUNK_SIZE}"
 echo "LMCache L1 GiB:      ${LMCACHE_L1_SIZE_GB}"
+echo "L2 load PF:          ${LMCACHE_L2_LOAD_MAX_IN_FLIGHT}"
+echo "L2 lookup PF:        ${LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT}"
+echo "L2 store cap GiB:   ${LMCACHE_MP_MAX_INFLIGHT_STORE_GB}"
 echo "LMCache L2 dir:      ${LMCACHE_L2_DIR}"
 echo "scratch cleanup:     FULL CLEAN of /scratch2/sriramc2 before run"
 echo "grid label:          ${GRID_LABEL}"
-echo "L0:                  OFF"
+echo "Stage1 freshness s:  ${LMCACHE_MP_STAGE1_FRESHNESS_GUARD_S}"
+echo "MP congestion debug: ${LMCACHE_MP_CONGESTION_DEBUG}"
+echo "MP CHTHM debug:      ${LMCACHE_MP_CHTHM_DEBUG}"
+echo "prefix diagnostics:  ${LMCACHE_MP_PREFIX_DIAGNOSTICS}"
+echo "VPC bypass:          ${KV_VPC_SUFFICIENT_BYPASS}"
+echo "mutual prefix:       ${KV_MUTUAL_PREFIX}"
+echo "Stage1 fallback:     ${KV_STAGE1_STARVATION_FALLBACK}"
+echo "store barrier:       ${KV_COLD_WARM_STORE_BARRIER}"
+echo "fs workers:          shared=${KV_FS_SHARED_WORKERS} lookup=${KV_FS_LOOKUP_WORKERS} retrieve=${KV_FS_RETRIEVE_WORKERS} store=${KV_FS_STORE_WORKERS} delete=${KV_FS_DELETE_WORKERS}"
 echo "============================================================"
 
 # ============================================================================
@@ -511,7 +597,12 @@ echo "===== PREFLIGHT: SOURCE COMPATIBILITY ====="
 
 python -m py_compile \
     experiments/mp_nognn_project.py \
-    third_party/LMCache/lmcache/integration/vllm/lmcache_mp_connector.py
+    third_party/LMCache/lmcache/integration/vllm/lmcache_mp_connector.py \
+    third_party/LMCache/lmcache/v1/multiprocess/modules/lookup.py \
+    third_party/LMCache/lmcache/v1/distributed/storage_controllers/prefetch_controller.py \
+    third_party/LMCache/lmcache/v1/distributed/storage_controllers/store_controller.py \
+    third_party/LMCache/lmcache/v1/distributed/l2_adapters/native_connector_l2_adapter.py \
+    scripts/analyze_mp_congestion_chthm.py
 
 CONNECTOR=third_party/LMCache/lmcache/integration/vllm/lmcache_mp_connector.py
 
@@ -587,7 +678,6 @@ cat > "${RUN_DIR}/run_config.json" <<EOF
 {
   "job_id": "${SLURM_JOB_ID}",
   "grid_label": "${GRID_LABEL}",
-  "l0_enabled": false,
   "node": "$(hostname)",
   "model": "${MODEL}",
   "tensor_parallel_size": ${TENSOR_PARALLEL_SIZE},
@@ -595,6 +685,27 @@ cat > "${RUN_DIR}/run_config.json" <<EOF
   "max_model_len": ${MAX_MODEL_LEN},
   "gpu_memory_utilization": ${GPU_MEMORY_UTILIZATION},
   "max_num_seqs": ${MAX_NUM_SEQS},
+  "lmcache_l2_load_max_in_flight": ${LMCACHE_L2_LOAD_MAX_IN_FLIGHT},
+  "lmcache_l2_lookup_max_in_flight": ${LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT},
+  "lmcache_l2_store_max_inflight_gb": ${LMCACHE_MP_MAX_INFLIGHT_STORE_GB},
+  "lmcache_mp_stage1_freshness_guard_s": ${LMCACHE_MP_STAGE1_FRESHNESS_GUARD_S},
+  "lmcache_mp_congestion_debug": ${LMCACHE_MP_CONGESTION_DEBUG},
+  "lmcache_mp_congestion_log_every": ${LMCACHE_MP_CONGESTION_LOG_EVERY},
+  "lmcache_mp_congestion_slow_s": ${LMCACHE_MP_CONGESTION_SLOW_S},
+  "lmcache_mp_chthm_debug": ${LMCACHE_MP_CHTHM_DEBUG},
+  "lmcache_mp_prefix_diagnostics": ${LMCACHE_MP_PREFIX_DIAGNOSTICS},
+  "vpc_sufficient_bypass": ${KV_VPC_SUFFICIENT_BYPASS},
+  "mutual_prefix": ${KV_MUTUAL_PREFIX},
+  "stage1_starvation_fallback": ${KV_STAGE1_STARVATION_FALLBACK},
+  "cold_warm_store_barrier": ${KV_COLD_WARM_STORE_BARRIER},
+  "store_barrier_timeout_s": ${KV_STORE_BARRIER_TIMEOUT_S},
+  "store_barrier_poll_s": ${KV_STORE_BARRIER_POLL_S},
+  "store_barrier_stable_polls": ${KV_STORE_BARRIER_STABLE_POLLS},
+  "fs_shared_workers": ${KV_FS_SHARED_WORKERS},
+  "fs_lookup_workers": ${KV_FS_LOOKUP_WORKERS:-0},
+  "fs_retrieve_workers": ${KV_FS_RETRIEVE_WORKERS:-0},
+  "fs_store_workers": ${KV_FS_STORE_WORKERS:-0},
+  "fs_delete_workers": ${KV_FS_DELETE_WORKERS:-0},
   "enable_vpc": ${ENABLE_VPC},
   "cuda_mps_bypass": true,
   "cuda_mps_pipe_directory": "${CUDA_MPS_PIPE_DIRECTORY}",
@@ -617,32 +728,54 @@ echo
 echo "===== START LMCACHE MP SERVER ====="
 
 L2_ADAPTER_JSON=$(
-python - "$LMCACHE_L2_DIR" "$LMCACHE_L2_WORKERS" <<'PY'
+python - "$LMCACHE_L2_DIR" \
+  "${KV_FS_SHARED_WORKERS}" \
+  "${KV_FS_LOOKUP_WORKERS}" \
+  "${KV_FS_RETRIEVE_WORKERS}" \
+  "${KV_FS_STORE_WORKERS}" \
+  "${KV_FS_DELETE_WORKERS}" <<'PY'
 import json
 import sys
 
 base_path = sys.argv[1]
-num_workers = int(sys.argv[2])
+shared_workers = int(sys.argv[2])
+lane_names = ("lookup", "retrieve", "store", "delete")
+lane_counts = list(map(int, sys.argv[3:7]))
 
-print(
-    json.dumps(
-        {
-            "type": "fs_native",
-            "base_path": base_path,
-            "num_workers": num_workers,
-            "use_odirect": False,
-        }
-    )
-)
+if shared_workers <= 0:
+    raise ValueError("KV_FS_SHARED_WORKERS must be > 0")
+if any(count < 0 for count in lane_counts):
+    raise ValueError("KV_FS_*_WORKERS lane counts must be >= 0")
+
+spec = {
+    "type": "fs_native",
+    "base_path": base_path,
+    "num_workers": shared_workers,
+    "use_odirect": False,
+}
+per_op = {
+    name: count
+    for name, count in zip(lane_names, lane_counts)
+    if count > 0
+}
+if per_op:
+    spec["per_op_workers"] = per_op
+
+print(json.dumps(spec))
 PY
 )
+echo "fs_native adapter: $L2_ADAPTER_JSON"
 
 lmcache server \
     --host localhost \
     --port 5556 \
     --chunk-size "$LMCACHE_CHUNK_SIZE" \
     --l1-size-gb "$LMCACHE_L1_SIZE_GB" \
+    --l2-load-max-in-flight "$LMCACHE_L2_LOAD_MAX_IN_FLIGHT" \
+    --l2-lookup-max-in-flight "$LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT" \
+    --l2-store-max-inflight-gb "$LMCACHE_MP_MAX_INFLIGHT_STORE_GB" \
     --eviction-policy LRU \
+    --eviction-ratio "$LMCACHE_EVICTION_RATIO" \
     --max-workers "$LMCACHE_MAX_WORKERS" \
     --l2-adapter "$L2_ADAPTER_JSON" \
     > "${LOG_DIR}/lmcache.log" 2>&1 &
@@ -665,11 +798,17 @@ echo
 echo "===== START VLLM SERVER ====="
 
 KV_TRANSFER_CONFIG=$(
-python - "$LMCACHE_MP_TIMEOUT" <<'PY'
+python - "$LMCACHE_MP_TIMEOUT" "$LMCACHE_MP_HEARTBEAT_INTERVAL" \
+    "$KV_STAGE1_STARVATION_FALLBACK" "$KV_VPC_SUFFICIENT_BYPASS" \
+    "$KV_MUTUAL_PREFIX" <<'PY'
 import json
 import sys
 
 timeout = float(sys.argv[1])
+heartbeat_interval = float(sys.argv[2])
+starvation_fallback = bool(int(sys.argv[3]))
+vpc_sufficient_bypass = bool(int(sys.argv[4]))
+mutual_prefix = bool(int(sys.argv[5]))
 
 print(
     json.dumps(
@@ -682,8 +821,11 @@ print(
                 "lmcache.mp.host": "tcp://localhost",
                 "lmcache.mp.port": 5556,
                 "lmcache.mp.mq_timeout": timeout,
+                "lmcache.mp.heartbeat_interval": heartbeat_interval,
                 "lmcache.mp.lookup_timeout": 0.0,
-                "lmcache.mp.starvation_fallback": True,
+                "lmcache.mp.starvation_fallback": starvation_fallback,
+                "lmcache.mp.vpc_sufficient_bypass": vpc_sufficient_bypass,
+                "lmcache.mp.mutual_prefix": mutual_prefix,
             },
         }
     )
@@ -794,8 +936,21 @@ DRIVER_ARGS=(
     --top_p "$TOP_P"
     --min_tokens "$MIN_TOKENS"
     --max_tokens "$MAX_TOKENS"
+    --metrics_after_cold_path "${RUN_DIR}/metrics_after_cold.txt"
     --output_dir "$RESULT_DIR"
 )
+
+if [[ "$KV_COLD_WARM_STORE_BARRIER" == "1" ]]; then
+    DRIVER_ARGS+=(
+        --between_phases_store_barrier
+        --lmcache_status_url http://127.0.0.1:8080/status
+        --store_barrier_timeout_s "$KV_STORE_BARRIER_TIMEOUT_S"
+        --store_barrier_poll_s "$KV_STORE_BARRIER_POLL_S"
+        --store_barrier_stable_polls "$KV_STORE_BARRIER_STABLE_POLLS"
+        --store_barrier_result_path "${RUN_DIR}/store_barrier.json"
+        --metrics_after_barrier_path "${RUN_DIR}/metrics_after_barrier.txt"
+    )
+fi
 
 if [[ -n "$QUESTIONS_JSON" ]]; then
     DRIVER_ARGS+=(--questions_json "$QUESTIONS_JSON")
@@ -809,6 +964,18 @@ then
     echo "Project workload failed"
     tail -n 300 "${LOG_DIR}/driver.log" || true
     exit 50
+fi
+
+if [[ "$KV_COLD_WARM_STORE_BARRIER" == "1" ]]; then
+    python - "${RESULT_DIR}/summary.json" "${RUN_DIR}/store_barrier.json" <<'PY'
+import json, pathlib, sys
+summary=json.load(open(sys.argv[1])); barrier=json.load(open(sys.argv[2]))
+assert summary.get('store_barrier', {}).get('enabled') is True, summary.get('store_barrier')
+assert barrier.get('final_pending_keys') == 0, barrier
+assert barrier.get('final_in_flight_stores') == 0, barrier
+assert barrier.get('final_l1_write_locked') == 0, barrier
+print('[SC_STORE_BARRIER_ASSERT] PASS', barrier)
+PY
 fi
 
 # Give asynchronous store activity a short drain window before inspection.

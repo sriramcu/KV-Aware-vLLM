@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+# [SC] Project-specific changes in this upstream file are marked with [SC];
+# see repo-root docs/SC_MODIFICATIONS.md for rationale and provenance.
+
 import enum
+# [SC] Short-Q sidecar plumbing for project-defined GPU/CPU/disk placement labels.
 import json
 import os
 import re
@@ -33,6 +37,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import BlockHash
 
 
+# [SC] Short-Q placement sidecar helpers.
 @lru_cache(maxsize=4)
 def _read_kv_importance_sidecar(path: str) -> dict[str, Any]:
     """Read a stable experiment sidecar once per engine process.
@@ -69,32 +74,36 @@ def _kv_importance_sidecar_keys(request_id: str) -> list[str]:
     return list(dict.fromkeys(keys))
 
 
-def _load_kv_importance_tiers(request_id: str) -> dict[int, str]:
+def _load_kv_importance_placements(request_id: str) -> dict[int, str]:
     """Load optional per-native-block GNN importance for one request.
 
-    Historical sidecars may key directly by request ID and store either a tier
-    string or ``{"tier": ...}``. New Short-Q sidecars key by reordered source
+    Sidecars may key directly by request ID and store either a placement string
+    or ``{"placement": ...}``. Short-Q sidecars key by reordered source
     index so cold and reverse-order warm requests share the same predictions.
     """
-    path = os.environ.get("VLLM_KV_IMPORTANCE_TIERS")
+    # [SC] New semantic name first; retain the historical sidecar env name as
+    # a compatibility alias for older launch wrappers.
+    path = os.environ.get("VLLM_KV_IMPORTANCE_PLACEMENTS") or os.environ.get(
+        "VLLM_KV_IMPORTANCE_TIERS"
+    )
     if not path:
         return {}
 
-    all_tiers = _read_kv_importance_sidecar(path)
-    raw_tiers: Any = {}
+    all_placements = _read_kv_importance_sidecar(path)
+    raw_placements: Any = {}
     for key in _kv_importance_sidecar_keys(request_id):
-        candidate = all_tiers.get(key)
+        candidate = all_placements.get(key)
         if isinstance(candidate, dict):
-            raw_tiers = candidate
+            raw_placements = candidate
             break
 
-    tiers: dict[int, str] = {}
-    for key, value in raw_tiers.items():
+    placements: dict[int, str] = {}
+    for key, value in raw_placements.items():
         if isinstance(value, dict):
-            value = value.get("tier")
+            value = value.get("placement", value.get("tier"))
         if value in ("disk", "cpu", "gpu"):
-            tiers[int(key)] = str(value)
-    return tiers
+            placements[int(key)] = str(value)
+    return placements
 
 
 @dataclass
@@ -148,9 +157,10 @@ class Request:
         abort_immediately: bool = False,
     ) -> None:
         self.request_id = request_id
-        # Project hook: optional per-vLLM-block importance tiers. The feature
-        # remains inert unless VLLM_KV_IMPORTANCE_TIERS points at a sidecar.
-        self.kv_importance_tiers = _load_kv_importance_tiers(request_id)
+        # [SC] Optional per-vLLM-block placement intent for bounded VPC bias.
+        # Inert unless VLLM_KV_IMPORTANCE_PLACEMENTS (or its legacy alias)
+        # points at a sidecar.
+        self.kv_importance_placements = _load_kv_importance_placements(request_id)
         self.client_index = client_index
         self.priority = priority
         self.sampling_params = sampling_params

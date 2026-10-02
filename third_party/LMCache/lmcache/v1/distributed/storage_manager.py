@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# [SC] Project-specific changes in this upstream file are marked with [SC];
+# see repo-root docs/SC_MODIFICATIONS.md for rationale and provenance.
+
 """
 Distributed multi-tier storage manager for MP mode
 """
@@ -7,7 +10,6 @@ Distributed multi-tier storage manager for MP mode
 from contextlib import contextmanager
 from dataclasses import replace
 from typing import Iterator, Literal, Optional
-import os
 import threading
 import time
 
@@ -33,7 +35,6 @@ from lmcache.v1.distributed.config import (
 )
 from lmcache.v1.distributed.error import L1Error, strerror
 from lmcache.v1.distributed.internal_api import L1MemoryDesc, L2AdapterListener
-from lmcache.v1.distributed.l0_manager import L0Manager
 from lmcache.v1.distributed.l1_manager import L1Manager
 from lmcache.v1.distributed.l2_adapters import create_l2_adapter
 from lmcache.v1.distributed.l2_adapters.base import AdapterUsage, L2AdapterInterface
@@ -76,7 +77,6 @@ logger = init_logger(__name__)
 
 class StorageManager:
     def __init__(self, config: StorageManagerConfig):
-        self._l0_manager = L0Manager(config.l0_manager_config)
         self._l1_manager = L1Manager(config.l1_manager_config)
         # Retained for the L1 half of the capacity report; L1's configured
         # size is a pure function of it.
@@ -150,21 +150,25 @@ class StorageManager:
         # Controllers receive the initial set as ordered lists; they key
         # their own copies by ``descriptor.index`` (== adapter_id) and learn
         # of later changes via add_adapter/request_remove_adapter.
+        # [SC] Rolling L2-store admission budget is explicit configuration,
+        # rather than an environment read hidden inside StoreController.
         self._store_controller = StoreController(
             l1_manager=self._l1_manager,
             l2_adapters=list(self._l2_adapters.values()),
             adapter_descriptors=list(self._adapter_descriptors.values()),
             policy=create_store_policy(config.store_policy),
+            max_inflight_store_bytes=config.max_inflight_store_bytes,
         )
         self._store_controller.start()
 
         # Prefetch controller
+        # [SC] Separate fast lookup admission from slow L2-load admission.
         self._prefetch_controller = PrefetchController(
             l1_manager=self._l1_manager,
             l2_adapters=list(self._l2_adapters.values()),
             adapter_descriptors=list(self._adapter_descriptors.values()),
             policy=create_prefetch_policy(config.prefetch_policy),
-            max_in_flight=config.prefetch_max_in_flight,
+            max_in_flight=config.prefetch_load_max_in_flight,
             lookup_max_in_flight=config.prefetch_lookup_max_in_flight,
         )
         self._prefetch_controller.start()
@@ -182,48 +186,6 @@ class StorageManager:
         )
 
     # External APIs for serving engine integration code to call
-    @property
-    def l0_enabled(self) -> bool:
-        """Whether the opt-in persistent GPU L0 data path is active."""
-        return self._l0_manager.enabled
-
-    def prepare_l0_rank_arena(
-        self,
-        kv_rank: int,
-        device,
-        group_layout_descs: dict[int, MemoryLayoutDesc],
-    ) -> bool:
-        """Prepare one fixed-Q rank-local L0 arena.
-
-        This is intentionally explicit and is not called by the legacy/default
-        store path. A future placement policy must opt a rank into L0 before it
-        can reserve L0 objects.
-        """
-        return self._l0_manager.prepare_rank_arena(
-            kv_rank, device, group_layout_descs
-        )
-
-    def reserve_l0_write(
-        self,
-        keys: list[ObjectKey],
-        layout_desc: MemoryLayoutDesc,
-        *,
-        is_temporary: bool = False,
-    ) -> dict[ObjectKey, MemoryObj]:
-        """Reserve persistent-GPU L0 objects for an explicit placement path."""
-        result = self._l0_manager.reserve_write(
-            keys, layout_desc, is_temporary=is_temporary
-        )
-        return {key: obj for key, (_err, obj) in result.items() if obj is not None}
-
-    def finish_l0_write(self, keys: list[ObjectKey]) -> None:
-        """Publish L0 objects after their D2D copies have completed."""
-        self._l0_manager.finish_write(keys)
-
-    def abort_l0_write(self, keys: list[ObjectKey]) -> None:
-        """Release unpublished L0 reservations after store failure/cancellation."""
-        self._l0_manager.abort_write(keys)
-
     @enable_tracing()
     def reserve_write(
         self,
@@ -307,61 +269,6 @@ class StorageManager:
 
         # TODO: global key states update
 
-    def _unsafe_read_prefetched(
-        self, keys: list[ObjectKey]
-    ) -> dict[ObjectKey, tuple[L1Error, MemoryObj | None]]:
-        """Read already-reserved local sources with deterministic L0 > L1 priority."""
-        if not self._l0_manager.enabled:
-            return self._l1_manager.unsafe_read(keys)
-
-        l0_result = self._l0_manager.unsafe_read(keys)
-        remaining = [
-            key
-            for key in keys
-            if l0_result[key][0] != L1Error.SUCCESS
-            or l0_result[key][1] is None
-        ]
-        l1_result = self._l1_manager.unsafe_read(remaining) if remaining else {}
-        return {
-            key: (
-                l0_result[key]
-                if l0_result[key][0] == L1Error.SUCCESS
-                and l0_result[key][1] is not None
-                else l1_result.get(key, l0_result[key])
-            )
-            for key in keys
-        }
-
-    def _finish_prefetched_by_source(
-        self, keys: list[ObjectKey], read_locks: int = 1
-    ) -> tuple[list[ObjectKey], list[ObjectKey]]:
-        """Release the manager that actually owns each lookup read lock."""
-        if not self._l0_manager.enabled:
-            result = self._l1_manager.finish_read(keys, read_locks=read_locks)
-            return (
-                [k for k, e in result.items() if e == L1Error.SUCCESS],
-                [k for k, e in result.items() if e != L1Error.SUCCESS],
-            )
-
-        l0_keys = [key for key in keys if self._l0_manager.has_read_lock(key)]
-        l0_set = set(l0_keys)
-        l1_keys = [key for key in keys if key not in l0_set]
-        l0_result = (
-            self._l0_manager.finish_read(l0_keys, read_locks=read_locks)
-            if l0_keys
-            else {}
-        )
-        l1_result = (
-            self._l1_manager.finish_read(l1_keys, read_locks=read_locks)
-            if l1_keys
-            else {}
-        )
-        combined = {**l0_result, **l1_result}
-        return (
-            [k for k, e in combined.items() if e == L1Error.SUCCESS],
-            [k for k, e in combined.items() if e != L1Error.SUCCESS],
-        )
-
     @contextmanager
     def read_prefetched_results(
         self,
@@ -399,7 +306,7 @@ class StorageManager:
                 "StorageManager.read_prefetched_results.__enter__",
                 {"keys": keys},
             )
-        read_results = self._unsafe_read_prefetched(keys)
+        read_results = self._l1_manager.unsafe_read(keys)
         good_keys: list[ObjectKey] = []
         good_objs: list[MemoryObj] = []
         bad_keys: list[ObjectKey] = []
@@ -409,7 +316,7 @@ class StorageManager:
         for k, (e, o) in read_results.items():
             if o is None:
                 logger.error(
-                    "Failed to read prefetched object %s from local L0/L1 storage: %s",
+                    "Failed to read prefetched object %s from L1 storage: %s",
                     k,
                     strerror(e),
                 )
@@ -464,7 +371,7 @@ class StorageManager:
             # Decrease the read lock for all successfully read memory objects
             # if None is yielded or exception occurs during caller's processing
             if not all_good or not successfully_yielded:
-                self._finish_prefetched_by_source(good_keys)
+                self._l1_manager.finish_read(good_keys)
                 self._event_bus.publish(
                     Event(
                         event_type=EventType.SM_READ_PREFETCHED_FINISHED,
@@ -494,9 +401,9 @@ class StorageManager:
             read_locks: Read locks to release per key (the whole
                 reservation when releasing a lookup's locks).
         """
-        successful_keys, failed_keys = self._finish_prefetched_by_source(
-            keys, read_locks=read_locks
-        )
+        finish_result = self._l1_manager.finish_read(keys, read_locks=read_locks)
+        successful_keys = [k for k, e in finish_result.items() if e == L1Error.SUCCESS]
+        failed_keys = [k for k, e in finish_result.items() if e != L1Error.SUCCESS]
         self._event_bus.publish(
             Event(
                 event_type=EventType.SM_READ_PREFETCHED_FINISHED,
@@ -547,16 +454,9 @@ class StorageManager:
                 ),
             )
 
-        # Persistent L0 is opt-in. Keep the legacy L1/L2 path completely
-        # unchanged while it is disabled. PREFIX is the normal vLLM lookup
-        # mode; the L0 v1 union path deliberately does not alter sparse/blend
-        # behavior yet.
-        if self._l0_manager.enabled and spec.policy is TrimPolicy.PREFIX:
-            return self._submit_prefix_l0_union(
-                spec, external_request_id, skip_l2
-            )
+        # NOTE: now we only have L1, so the prefetch is essentially checking how many
+        # objects are already in L1, and adding read locks to them.
 
-        # Legacy L1/L2 path.
         l1_read_result = self._l1_manager.reserve_read(
             keys, read_locks=spec.num_kv_readers
         )
@@ -619,100 +519,6 @@ class StorageManager:
             )
 
         raise ValueError(f"Unsupported trim policy: {spec.policy}")
-
-    def _submit_prefix_l0_union(
-        self,
-        spec: PrefetchRequestSpec,
-        external_request_id: str,
-        skip_l2: bool,
-    ) -> PrefetchHandle:
-        """PREFIX lookup over a non-monotonic L0/L1/L2 local-source union.
-
-        L0 is probed first and read-locked. L1 is probed only for L0 misses,
-        giving deterministic source priority L0 > L1. Every remaining key is
-        submitted to L2 with SPARSE retention so holes in one tier do not
-        prevent a later chunk from being supplied by another tier. The final
-        model-wide prefix fold still happens over the union, so the first true
-        cross-tier miss truncates reuse exactly as before.
-        """
-        keys = spec.keys
-        l0_result = self._l0_manager.reserve_read(
-            keys, read_locks=spec.num_kv_readers
-        )
-        l0_presence = Bitmap(len(keys))
-        l0_indices: list[int] = []
-        non_l0_keys: list[ObjectKey] = []
-        non_l0_indices: list[int] = []
-        for i, key in enumerate(keys):
-            err, obj = l0_result[key]
-            if err == L1Error.SUCCESS and obj is not None:
-                l0_presence.set(i)
-                l0_indices.append(i)
-            else:
-                non_l0_keys.append(key)
-                non_l0_indices.append(i)
-
-        l1_result = self._l1_manager.reserve_read(
-            non_l0_keys, read_locks=spec.num_kv_readers
-        )
-        l1_presence = Bitmap(len(keys))
-        l1_indices: list[int] = []
-        for original_i, key in zip(non_l0_indices, non_l0_keys, strict=True):
-            err, obj = l1_result[key]
-            if err == L1Error.SUCCESS and obj is not None:
-                l1_presence.set(original_i)
-                l1_indices.append(original_i)
-
-        local_presence = l0_presence | l1_presence
-        stride = spec.attn_desc.num_object_groups * spec.attn_desc.world_size
-        num_chunks = len(keys) // stride
-        local_hit_chunks, _ = fold_unfold_ranked(
-            local_presence,
-            num_chunks,
-            spec.attn_desc.world_size,
-            spec.attn_desc.num_chunks_in_sw,
-        )
-
-        local_indices = set(l0_indices) | set(l1_indices)
-        remaining_indices = [i for i in range(len(keys)) if i not in local_indices]
-        remaining_keys = [keys[i] for i in remaining_indices]
-
-        self._event_bus.publish(
-            Event(
-                event_type=EventType.SM_READ_PREFETCHED,
-                metadata={
-                    "succeeded_keys": [keys[i] for i in sorted(local_indices)],
-                    "failed_keys": remaining_keys,
-                },
-            )
-        )
-
-        prefetch_request_id = -1
-        l2_orig_indices: tuple[int, ...] = ()
-        if not skip_l2 and remaining_keys and self._has_l2_adapters():
-            # The remaining list is intentionally sparse in original chunk
-            # space. SPARSE makes the L2 controller load every independently
-            # found key; StorageManager performs the model-wide prefix fold
-            # after mapping those results back to original positions.
-            prefetch_request_id = self._prefetch_controller.submit_prefetch_request(
-                replace(spec, keys=remaining_keys, policy=TrimPolicy.SPARSE)
-            )
-            l2_orig_indices = tuple(remaining_indices)
-
-        return PrefetchHandle(
-            prefetch_request_id=prefetch_request_id,
-            external_request_id=external_request_id,
-            l1_found_indices=tuple(l1_indices),
-            l1_hit_chunks=local_hit_chunks,
-            total_requested_keys=len(keys),
-            submit_time=time.monotonic(),
-            l2_orig_indices=l2_orig_indices,
-            l0_found_indices=tuple(l0_indices),
-            l0_union_enabled=True,
-            num_kv_readers=spec.num_kv_readers,
-            attn_desc=spec.attn_desc,
-            original_keys=tuple(keys),
-        )
 
     def _submit_prefix_fold(
         self,
@@ -810,9 +616,6 @@ class StorageManager:
             total_requested_keys=len(keys),
             submit_time=submit_time,
             l2_orig_indices=l2_orig_indices,
-            num_kv_readers=spec.num_kv_readers,
-            attn_desc=spec.attn_desc,
-            original_keys=tuple(keys),
         )
 
     def _combine_found(
@@ -826,7 +629,6 @@ class StorageManager:
         ``handle.l2_orig_indices``.
         """
         found = Bitmap(handle.total_requested_keys)
-        found.batched_set(handle.l0_found_indices)
         found.batched_set(handle.l1_found_indices)
         if l2_local is not None:
             # gather maps each L2 set bit i to its original position
@@ -861,27 +663,6 @@ class StorageManager:
         """
         if handle.prefetch_request_id == -1:
             return handle.l1_hit_chunks
-
-        if handle.l0_union_enabled:
-            # The L2 controller sees only sparse local-tier misses, so its
-            # scalar prefix count is not meaningful in original chunk space.
-            # Use lookup-phase found positions (available before the load
-            # finishes), map them back, and fold the real L0/L1/L2 union.
-            l2_bitmap = self._prefetch_controller.peek_lookup_result_bitmap(
-                handle.prefetch_request_id
-            )
-            if l2_bitmap is None:
-                return None
-            found = self._combine_found(handle, l2_bitmap)
-            stride = handle.attn_desc.num_object_groups * handle.attn_desc.world_size
-            num_chunks = handle.total_requested_keys // stride
-            hit_chunks, _ = fold_unfold_ranked(
-                found,
-                num_chunks,
-                handle.attn_desc.world_size,
-                handle.attn_desc.num_chunks_in_sw,
-            )
-            return hit_chunks
 
         l2_r = self._prefetch_controller.query_lookup_result(handle.prefetch_request_id)
         if l2_r is None:
@@ -941,97 +722,21 @@ class StorageManager:
                 return None
 
         found = self._combine_found(handle, l2_r)
-
-        if handle.l0_union_enabled:
-            stride = handle.attn_desc.num_object_groups * handle.attn_desc.world_size
-            num_chunks = handle.total_requested_keys // stride
-            _hit_chunks, retain = fold_unfold_ranked(
-                found,
-                num_chunks,
-                handle.attn_desc.world_size,
-                handle.attn_desc.num_chunks_in_sw,
-            )
-            released = (found & (~retain)).gather(
-                list(handle.original_keys)
-            )
-            if released:
-                self._finish_prefetched_by_source(
-                    released, read_locks=handle.num_kv_readers
-                )
-            retained_keys = retain.gather(list(handle.original_keys))
-            if retained_keys:
-                self._l0_manager.touch_keys(retained_keys)
-                self._l1_manager.touch_keys(retained_keys)
-
         # popcount (not count_leading_ones) so the log is accurate for
         # non-contiguous policies (SEGMENTED_PREFIX / SPARSE) too.
         total_hits = found.popcount()
         elapsed_ms = (time.monotonic() - handle.submit_time) * 1000
 
-        if os.getenv("LMCACHE_MP_CHTHM_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}:
-            stride = handle.attn_desc.num_object_groups * handle.attn_desc.world_size
-            requested_chunks = handle.total_requested_keys // max(stride, 1)
-            if requested_chunks > 0:
-                source_tiers: list[str] = []
-                hit_chunks, retain = fold_unfold_ranked(
-                    found, requested_chunks, handle.attn_desc.world_size,
-                    handle.attn_desc.num_chunks_in_sw,
-                )
-                retained = retain.get_indices_set()
-                l0_set = set(handle.l0_found_indices)
-                l1_set = set(handle.l1_found_indices)
-                l2_set: set[int] = set()
-                if l2_r is not None:
-                    l2_local = l2_r.get_indices_list()
-                    l2_set = {
-                        handle.l2_orig_indices[i]
-                        for i in l2_local
-                        if i < len(handle.l2_orig_indices)
-                    }
-                for chunk_idx in range(hit_chunks):
-                    lo = chunk_idx * stride
-                    hi = lo + stride
-                    required = {i for i in retained if lo <= i < hi}
-                    # CHTHM is hierarchical: a chunk is an L0/GPU hit only
-                    # when every required shard is available from L0. If L1
-                    # is needed to complete it, count it at L1; if L2 is
-                    # needed to complete it, count it at L2.
-                    if required and required <= l0_set:
-                        source_tiers.append("L0")
-                    elif required and required <= (l0_set | l1_set):
-                        source_tiers.append("L1")
-                    elif required and required <= (l0_set | l1_set | l2_set):
-                        source_tiers.append("L2")
-                    else:
-                        logger.warning(
-                            "[MP_CHTHM_RAW_INCOMPLETE_SOURCE] request=%s chunk=%d "
-                            "required=%d l0=%d l1=%d l2=%d",
-                            handle.external_request_id, chunk_idx, len(required),
-                            len(required & l0_set), len(required & l1_set),
-                            len(required & l2_set),
-                        )
-                        break
-                logger.info(
-                    "[MP_CHTHM_RAW] request=%s chunk_size=%d requested_chunks=%d "
-                    "total_hit_chunks=%d l0_hit_chunks=%d l1_hit_chunks=%d l2_hit_chunks=%d "
-                    "source_tiers=%s",
-                    handle.external_request_id, int(os.getenv("LMCACHE_CHUNK_SIZE", "512")),
-                    requested_chunks, len(source_tiers), source_tiers.count("L0"),
-                    source_tiers.count("L1"), source_tiers.count("L2"),
-                    ",".join(source_tiers) or "-",
-                )
-
         if total_hits > 0:
-            l0_hits = len(handle.l0_found_indices)
+            # L1 and L2 sets are disjoint (only L1-misses go to L2).
             l1_hits = len(handle.l1_found_indices)
             l2_hits = l2_r.popcount() if l2_r is not None else 0
             logger.info(
-                "Prefetch request completed (L0+L1+L2): "
-                "%d/%d found keys (%d L0, %d L1, %d L2) in %.1f ms "
+                "Prefetch request completed (L1+L2): "
+                "%d/%d retained keys (%d L1, %d L2) in %.1f ms "
                 "(external_request_id=%s, prefetch_request_id=%d)",
                 total_hits,
                 handle.total_requested_keys,
-                l0_hits,
                 l1_hits,
                 l2_hits,
                 elapsed_ms,
@@ -1048,7 +753,6 @@ class StorageManager:
         Args:
             keys (list[ObjectKey]): List of object keys to touch.
         """
-        self._l0_manager.touch_keys(keys)
         self._l1_manager.touch_keys(keys)
 
     def delete_l1_keys(
@@ -1075,7 +779,7 @@ class StorageManager:
         self, keys: list[ObjectKey]
     ) -> tuple[list[ObjectKey], list[MemoryObj]]:
         """Read already read-locked objects without acquiring new read locks."""
-        read_results = self._unsafe_read_prefetched(keys)
+        read_results = self._l1_manager.unsafe_read(keys)
         good_keys: list[ObjectKey] = []
         good_objs: list[MemoryObj] = []
         for key in keys:
@@ -1411,7 +1115,6 @@ class StorageManager:
                 If False (default), only clear unlocked objects, keeping
                 write-locked and read-locked objects intact.
         """
-        self._l0_manager.clear(force=force)
         self._l1_manager.clear(force=force)
 
     def close(self):
@@ -1428,22 +1131,19 @@ class StorageManager:
         for adapter in self._l2_adapters.values():
             adapter.close()
 
-        self._l0_manager.close()
         self._l1_manager.close()
 
     def report_status(self) -> dict:
         """Return a status dict aggregating all sub-component statuses."""
-        l0 = self._l0_manager.report_status()
         l1 = self._l1_manager.report_status()
         store = self._store_controller.report_status()
         prefetch = self._prefetch_controller.report_status()
         l1_eviction = self._eviction_controller.report_status()
         l2_eviction = self._l2_eviction_controller.report_status()
         adapters = [a.report_status() for _id, _desc, a in self._snapshot_adapters()]
-        children = [l0, l1, store, prefetch, l1_eviction, l2_eviction] + adapters
+        children = [l1, store, prefetch, l1_eviction, l2_eviction] + adapters
         return {
             "is_healthy": all(c["is_healthy"] for c in children),
-            "l0_manager": l0,
             "l1_manager": l1,
             "store_controller": store,
             "prefetch_controller": prefetch,
@@ -1475,7 +1175,7 @@ class StorageManager:
         Returns:
             True if memory is consistent, False otherwise.
         """
-        return self._l0_manager.memcheck() and self._l1_manager.memcheck()
+        return self._l1_manager.memcheck()
 
     def _snapshot_adapters(
         self,

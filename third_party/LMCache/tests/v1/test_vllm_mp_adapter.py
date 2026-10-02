@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# [SC] Project-specific changes in this upstream file are marked with [SC];
+# see repo-root docs/SC_MODIFICATIONS.md for rationale and provenance.
+
 """Public-API unit tests for ``LMCacheMPWorkerAdapter``. The MQ boundary is
 stubbed (see ``fake_adapter``); no GPU or live server needed. End-to-end
 recovery: ``.buildkite/k3_tests/multiprocess/scripts/run-restart-recovery.sh``."""
@@ -1121,6 +1124,7 @@ def test_recovery_reports_the_ring_re_registration_result(fake_adapter, ring_ok)
     assert adapter._reregister_kv_caches_callback() is ring_ok
 
 
+# [SC] Regression coverage for mutual-prefix stale-bridge revalidation.
 def test_mutual_prefix_rejects_stale_vpc_bridge_and_releases_suffix_locks() -> None:
     """A ranged LMCache hit must not bridge across a VPC prefix that shrank."""
     pytest.importorskip("vllm")

@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# [SC] Project-specific changes in this upstream file are marked with [SC];
+# see repo-root docs/SC_MODIFICATIONS.md for rationale and provenance.
+
 """Public adapter contracts for nonblocking status polling."""
 
 # Standard
@@ -157,6 +160,7 @@ def resolved(adapter: LMCacheMPSchedulerAdapter) -> int:
     raise AssertionError("completed status did not become observable")
 
 
+# [SC] Verify scheduler-adapter ranged lookup for mutual-prefix reuse.
 def test_ranged_lookup_starts_after_local_prefix_and_returns_suffix_length(
     make_adapter: AdapterFactory,
 ) -> None:
@@ -351,6 +355,7 @@ def test_status_deadline_does_not_restart_on_poll(
     assert client.queries == ["r"]
 
 
+# [SC] Verify logical Stage-1 timeout/reaper cleanup.
 def test_stage1_lookup_timeout_returns_miss_and_reaps_locks(
     make_adapter: AdapterFactory,
 ) -> None:

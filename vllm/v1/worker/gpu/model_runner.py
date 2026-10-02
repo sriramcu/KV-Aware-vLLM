@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# [SC] Project-specific changes in this upstream file are marked with [SC];
+# see repo-root docs/SC_MODIFICATIONS.md for rationale and provenance.
+
 """
 NOTE: Coding style guide for this file:
 This model runner is shared by all models: text and multimodal, generative
@@ -19,6 +22,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+# [SC] Debug gate for scheduler-authoritative KV rewind recovery.
 import os
 import time
 from contextlib import AbstractContextManager
@@ -1072,6 +1076,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Add new blocks and update num_computed_tokens for the existing requests.
         reqs = scheduler_output.scheduled_cached_reqs
         num_computed_tokens_np = self.req_states.num_computed_tokens_np
+        # [SC] Restore device-side request state after scheduler rewind.
+        # Upstream context: https://github.com/vllm-project/vllm/issues/49250
+        # https://github.com/vllm-project/vllm/pull/49252
+        # https://github.com/vllm-project/vllm/pull/53298
         rewound_req_ids = reqs.rewound_req_ids or set()
         rewound_all_token_ids = reqs.rewound_all_token_ids or {}
         debug_recompute = os.getenv("VLLM_KV_RECOMPUTE_DEBUG", "0") == "1"
@@ -1154,6 +1162,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
 
         if staged_rewind:
+            # [SC] Rewind writes must reach device state before the next forward.
             self.req_states.apply_staged_writes()
 
         # Update CPU num_computed_prefill_tokens.

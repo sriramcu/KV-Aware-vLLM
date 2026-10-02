@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# [SC] Project-specific changes in this upstream file are marked with [SC];
+# see repo-root docs/SC_MODIFICATIONS.md for rationale and provenance.
+
 """Unit tests for the ``WAIT_PREFETCH_STATUS`` request handler path.
 
 The prefetch-controller tests cover the condition-variable wait in isolation;
@@ -26,6 +29,7 @@ def _make_ctx(wait_result=True, found=None):
     ctx.storage_manager = storage_manager
     ctx.event_bus = mock.Mock()
     ctx.chunk_size = 256
+    # [SC] Default ranged-lookup origin for mutual-prefix tests.
     ctx.session_manager.get_or_create.return_value.lookup_ipc_key.start = 0
     return ctx
 
@@ -74,6 +78,7 @@ def test_wait_prefetch_status_returns_count_and_consumes_job():
     session.record_prefetch_result.assert_called_once_with(4, (0,))
 
 
+# [SC] Verify mutual-prefix session cleanup uses absolute chunk coordinates.
 def test_wait_prefetch_status_records_absolute_hit_end_for_ranged_lookup():
     # The prefetch result is 4 chunks relative to a lookup that starts at
     # chunk 2. Lock cleanup must remember absolute end chunk 6.

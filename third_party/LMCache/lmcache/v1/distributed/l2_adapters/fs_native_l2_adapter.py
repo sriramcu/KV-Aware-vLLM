@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# [SC] Project-specific changes in this upstream file are marked with [SC];
+# see repo-root docs/SC_MODIFICATIONS.md for rationale and provenance.
+
 """
 Filesystem native L2 adapter config and factory.
 
@@ -40,6 +43,8 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
 
     Fields:
     - base_path: directory for storing KV cache files.
+    # [SC] Per-operation worker lanes isolate latency-critical lookup/retrieve
+    # work from the shared filesystem worker pool.
     - num_workers: shared C++ worker threads for operations without a dedicated
       lane (default 4).
     - per_op_workers: optional dedicated worker counts keyed by ``lookup``,
@@ -65,6 +70,7 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
         use_odirect: bool = False,
         read_ahead_size: Optional[int] = None,
         max_capacity_gb: float = 0,
+        # [SC] Nonzero lane counts are self-enabling; no separate gate required.
         per_op_workers: dict[str, int] | None = None,
     ):
         self.base_path = base_path
@@ -86,6 +92,7 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
         num_workers = d.get("num_workers", 4)
         if not isinstance(num_workers, int) or num_workers <= 0:
             raise ValueError("num_workers must be a positive integer")
+        # [SC] Validate only fs_native-supported lane names.
         per_op_workers = L2AdapterConfigBase._parse_per_op_workers_from_dict(d)
         per_op_workers = L2AdapterConfigBase._validate_per_op_workers(
             per_op_workers
@@ -126,6 +133,7 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
                 base_path,
             )
 
+        # [SC] Carry the resolved per-operation lane topology into the adapter.
         return cls(
             base_path=base_path,
             num_workers=num_workers,
@@ -138,6 +146,7 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
 
     @classmethod
     def help(cls) -> str:
+        # [SC] Document shared-vs-dedicated worker semantics.
         return (
             "FS native L2 adapter config fields:\n"
             "- base_path (str): directory for KV "
@@ -184,6 +193,7 @@ def _create_fs_native_l2_adapter(
     )
 
     assert isinstance(config, FSNativeL2AdapterConfig)
+    # [SC] Pass dedicated lane counts to the native fs connector.
     native_client = LMCacheFSClient(
         config.base_path,
         config.num_workers,
@@ -209,6 +219,7 @@ def _create_fs_native_l2_adapter(
             "base_path": config.base_path,
             "use_odirect": config.use_odirect,
             "num_workers": config.num_workers,
+            # [SC] Expose resolved lane topology in adapter status.
             "per_op_workers": config.per_op_workers,
             "read_ahead_size": config.read_ahead_size,
         },

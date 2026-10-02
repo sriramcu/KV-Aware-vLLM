@@ -83,6 +83,7 @@ class LoadRecoveryExampleConnector(ExampleConnector):
         super().clear_connector_metadata()
 
     def start_load_kv(self, forward_context: ForwardContext, **kwargs) -> None:
+        # [SC] Fix the async-load injection path used by the recovery regression harness.
         if self._async_load and forward_context.attn_metadata is None:
             # Async loads may be started from a connector-only/no-forward step.
             # ExampleConnector only performs its KV assignment when

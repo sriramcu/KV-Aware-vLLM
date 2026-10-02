@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Analyze MP congestion, raw hierarchy CHTHM, and useful KV contribution.
+"""Analyze MP congestion, raw L1/L2 opportunity, and useful KV contribution.
 
-Raw CHTHM and scheduler-useful contribution are deliberately separate:
-  * raw CHTHM: where KV was eventually found in the hierarchy;
+Raw hierarchy opportunity and scheduler-useful contribution are deliberately separate:
+  * raw opportunity: where external KV was eventually found in L1/L2;
   * useful contribution: what the scheduler actually admitted/loaded.
 
 If Stage-1 is abandoned before the server result is observed, raw hierarchy
@@ -18,15 +18,9 @@ from pathlib import Path
 import re
 from typing import Iterable
 
-RAW_RE = re.compile(
-    r"\[MP_CHTHM_RAW\] request=(\S+) chunk_size=(\d+) requested_chunks=(\d+) "
-    r"total_hit_chunks=(\d+) l0_hit_chunks=(\d+) l1_hit_chunks=(\d+) "
-    r"l2_hit_chunks=(\d+) source_tiers=(\S+)"
-)
-OLD_LOOKUP_RE = re.compile(
+LOOKUP_RE = re.compile(
     r"\[MP_CHTHM_LOOKUP\] request=(\S+) requested_tokens=(\d+) "
     r"total_hit_tokens=(\d+) l1_hit_tokens=(\d+) l2_hit_tokens=(\d+)"
-    r"(?: l0_union=(\S+))?"
 )
 ADMIT_RE = re.compile(
     r"\[MP_CHTHM_ADMIT\] request=(\S+) decision=(\S+) prompt_tokens=(\d+) "
@@ -51,7 +45,9 @@ NATIVE_DONE_RE = re.compile(
     r"\[MP_NATIVE_IO_DONE\].*op=(\S+).*service_s=([0-9.]+) "
     r"pending_store=(\d+) pending_lookup=(\d+) pending_load=(\d+) pending_total=(\d+)"
 )
-LIFETIME_RE = re.compile(r"\[L1_READ_LIFETIME\] unsafe_read (?:missing|unlocked).*reserved_age_s=([-0-9.]+)")
+LIFETIME_RE = re.compile(
+    r"\[L1_READ_LIFETIME\] unsafe_read (?:missing|unlocked).*reserved_age_s=([-0-9.]+)"
+)
 
 
 def lines(path: Path | None) -> Iterable[str]:
@@ -83,13 +79,12 @@ def dist(values: list[float]) -> dict[str, float | int | None]:
     }
 
 
-
-
 def base_request_id(request_id: str) -> str:
     parts = request_id.split("-")
     if len(parts) >= 4 and parts[0] == "cmpl":
         return "-".join(parts[:2])
     return request_id
+
 
 def phase_map(results: Path | None) -> dict[str, str]:
     out: dict[str, str] = {}
@@ -111,7 +106,8 @@ def overlap(a0: int, a1: int, b0: int, b1: int) -> int:
 
 
 def source_token_counts(raw: dict, start: int, end: int) -> dict[str, int]:
-    out = {"L0": 0, "L1": 0, "L2": 0}
+    """Attribute a requested interval to the monotonic L1-prefix/L2-extension plan."""
+    out = {"L1": 0, "L2": 0}
     cs = raw["chunk_size"]
     offset = raw.get("start_token", 0)
     for i, tier in enumerate(raw["source_tiers"]):
@@ -128,8 +124,7 @@ def main() -> None:
     ap.add_argument("--output", type=Path)
     args = ap.parse_args()
 
-    raw: dict[str, dict] = {}
-    old: dict[str, dict] = {}
+    lookups: dict[str, dict] = {}
     qwait: list[float] = []
     lookup_s: list[float] = []
     total_s: list[float] = []
@@ -140,25 +135,12 @@ def main() -> None:
     lifetimes: list[float] = []
 
     for line in lines(args.lmcache_log):
-        if m := RAW_RE.search(line):
-            rid, cs, req, hit, l0, l1, l2, tiers = m.groups()
-            tier_list = [] if tiers == "-" else tiers.split(",")
-            raw[rid] = {
-                "chunk_size": int(cs),
-                "requested_chunks": int(req),
-                "total_hit_chunks": int(hit),
-                "l0_hit_chunks": int(l0),
-                "l1_hit_chunks": int(l1),
-                "l2_hit_chunks": int(l2),
-                "source_tiers": tier_list,
-            }
-        if m := OLD_LOOKUP_RE.search(line):
-            old[m.group(1)] = {
+        if m := LOOKUP_RE.search(line):
+            lookups[m.group(1)] = {
                 "requested": int(m.group(2)),
                 "total": int(m.group(3)),
                 "l1": int(m.group(4)),
                 "l2": int(m.group(5)),
-                "l0_union": str(m.group(6) or "False").lower() == "true",
             }
         if m := PREFETCH_ADMIT_RE.search(line):
             qwait.append(float(m.group(1)))
@@ -171,8 +153,8 @@ def main() -> None:
             store_s.append(float(m.group(1)))
         if m := NATIVE_DONE_RE.search(line):
             native.setdefault(m.group(1), []).append(float(m.group(2)))
-            for k, g in zip(("store", "lookup", "load", "total"), (3, 4, 5, 6)):
-                pending[k].append(float(m.group(g)))
+            for key, group in zip(("store", "lookup", "load", "total"), (3, 4, 5, 6)):
+                pending[key].append(float(m.group(group)))
         if m := LIFETIME_RE.search(line):
             age = float(m.group(1))
             if age >= 0:
@@ -211,32 +193,22 @@ def main() -> None:
             recovery_waves += 1
             recovered_request_events += int(m.group(1))
 
-    # Raw source_tiers are relative to the submitted LMCache lookup range.
-    # Under mutual-prefix lookup that range can start after token 0, so carry
-    # the vLLM-side lookup offset into CHTHM overlap accounting.
-    for rid, rec in raw.items():
-        rec["start_token"] = mutual_lookup_starts.get(rid, 0)
-
-    # Backward-compatible raw-source reconstruction for older L0-off logs.
-    # Their MP_CHTHM_LOOKUP records describe a monotonic L1 prefix followed by
-    # an L2 extension. Do not attempt this for legacy L0-union records because
-    # those logs intentionally collapsed mixed L0/L1/L2 attribution.
-    for rid, rec in old.items():
-        if rid in raw or rec.get("l0_union"):
-            continue
-        chunk_size = 512
+    # Current MP_CHTHM_LOOKUP records describe a monotonic L1 prefix followed
+    # by the additional prefix extension found in L2. Under mutual prefix, the
+    # lookup range begins after the vLLM-local prefix, so preserve that offset.
+    raw: dict[str, dict] = {}
+    chunk_size = 512
+    for rid, rec in lookups.items():
         l1_chunks = rec["l1"] // chunk_size
         l2_chunks = rec["l2"] // chunk_size
         raw[rid] = {
             "chunk_size": chunk_size,
             "requested_chunks": rec["requested"] // chunk_size,
             "total_hit_chunks": rec["total"] // chunk_size,
-            "l0_hit_chunks": 0,
             "l1_hit_chunks": l1_chunks,
             "l2_hit_chunks": l2_chunks,
             "source_tiers": ["L1"] * l1_chunks + ["L2"] * l2_chunks,
             "start_token": mutual_lookup_starts.get(rid, 0),
-            "reconstructed_from_legacy_lookup": True,
         }
 
     phases = phase_map(args.results_dir)
@@ -248,8 +220,8 @@ def main() -> None:
         prompt = admit["prompt"]
         vpc = min(prompt, admit["vpc"])
         rr = raw.get(rid)
-        chunk_size = rr["chunk_size"] if rr is not None else 512
-        chunk_addressable = prompt - (prompt % chunk_size)
+        cs = rr["chunk_size"] if rr is not None else chunk_size
+        chunk_addressable = prompt - (prompt % cs)
         external_opportunity = max(0, chunk_addressable - min(vpc, chunk_addressable))
 
         rb = raw_b.setdefault(
@@ -258,7 +230,6 @@ def main() -> None:
                 "requests": 0,
                 "prompt_tokens": 0,
                 "vpc_hit_tokens": 0,
-                "l0_hit_tokens": 0,
                 "l1_hit_tokens": 0,
                 "l2_hit_tokens": 0,
                 "known_hierarchy_miss_tokens": 0,
@@ -273,7 +244,6 @@ def main() -> None:
                 "requests": 0,
                 "prompt_tokens": 0,
                 "vpc_tokens": 0,
-                "l0_tokens": 0,
                 "l1_tokens": 0,
                 "l2_tokens": 0,
                 "external_unknown_tokens": 0,
@@ -293,10 +263,9 @@ def main() -> None:
         if rr is not None:
             rb["observed_external_opportunity_tokens"] += external_opportunity
             src = source_token_counts(rr, vpc, chunk_addressable)
-            rb["l0_hit_tokens"] += src["L0"]
             rb["l1_hit_tokens"] += src["L1"]
             rb["l2_hit_tokens"] += src["L2"]
-            known_hit = src["L0"] + src["L1"] + src["L2"]
+            known_hit = src["L1"] + src["L2"]
             rb["known_hierarchy_miss_tokens"] += max(0, external_opportunity - known_hit)
         else:
             rb["unobserved_external_opportunity_tokens"] += external_opportunity
@@ -311,10 +280,9 @@ def main() -> None:
         ub["recompute_tokens"] += max(0, prompt - vpc - ext)
         if ext and rr is not None:
             src = source_token_counts(rr, vpc, vpc + ext)
-            ub["l0_tokens"] += src["L0"]
             ub["l1_tokens"] += src["L1"]
             ub["l2_tokens"] += src["L2"]
-            attributed = src["L0"] + src["L1"] + src["L2"]
+            attributed = src["L1"] + src["L2"]
             ub["external_unknown_tokens"] += max(0, ext - attributed)
         else:
             ub["external_unknown_tokens"] += ext
@@ -323,7 +291,7 @@ def main() -> None:
 
     for bucket in raw_b.values():
         total = bucket["prompt_tokens"]
-        gpu = bucket["vpc_hit_tokens"] + bucket["l0_hit_tokens"]
+        gpu = bucket["vpc_hit_tokens"]
         cpu = bucket["l1_hit_tokens"]
         disk = bucket["l2_hit_tokens"]
         opportunity = bucket["raw_external_opportunity_tokens"]
@@ -348,7 +316,6 @@ def main() -> None:
         total = bucket["prompt_tokens"]
         for key in (
             "vpc_tokens",
-            "l0_tokens",
             "l1_tokens",
             "l2_tokens",
             "external_unknown_tokens",
@@ -356,20 +323,25 @@ def main() -> None:
         ):
             bucket[key.replace("_tokens", "_pct")] = 100.0 * bucket[key] / total if total else 0.0
 
-    phase_counts = {phase: sum(1 for x in phases.values() if x == phase) for phase in set(phases.values())}
+    phase_counts = {
+        phase: sum(1 for value in phases.values() if value == phase)
+        for phase in set(phases.values())
+    }
     starve_by: dict[str, set[str]] = {}
     fresh_by: dict[str, set[str]] = {}
     for rid in starvation_requests:
-        starve_by.setdefault(phases.get(rid, phases.get(base_request_id(rid), "unknown")), set()).add(rid)
+        phase = phases.get(rid, phases.get(base_request_id(rid), "unknown"))
+        starve_by.setdefault(phase, set()).add(rid)
     for rid, _ in freshness:
-        fresh_by.setdefault(phases.get(rid, phases.get(base_request_id(rid), "unknown")), set()).add(rid)
+        phase = phases.get(rid, phases.get(base_request_id(rid), "unknown"))
+        fresh_by.setdefault(phase, set()).add(rid)
 
     result = {
         "raw_chthm": raw_b,
         "useful_contribution": useful_b,
         "chthm_definition": (
-            "GPU hit is over all prompt tokens; CPU hit is conditional on GPU miss; "
-            "disk hit is conditional on GPU+CPU miss; hierarchy miss/recompute is over all prompt tokens."
+            "GPU/VPC hit is over all prompt tokens; CPU/L1 hit is conditional on GPU miss; "
+            "disk/L2 hit is conditional on GPU+CPU miss; hierarchy miss/recompute is over all prompt tokens."
         ),
         "observation_note": (
             "Raw tier rates are lower bounds when raw_external_observation_coverage_pct < 100. "
@@ -406,8 +378,7 @@ def main() -> None:
             "native_pending_load": dist(pending["load"]),
             "native_pending_total": dist(pending["total"]),
         },
-        "legacy_lookup_records": len(old),
-        "raw_source_records": len(raw),
+        "lookup_records": len(lookups),
         "scheduler_admit_records": len(admits),
     }
 

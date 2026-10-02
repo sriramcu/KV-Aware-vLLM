@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# [SC] Project-specific changes in this upstream file are marked with [SC];
+# see repo-root docs/SC_MODIFICATIONS.md for rationale and provenance.
+
 """
 Unit tests for the L2 adapter factory registry and
 PluginL2AdapterConfig.
@@ -882,6 +885,7 @@ class _FakeLMCacheFSClient:
         relative_tmp_dir="",
         use_odirect=False,
         read_ahead_size=0,
+        # [SC] Mirror the project-extended native FS constructor.
         per_op_workers=None,
     ):
         self.base_path = base_path

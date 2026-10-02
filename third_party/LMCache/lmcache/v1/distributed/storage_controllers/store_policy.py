@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# [SC] Project-specific changes in this upstream file are marked with [SC];
+# see repo-root docs/SC_MODIFICATIONS.md for rationale and provenance.
+
 """
 Store policy interface and default implementation for L1-to-L2 storage decisions.
 
@@ -14,6 +17,7 @@ from dataclasses import dataclass
 
 # First Party
 from lmcache.logging import init_logger
+
 from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.distributed.l2_adapters.config import (
     L2AdapterConfigBase,
@@ -95,18 +99,12 @@ class StorePolicy(ABC):
             Keys to delete from L1. Empty list means keep all.
         """
 
+    # [SC] Preserve policy ownership semantics when StoreController's rolling
+    # L2 byte budget deliberately skips a store.  Default behavior mirrors a
+    # successful store; cache-like policies override this by returning [].
     def select_l1_deletions_on_store_skip(
-        self,
-        keys: list[ObjectKey],
+        self, keys: list[ObjectKey]
     ) -> list[ObjectKey]:
-        """Decide which L1 keys to delete when an L2 store is intentionally skipped.
-
-        The default mirrors ``select_l1_deletions``. This preserves the
-        ownership semantics of existing policies: cache-like policies keep
-        their L1 copy, while policies that use L1 only as an L2 staging buffer
-        drop the skipped staging copy instead of accidentally promoting it to
-        persistent L1.
-        """
         return self.select_l1_deletions(keys)
 
 
@@ -230,93 +228,47 @@ class BufferOnlyStorePolicy(DefaultStorePolicy):
 register_store_policy("default", DefaultStorePolicy)
 register_store_policy("skip_l1", BufferOnlyStorePolicy)
 
-
-class GNNExclusiveStorePolicy(StorePolicy):
-    """Keep L1-selected keys in L1 and use L1 only as staging for L2 keys."""
-
-    def select_store_targets(
-        self,
-        keys: list[ObjectKey],
-        adapters: list[AdapterDescriptor],
-    ) -> dict[int, list[ObjectKey]]:
-        # Local import keeps the default path independent of experimental code.
-        from lmcache.v1.distributed.placement_metadata import get_chunk_placement
-
-        l2_keys = [key for key in keys if get_chunk_placement(key.chunk_hash) == "L2"]
-        l1_keys = len(keys) - len(l2_keys)
-        logger.info(
-            "[GNN_EXCLUSIVE_L2_POLICY] candidates=%d persistent_l1=%d l2_targets=%d adapters=%d",
-            len(keys), l1_keys, len(l2_keys), len(adapters),
-        )
-        return {ad.index: list(l2_keys) for ad in adapters if l2_keys}
-
-    def select_l1_deletions(self, keys: list[ObjectKey]) -> list[ObjectKey]:
-        # StoreController calls this only with keys that successfully reached L2.
-        if keys:
-            logger.info("[GNN_EXCLUSIVE_L2_COMMIT] l2_keys=%d delete_l1_staging=%d", len(keys), len(keys))
-        return list(keys)
-
-    def select_l1_deletions_on_store_skip(
-        self, keys: list[ObjectKey]
-    ) -> list[ObjectKey]:
-        if keys:
-            logger.info(
-                "[GNN_EXCLUSIVE_L2_SKIP] skipped_l2_keys=%d delete_l1_staging=%d",
-                len(keys),
-                len(keys),
-            )
-        return list(keys)
-
-
-register_store_policy("gnn_exclusive", GNNExclusiveStorePolicy)
-
-
+# [SC] Short-Q dynamic placement policy.  Semantic labels are gpu/cpu/disk;
+# LMCache itself remains a physical CPU-L1 / disk-L2 hierarchy.
 class GNNDynamicStorePolicy(StorePolicy):
-    """Persistent policy for GNN-aware dynamic VPC.
+    """Persist Short-Q-selected disk objects, optionally safety-back all objects.
 
-    Logical GPU/L0 and CPU/L1 objects that reach host memory stay in L1.
-    Logical disk/L2 objects are committed to L2 and their L1 staging copies are
-    removed. Whether logical GPU/L0 objects are copied to host at all is decided
-    independently by ``LMCACHE_GNN_L1_BACKING`` in the transfer path.
-
-    When ``LMCACHE_GNN_L2_BACKING=1``, every host-resident GNN prompt chunk is
-    also written to every configured L2 adapter.  This is deliberately a
-    *backing* mode rather than a placement rewrite: GPU/L0 and CPU/L1 chunks
-    remain persistent in L1 after the L2 commit, while true disk/L2 chunks keep
-    the existing staging behavior and are deleted from L1 after commit.
+    With ``LMCACHE_GNN_L2_BACKING=0`` only ``disk`` placements are sent to L2.
+    With backing enabled, all host-resident objects get an L2 safety copy while
+    only true ``disk`` placements are deleted from L1 after commit.  This keeps
+    ``gpu``/``cpu`` placement objects resident in fast host memory when present.
     """
 
     def __init__(self) -> None:
         value = os.getenv("LMCACHE_GNN_L2_BACKING", "0").strip().lower()
         self._l2_backing = value in {"1", "true", "yes", "on"}
-        logger.info(
-            "[GNN_DYNAMIC_L2_BACKING_INIT] enabled=%s",
-            self._l2_backing,
-        )
+        logger.info("[GNN_DYNAMIC_L2_BACKING_INIT] enabled=%s", self._l2_backing)
+
+    @staticmethod
+    def _placements(keys: list[ObjectKey]) -> dict[ObjectKey, str]:
+        from lmcache.v1.distributed.placement_metadata import get_chunk_placement
+
+        return {key: get_chunk_placement(key.chunk_hash) for key in keys}
 
     def select_store_targets(
         self,
         keys: list[ObjectKey],
         adapters: list[AdapterDescriptor],
     ) -> dict[int, list[ObjectKey]]:
-        from lmcache.v1.distributed.placement_metadata import get_chunk_placement
-
-        placements = {
-            key: get_chunk_placement(key.chunk_hash)
-            for key in keys
-        }
+        placements = self._placements(keys)
         if self._l2_backing:
             l2_keys = list(keys)
         else:
-            l2_keys = [key for key in keys if placements[key] == "L2"]
-        persistent_l1 = sum(1 for key in keys if placements[key] != "L2")
-        backing_targets = sum(1 for key in l2_keys if placements[key] != "L2")
+            l2_keys = [key for key in keys if placements[key] == "disk"]
+
+        persistent_l1 = sum(1 for key in keys if placements[key] != "disk")
+        backing_targets = sum(1 for key in l2_keys if placements[key] != "disk")
         logger.info(
             "[GNN_DYNAMIC_L2_POLICY] candidates=%d persistent_l1=%d "
-            "l2_targets=%d backing_targets=%d l2_backing=%s adapters=%d",
+            "disk_targets=%d backing_targets=%d l2_backing=%s adapters=%d",
             len(keys),
             persistent_l1,
-            len(l2_keys),
+            sum(1 for key in l2_keys if placements[key] == "disk"),
             backing_targets,
             self._l2_backing,
             len(adapters),
@@ -324,53 +276,32 @@ class GNNDynamicStorePolicy(StorePolicy):
         return {ad.index: list(l2_keys) for ad in adapters if l2_keys}
 
     def select_l1_deletions(self, keys: list[ObjectKey]) -> list[ObjectKey]:
-        if self._l2_backing:
-            from lmcache.v1.distributed.placement_metadata import get_chunk_placement
-
-            # In backing mode, only true L2 placements use L1 as staging.
-            # GPU/L0 and CPU/L1 objects keep their existing persistent L1 copy
-            # even though an additional durable L2 copy now exists.
-            deletions = [
-                key
-                for key in keys
-                if get_chunk_placement(key.chunk_hash) == "L2"
-            ]
-        else:
-            deletions = list(keys)
-
+        placements = self._placements(keys)
+        deletions = [key for key in keys if placements[key] == "disk"]
         if keys:
             logger.info(
                 "[GNN_DYNAMIC_L2_COMMIT] l2_keys=%d delete_l1_staging=%d "
-                "keep_l1_backing=%d l2_backing=%s",
+                "keep_l1_backing=%d",
                 len(keys),
                 len(deletions),
                 len(keys) - len(deletions),
-                self._l2_backing,
             )
         return deletions
 
     def select_l1_deletions_on_store_skip(
         self, keys: list[ObjectKey]
     ) -> list[ObjectKey]:
-        if self._l2_backing:
-            from lmcache.v1.distributed.placement_metadata import get_chunk_placement
-
-            deletions = [
-                key
-                for key in keys
-                if get_chunk_placement(key.chunk_hash) == "L2"
-            ]
-        else:
-            deletions = list(keys)
-
+        # A skipped true-disk object was admitted to L1 only as L2 staging.
+        # gpu/cpu placements retain their fast-tier backing copy.
+        placements = self._placements(keys)
+        deletions = [key for key in keys if placements[key] == "disk"]
         if keys:
             logger.info(
                 "[GNN_DYNAMIC_L2_SKIP] skipped_l2_keys=%d delete_l1_staging=%d "
-                "keep_l1=%d l2_backing=%s",
+                "keep_l1_backing=%d",
                 len(keys),
                 len(deletions),
                 len(keys) - len(deletions),
-                self._l2_backing,
             )
         return deletions
 

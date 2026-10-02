@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# [SC] Project-specific changes in this upstream file are marked with [SC];
+# see repo-root docs/SC_MODIFICATIONS.md for rationale and provenance.
+
 # Standard
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -76,6 +79,9 @@ class ExtraConfigDefault(enum.Enum):
     heartbeat_interval = 10.0
     # Poll status replies without blocking the scheduler by default.
     nonblocking_lookup_status = True
+    # [SC] Optional Stage-1 logical timeout/recompute seam. Related RFCs:
+    # https://github.com/LMCache/LMCache/issues/4945
+    # https://github.com/LMCache/LMCache/issues/2585
     # End-to-end Stage-1 lookup/prefetch timeout in seconds. A value <= 0
     # disables the timeout. This is intentionally separate from mq_timeout:
     # mq_timeout bounds one control-plane RPC, while lookup_timeout bounds the
@@ -208,6 +214,9 @@ class _LookupAck:
     """``time.monotonic()`` timestamp taken when the LOOKUPs were sent."""
 
 
+# [SC] Background cleanup for logically abandoned Stage-1 work; cancellation
+# remains logical only. Related async-interface/cancellation RFC:
+# https://github.com/LMCache/LMCache/issues/2585
 @dataclass
 class _TimedOutLookupCleanup:
     """Background cleanup state for a logically abandoned Stage-1 lookup.
@@ -677,6 +686,7 @@ class LMCacheMPSchedulerAdapter:
         self._nonblocking_lookup_status = (
             ExtraConfigDefault.nonblocking_lookup_status.default
         )
+        # [SC] Keep a Stage-1 wall-age policy separate from one-RPC mq_timeout.
         self._lookup_timeout = ExtraConfigDefault.lookup_timeout.default
         if extra_config is not None:
             cfg = _resolve_extra_config(extra_config)
@@ -710,6 +720,9 @@ class LMCacheMPSchedulerAdapter:
         self._lookup_params: dict[
             str, tuple[list[int], int, str, dict[str, Any] | None]
         ] = {}
+        # [SC] Stage-1 abandonment/reaper state. Related RFC/issues:
+        # https://github.com/LMCache/LMCache/issues/4945
+        # https://github.com/LMCache/LMCache/issues/2585
         # Monotonic submission timestamp for the end-to-end Stage-1 timeout.
         self._lookup_started_at: dict[str, float] = {}
 
@@ -813,6 +826,8 @@ class LMCacheMPSchedulerAdapter:
                 hb.start()
                 self._heartbeats[url] = hb
 
+    # [SC] Stage-1 logical abandonment + reaper. This block deliberately does
+    # not cancel daemon work or touch Stage-2 GPU destination transfers.
     def _lookup_was_logically_timed_out(self, request_id: str) -> bool:
         with self._timed_out_lookup_lock:
             return request_id in self._timed_out_lookups
@@ -866,7 +881,7 @@ class LMCacheMPSchedulerAdapter:
         self._mark_stage1_lookup_abandoned(request_id, reason="timeout")
 
     def abandon_stage1_lookup(self, request_id: str) -> bool:
-        """Abandon one still-pending Stage-1 lookup due to GPU starvation.
+        """Abandon one still-pending Stage-1 lookup due to scheduler starvation.
 
         Recheck the lookup once nonblockingly before abandoning it. If its
         result became ready since the scheduler's earlier scan, preserve that
@@ -1058,7 +1073,7 @@ class LMCacheMPSchedulerAdapter:
                 cache_salt values produce separate cache entries.
             request_configs: Optional LMCache request configs to include in
                 the IPC key.
-            start: Chunk-aligned token index at which external prefix lookup
+            [SC] start: Chunk-aligned token index at which external prefix lookup
                 should begin. Tokens before ``start`` are assumed to be covered
                 by vLLM's local prefix cache and are not required from LMCache.
 
@@ -1087,6 +1102,8 @@ class LMCacheMPSchedulerAdapter:
             # Skip if there is already a lookup request
             return
 
+        # [SC] Mutual-prefix lookup: start at the scheduler-provided local VPC
+        # boundary and address only complete LMCache chunks in the remaining range.
         aligned_end = (
             len(token_ids) // self.lmcache_tokens_per_chunk
         ) * self.lmcache_tokens_per_chunk
@@ -1123,6 +1140,7 @@ class LMCacheMPSchedulerAdapter:
             futures=futures, submitted_at=time.monotonic()
         )
         self._pending_lookups.add(request_id)
+        # [SC] Preserve the ranged lookup start for lock cleanup/reaping.
         self._lookup_params[request_id] = (
             token_ids, start, cache_salt, request_configs
         )
@@ -1146,6 +1164,7 @@ class LMCacheMPSchedulerAdapter:
             per_server: Per-server hit chunk counts.
             min_chunks: Minimum hit chunk count across all servers.
         """
+        # [SC] Tail-lock cleanup is relative to the ranged lookup start.
         token_ids_l, lookup_start, cs, request_configs = self._lookup_params.pop(
             request_id, (None, 0, None, None)
         )
@@ -1195,6 +1214,7 @@ class LMCacheMPSchedulerAdapter:
             in LMCache (prefix matching), or
             None if the lookup request is not finished yet.
         """
+        # [SC] A logically abandoned Stage-1 lookup remains a stable cache miss.
         if self._lookup_was_logically_timed_out(request_id):
             return 0
 
@@ -1211,6 +1231,8 @@ class LMCacheMPSchedulerAdapter:
             # Aggregation already done; return the cached value.
             return self._finished_lookup_results[request_id]
 
+        # [SC] Optional fixed timeout is an ablation/debug path; the selected
+        # runtime liveness mechanism is the scheduler's two-pass fallback.
         started_at = self._lookup_started_at.get(request_id)
         if (
             self._lookup_timeout > 0
@@ -1310,6 +1332,8 @@ class LMCacheMPSchedulerAdapter:
             request_id: The ID of the finished request.
         """
         if self._lookup_was_logically_timed_out(request_id):
+            # [SC] Preserve stale Stage-1 state until the background reaper has
+            # consumed the completion and released the retained read locks.
             # The reaper still needs the LOOKUP/status futures and key params
             # to consume the stale prefetch result and release its locks.
             # Keep that state until reaping completes; the logical miss remains
@@ -1325,6 +1349,7 @@ class LMCacheMPSchedulerAdapter:
 
     def shutdown(self) -> None:
         """Shutdown the scheduler adapter and its resources."""
+        # [SC] Stop the Stage-1 cleanup thread before closing request clients.
         self._timed_out_lookup_stop.set()
         self._timed_out_lookup_wakeup.set()
         self._timed_out_lookup_reaper.join(timeout=2.0)
@@ -1391,6 +1416,7 @@ class LMCacheMPSchedulerAdapter:
         Args:
             request_id: The ID of the finished request.
         """
+        # [SC] Defer END_SESSION until abandoned Stage-1 work has been reaped.
         if self._lookup_was_logically_timed_out(request_id):
             # Do not remove the server session until the abandoned prefetch has
             # published its result and the reaper has released its read locks.

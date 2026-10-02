@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# [SC] Project-specific changes in this upstream file are marked with [SC];
+# see repo-root docs/SC_MODIFICATIONS.md for rationale and provenance.
+
 """
 Managing objects and memory for L1 cache
 """
@@ -6,6 +9,7 @@ Managing objects and memory for L1 cache
 # Standard
 from dataclasses import dataclass
 from typing import Literal
+# [SC] Optional read-lifetime diagnostics and warm-start L1 accounting.
 import os
 import threading
 import time
@@ -210,6 +214,7 @@ class L1Manager:
         )
         self._write_ttl_seconds = config.write_ttl_seconds
         self._read_ttl_seconds = config.read_ttl_seconds
+        # [SC] Diagnose read-reservation age without changing lock semantics.
         self._prefetch_lifetime_debug = (
             os.getenv("LMCACHE_PREFETCH_LIFETIME_DEBUG", "0") == "1"
         )
@@ -296,6 +301,7 @@ class L1Manager:
                 entry.read_lock.lock()
             ret[key] = (L1Error.SUCCESS, entry.memory_obj)
             successful_keys.append(key)
+            # [SC] Timestamp successful read reservations for diagnostics only.
             if self._prefetch_lifetime_debug:
                 self._debug_read_reserved_at.setdefault(key, time.monotonic())
 
@@ -336,6 +342,7 @@ class L1Manager:
         for key in keys:
             entry = self._objects.get(key, None)
             if entry is None:
+                # [SC] Surface reservation age on real unsafe-read failures.
                 if self._prefetch_lifetime_debug:
                     reserved_at = self._debug_read_reserved_at.get(key)
                     age = time.monotonic() - reserved_at if reserved_at else -1.0
@@ -402,6 +409,7 @@ class L1Manager:
         for key in keys:
             entry = self._objects.get(key, None)
             if entry is None:
+                # [SC] Preserve age diagnostics when a reserved object vanished.
                 if self._prefetch_lifetime_debug:
                     reserved_at = self._debug_read_reserved_at.pop(key, None)
                     age = time.monotonic() - reserved_at if reserved_at else -1.0
@@ -441,6 +449,7 @@ class L1Manager:
             # overhead (TTLLock is C++ std::atomic).
             for _ in range(total):
                 entry.read_lock.unlock()
+            # [SC] Report unusually long reservations when their final lock releases.
             if self._prefetch_lifetime_debug and not entry.read_lock.is_locked():
                 reserved_at = self._debug_read_reserved_at.pop(key, None)
                 if reserved_at is not None:
@@ -913,6 +922,8 @@ class L1Manager:
         write_locked = 0
         read_locked = 0
         temporary = 0
+        # [SC] Byte-level L1 status separates persistent reusable objects from
+        # temporary/write/read-locked staging for capacity-normalized runs.
         object_bytes = 0
         write_locked_bytes = 0
         read_locked_bytes = 0

@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
+# [SC] Project-specific changes in this upstream file are marked with [SC];
+# see repo-root docs/SC_MODIFICATIONS.md for rationale and provenance.
+
 """LMCache-driven KV cache transfer operations for the MPCacheServer."""
 
 # Standard
 from dataclasses import dataclass
-from typing import Any, Sequence
 import os
+from typing import Any, Sequence
 import threading
 import time
 
@@ -20,6 +23,7 @@ from lmcache.v1.distributed.api import (
     ObjectKey,
 )
 from lmcache.v1.gpu_connector.utils import LayoutHints
+# [SC] Short-Q dynamic placement metadata; physical LMCache tiers remain L1/L2.
 from lmcache.v1.distributed.placement_metadata import get_chunk_placement
 from lmcache.v1.kv_layer_groups import ObjectGroupInfo
 from lmcache.v1.memory_management import MemoryObj
@@ -60,68 +64,12 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-_L0_SMOKE_STORE_ENABLED = _env_flag("LMCACHE_L0_SMOKE_STORE")
-_L0_VPC_IMITATION_ENABLED = _env_flag("LMCACHE_L0_VPC_IMITATION")
-_GNN_EXCLUSIVE_ENABLED = _env_flag("LMCACHE_GNN_EXCLUSIVE_PLACEMENT")
+# [SC] Project store path: vLLM owns GPU residency; LMCache optionally keeps
+# gpu-labelled chunks backed in host L1 and always stages cpu/disk chunks there.
 _GNN_DYNAMIC_STORE_ENABLED = _env_flag("LMCACHE_GNN_DYNAMIC_STORE")
 _GNN_L1_BACKING_ENABLED = _env_flag("LMCACHE_GNN_L1_BACKING")
-_L0_ROUTE_MODE = os.getenv("LMCACHE_L0_ROUTE_MODE", "all").strip().lower()
-_L0_SMOKE_MOD = int(os.getenv("LMCACHE_L0_SMOKE_MOD", "4"))
-_L0_SMOKE_TAKE = int(os.getenv("LMCACHE_L0_SMOKE_TAKE", "2"))
-if _L0_SMOKE_MOD <= 0:
-    raise ValueError("LMCACHE_L0_SMOKE_MOD must be > 0")
-if not 0 <= _L0_SMOKE_TAKE <= _L0_SMOKE_MOD:
-    raise ValueError(
-        "LMCACHE_L0_SMOKE_TAKE must be between 0 and LMCACHE_L0_SMOKE_MOD"
-    )
-if sum(
-    bool(x)
-    for x in (
-        _L0_VPC_IMITATION_ENABLED,
-        _L0_SMOKE_STORE_ENABLED,
-        _GNN_EXCLUSIVE_ENABLED,
-        _GNN_DYNAMIC_STORE_ENABLED,
-    )
-) > 1:
-    raise ValueError(
-        "LMCACHE_L0_VPC_IMITATION, LMCACHE_L0_SMOKE_STORE, "
-        "LMCACHE_GNN_EXCLUSIVE_PLACEMENT, and LMCACHE_GNN_DYNAMIC_STORE "
-        "are mutually exclusive"
-    )
 if _GNN_L1_BACKING_ENABLED and not _GNN_DYNAMIC_STORE_ENABLED:
-    raise ValueError(
-        "LMCACHE_GNN_L1_BACKING requires LMCACHE_GNN_DYNAMIC_STORE=1"
-    )
-if _L0_VPC_IMITATION_ENABLED and _L0_ROUTE_MODE not in {"all", "smoke"}:
-    raise ValueError(
-        "LMCACHE_L0_ROUTE_MODE must be one of: all, smoke "
-        "(more routing modes can be added here later)"
-    )
-
-
-def _l0_smoke_select_chunk(global_chunk_idx: int) -> bool:
-    """Deterministic smoke-only L0 placement rule.
-
-    With the defaults, global logical chunk indices 0,1,4,5,... go to L0;
-    all other chunks stay on the normal L1/L2 path. The rule is stable across
-    partial STORE ranges because it uses the request-global chunk index.
-    """
-    return (global_chunk_idx % _L0_SMOKE_MOD) < _L0_SMOKE_TAKE
-
-
-def _l0_imitation_select_chunk(global_chunk_idx: int) -> bool:
-    """Select which normal MP stores also receive a persistent L0 mirror.
-
-    Imitation mode is intentionally separate from the routing policy so the
-    same VPC-off + write-through hierarchy can later compare all/smoke/random/
-    GNN routing without changing the backing L1/L2 semantics.  Only the two
-    simple routing modes needed today are implemented here.
-    """
-    if _L0_ROUTE_MODE == "all":
-        return True
-    if _L0_ROUTE_MODE == "smoke":
-        return _l0_smoke_select_chunk(global_chunk_idx)
-    return False  # guarded by module-level validation above
+    raise ValueError("LMCACHE_GNN_L1_BACKING requires LMCACHE_GNN_DYNAMIC_STORE=1")
 
 
 def get_layout_desc(
@@ -253,19 +201,6 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         self._device_host_func_dispatcher.register(
             "finish_write",
             self._ctx.storage_manager.finish_write,
-            payload_type=list[ObjectKey],
-        )
-        # Dormant L0 completion hook. No current placement policy submits this
-        # callback; it exists so a later explicit L0 store can publish only
-        # after its D2D copy reaches this stream position.
-        self._device_host_func_dispatcher.register(
-            "finish_l0_write",
-            self._ctx.storage_manager.finish_l0_write,
-            payload_type=list[ObjectKey],
-        )
-        self._device_host_func_dispatcher.register(
-            "abort_l0_write",
-            self._ctx.storage_manager.abort_l0_write,
             payload_type=list[ObjectKey],
         )
         self._device_host_func_dispatcher.register(
@@ -766,438 +701,123 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             )
 
             reserved_dict: dict[ObjectKey, MemoryObj] = {}
-            all_l1_dict: dict[ObjectKey, MemoryObj] = {}
-            all_l0_dict: dict[ObjectKey, MemoryObj] = {}
+            all_dict: dict[ObjectKey, MemoryObj] = {}
             total_bytes: int = 0
             store_succeeded = False
-            smoke_l0 = _L0_SMOKE_STORE_ENABLED and self._ctx.storage_manager.l0_enabled
-            imitation_l0 = (
-                _L0_VPC_IMITATION_ENABLED and self._ctx.storage_manager.l0_enabled
-            )
-            gnn_exclusive = _GNN_EXCLUSIVE_ENABLED
-            gnn_dynamic = _GNN_DYNAMIC_STORE_ENABLED
-            gnn_target_counts = {"L0": 0, "L1": 0, "L2": 0}
-            gnn_host_reserved_counts = {"L0": 0, "L1": 0, "L2": 0}
-            global_start_chunk = key.start // self._ctx.chunk_size
-
-            if _L0_SMOKE_STORE_ENABLED and not self._ctx.storage_manager.l0_enabled:
-                logger.warning(
-                    "LMCACHE_L0_SMOKE_STORE is enabled but L0 itself is disabled; "
-                    "falling back to the legacy L1/L2 store path"
-                )
-            if _L0_VPC_IMITATION_ENABLED and not self._ctx.storage_manager.l0_enabled:
-                logger.warning(
-                    "LMCACHE_L0_VPC_IMITATION is enabled but L0 itself is disabled; "
-                    "falling back to the normal L1/L2 store path"
-                )
-            if gnn_exclusive and not self._ctx.storage_manager.l0_enabled:
-                raise RuntimeError(
-                    "GNN exclusive placement requires persistent L0 to be enabled"
-                )
-
-            if (smoke_l0 or imitation_l0 or gnn_exclusive) and num_chunks:
-                first_keys = obj_keys_per_obj_group[0]
-                if first_keys:
-                    group_layout_descs = {
-                        gid: get_layout_desc(
-                            cache_context,
-                            self._ctx.chunk_size,
-                            object_group_id=gid,
-                        )
-                        for gid in range(num_object_groups)
-                    }
-                    prepared = self._ctx.storage_manager.prepare_l0_rank_arena(
-                        first_keys[0].kv_rank,
-                        cache_context.device,
-                        group_layout_descs,
-                    )
-                    if not prepared:
-                        logger.error(
-                            "[L0_STORE] failed to prepare L0 arena for "
-                            "request_id=%s kv_rank=%d; selected chunks will not "
-                            "receive an L0 copy",
-                            key.request_id,
-                            first_keys[0].kv_rank,
-                        )
-
+            gnn_target_counts = {"gpu": 0, "cpu": 0, "disk": 0}
+            gnn_reserved_counts = {"gpu": 0, "cpu": 0, "disk": 0}
             try:
                 for obj_group_id in range(num_object_groups):
                     obj_keys = obj_keys_per_obj_group[obj_group_id]
                     skip_mask = skipped_chunks[obj_group_id]
+
+                    # [SC] Dynamic Short-Q store admission. GPU placement is a
+                    # vLLM retention preference, not an LMCache storage tier.
+                    # CPU/disk placements always enter host L1; gpu placement
+                    # enters host L1 only when safety backing is enabled.
+                    if _GNN_DYNAMIC_STORE_ENABLED:
+                        placements = [
+                            get_chunk_placement(k.chunk_hash) if not skip_mask[i] else None
+                            for i, k in enumerate(obj_keys)
+                        ]
+                        if obj_group_id == 0:
+                            for placement in gnn_target_counts:
+                                gnn_target_counts[placement] = sum(
+                                    value == placement for value in placements
+                                )
+                        host_placements = {"cpu", "disk"}
+                        if _GNN_L1_BACKING_ENABLED:
+                            host_placements.add("gpu")
+                        keys_to_reserve = [
+                            k
+                            for k, placement in zip(obj_keys, placements, strict=True)
+                            if placement in host_placements
+                        ]
+                    else:
+                        placements = None
+                        keys_to_reserve = [
+                            k for i, k in enumerate(obj_keys) if not skip_mask[i]
+                        ]
+
                     layout_desc = get_layout_desc(
                         cache_context,
                         self._ctx.chunk_size,
                         object_group_id=obj_group_id,
                     )
+                    reserved_dict = self._ctx.storage_manager.reserve_write(
+                        keys_to_reserve, layout_desc, "new"
+                    )
+                    all_dict.update(reserved_dict)
+                    if reserved_dict:
+                        total_bytes += next(
+                            iter(reserved_dict.values())
+                        ).get_size() * len(reserved_dict)
+                    # [SC] Account semantic gpu/cpu/disk reservations for diagnostics.
+                    if placements is not None and obj_group_id == 0:
+                        placement_by_key = dict(zip(obj_keys, placements, strict=True))
+                        for reserved_key in reserved_dict:
+                            placement = placement_by_key[reserved_key]
+                            if placement is not None:
+                                gnn_reserved_counts[placement] += 1
 
-                    if gnn_dynamic:
-                        target_tiers = [
-                            get_chunk_placement(k.chunk_hash) if not skip_mask[i] else "SKIP"
-                            for i, k in enumerate(obj_keys)
-                        ]
-                        if obj_group_id == 0:
-                            for tier in ("L0", "L1", "L2"):
-                                gnn_target_counts[tier] = sum(
-                                    1 for x in target_tiers if x == tier
-                                )
+                    # Keys not in reserved_dict become None entries; the helper
+                    # skips them for D2H.
+                    memory_objs: list[MemoryObj | None] = [
+                        reserved_dict.get(obj_key) for obj_key in obj_keys
+                    ]
 
-                        # Dynamic VPC owns GPU residency. LMCache only supplies
-                        # lower-tier persistence. L1 backing independently adds
-                        # logical GPU/L0 chunks to the host-store set.
-                        host_tiers = {"L1", "L2"}
-                        if _GNN_L1_BACKING_ENABLED:
-                            host_tiers.add("L0")
-                        host_keys = [
-                            k
-                            for i, k in enumerate(obj_keys)
-                            if not skip_mask[i] and target_tiers[i] in host_tiers
-                        ]
-                        reserved_dict = self._ctx.storage_manager.reserve_write(
-                            host_keys, layout_desc, "new"
-                        )
-                        if obj_group_id == 0:
-                            tier_by_key = {
-                                k: target_tiers[i] for i, k in enumerate(obj_keys)
-                            }
-                            for reserved_key in reserved_dict:
-                                reserved_tier = tier_by_key[reserved_key]
-                                if reserved_tier in gnn_host_reserved_counts:
-                                    gnn_host_reserved_counts[reserved_tier] += 1
-                        all_l1_dict.update(reserved_dict)
-                        if reserved_dict:
-                            total_bytes += (
-                                next(iter(reserved_dict.values())).get_size()
-                                * len(reserved_dict)
-                            )
-
-                        host_memory_objs: list[MemoryObj | None] = [
-                            reserved_dict.get(obj_key) for obj_key in obj_keys
-                        ]
-                        if reserved_dict:
-                            transfer_kv_per_object_group(
-                                cache_context,
-                                block_ids_per_group_gpu,
-                                host_memory_objs,
-                                object_group_id=obj_group_id,
-                                batch_size=1,
-                                skip_first_n_tokens=0,
-                                direction=lmcache_native.TransferDirection.D2H,
-                                transfer_key=transfer_key,
-                            )
-
-                    elif gnn_exclusive:
-                        target_tiers = [
-                            get_chunk_placement(k.chunk_hash) if not skip_mask[i] else "SKIP"
-                            for i, k in enumerate(obj_keys)
-                        ]
-                        if obj_group_id == 0:
-                            for tier in ("L0", "L1", "L2"):
-                                gnn_target_counts[tier] = sum(1 for x in target_tiers if x == tier)
-
-                        l0_keys = [
-                            k for i, k in enumerate(obj_keys)
-                            if not skip_mask[i] and target_tiers[i] == "L0"
-                        ]
-                        host_keys = [
-                            k for i, k in enumerate(obj_keys)
-                            if not skip_mask[i] and target_tiers[i] in {"L1", "L2"}
-                        ]
-                        l0_reserved = self._ctx.storage_manager.reserve_l0_write(
-                            l0_keys, layout_desc
-                        )
-                        reserved_dict = self._ctx.storage_manager.reserve_write(
-                            host_keys, layout_desc, "new"
-                        )
-                        all_l0_dict.update(l0_reserved)
-                        all_l1_dict.update(reserved_dict)
-                        for current in (l0_reserved, reserved_dict):
-                            if current:
-                                total_bytes += next(iter(current.values())).get_size() * len(current)
-
-                        l0_memory_objs: list[MemoryObj | None] = [
-                            l0_reserved.get(obj_key) for obj_key in obj_keys
-                        ]
-                        host_memory_objs: list[MemoryObj | None] = [
-                            reserved_dict.get(obj_key) for obj_key in obj_keys
-                        ]
-                        if l0_reserved:
-                            transfer_kv_per_object_group(
-                                cache_context, block_ids_per_group_gpu, l0_memory_objs,
-                                object_group_id=obj_group_id, batch_size=1,
-                                skip_first_n_tokens=0,
-                                direction=lmcache_native.TransferDirection.D2H,
-                                transfer_key=transfer_key,
-                            )
-                        if reserved_dict:
-                            transfer_kv_per_object_group(
-                                cache_context, block_ids_per_group_gpu, host_memory_objs,
-                                object_group_id=obj_group_id, batch_size=1,
-                                skip_first_n_tokens=0,
-                                direction=lmcache_native.TransferDirection.D2H,
-                                transfer_key=transfer_key,
-                            )
-                    elif imitation_l0:
-                        # VPC-imitation mode is write-through: preserve the
-                        # ordinary L1/L2 store for every eligible chunk, then
-                        # mirror only router-selected chunks into persistent L0.
-                        # This keeps backing-storage behavior invariant while
-                        # allowing the routing decision to change independently.
-                        keys_to_reserve = [
-                            k for i, k in enumerate(obj_keys) if not skip_mask[i]
-                        ]
-                        reserved_dict = self._ctx.storage_manager.reserve_write(
-                            keys_to_reserve, layout_desc, "new"
-                        )
-                        all_l1_dict.update(reserved_dict)
-                        if reserved_dict:
-                            total_bytes += next(
-                                iter(reserved_dict.values())
-                            ).get_size() * len(reserved_dict)
-
-                        l1_memory_objs: list[MemoryObj | None] = [
-                            reserved_dict.get(obj_key) for obj_key in obj_keys
-                        ]
-                        if reserved_dict:
-                            transfer_kv_per_object_group(
-                                cache_context,
-                                block_ids_per_group_gpu,
-                                l1_memory_objs,
-                                object_group_id=obj_group_id,
-                                batch_size=1,
-                                skip_first_n_tokens=0,
-                                direction=lmcache_native.TransferDirection.D2H,
-                                transfer_key=transfer_key,
-                            )
-
-                        l0_selected = [
-                            (not skip_mask[i])
-                            and _l0_imitation_select_chunk(global_start_chunk + i)
-                            for i in range(len(obj_keys))
-                        ]
-                        l0_keys = [
-                            k for i, k in enumerate(obj_keys) if l0_selected[i]
-                        ]
-                        l0_reserved = self._ctx.storage_manager.reserve_l0_write(
-                            l0_keys, layout_desc
-                        )
-                        all_l0_dict.update(l0_reserved)
-                        if l0_reserved:
-                            total_bytes += next(
-                                iter(l0_reserved.values())
-                            ).get_size() * len(l0_reserved)
-                            l0_memory_objs: list[MemoryObj | None] = [
-                                l0_reserved.get(obj_key) for obj_key in obj_keys
-                            ]
-                            transfer_kv_per_object_group(
-                                cache_context,
-                                block_ids_per_group_gpu,
-                                l0_memory_objs,
-                                object_group_id=obj_group_id,
-                                batch_size=1,
-                                skip_first_n_tokens=0,
-                                direction=lmcache_native.TransferDirection.D2H,
-                                transfer_key=transfer_key,
-                            )
-                    elif smoke_l0:
-                        l0_selected = [
-                            (not skip_mask[i])
-                            and _l0_smoke_select_chunk(global_start_chunk + i)
-                            for i in range(len(obj_keys))
-                        ]
-                        l0_keys = [
-                            k for i, k in enumerate(obj_keys) if l0_selected[i]
-                        ]
-                        l1_keys = [
-                            k
-                            for i, k in enumerate(obj_keys)
-                            if not skip_mask[i] and not l0_selected[i]
-                        ]
-
-                        l0_reserved = self._ctx.storage_manager.reserve_l0_write(
-                            l0_keys, layout_desc
-                        )
-                        reserved_dict = self._ctx.storage_manager.reserve_write(
-                            l1_keys, layout_desc, "new"
-                        )
-                        all_l0_dict.update(l0_reserved)
-                        all_l1_dict.update(reserved_dict)
-
-                        for current in (l0_reserved, reserved_dict):
-                            if current:
-                                total_bytes += next(
-                                    iter(current.values())
-                                ).get_size() * len(current)
-
-                        l0_memory_objs: list[MemoryObj | None] = [
-                            l0_reserved.get(obj_key) for obj_key in obj_keys
-                        ]
-                        l1_memory_objs: list[MemoryObj | None] = [
-                            reserved_dict.get(obj_key) for obj_key in obj_keys
-                        ]
-
-                        if l0_reserved:
-                            transfer_kv_per_object_group(
-                                cache_context,
-                                block_ids_per_group_gpu,
-                                l0_memory_objs,
-                                object_group_id=obj_group_id,
-                                batch_size=1,
-                                skip_first_n_tokens=0,
-                                direction=lmcache_native.TransferDirection.D2H,
-                                transfer_key=transfer_key,
-                            )
-                        if reserved_dict:
-                            transfer_kv_per_object_group(
-                                cache_context,
-                                block_ids_per_group_gpu,
-                                l1_memory_objs,
-                                object_group_id=obj_group_id,
-                                batch_size=1,
-                                skip_first_n_tokens=0,
-                                direction=lmcache_native.TransferDirection.D2H,
-                                transfer_key=transfer_key,
-                            )
-                    else:
-                        keys_to_reserve = [
-                            k for i, k in enumerate(obj_keys) if not skip_mask[i]
-                        ]
-                        reserved_dict = self._ctx.storage_manager.reserve_write(
-                            keys_to_reserve, layout_desc, "new"
-                        )
-                        all_l1_dict.update(reserved_dict)
-                        if reserved_dict:
-                            total_bytes += next(
-                                iter(reserved_dict.values())
-                            ).get_size() * len(reserved_dict)
-
-                        # Keys not in reserved_dict (all-null chunks skipped above,
-                        # or skipped by the storage manager) become None entries;
-                        # the helper skips them for D2H.
-                        memory_objs: list[MemoryObj | None] = [
-                            reserved_dict.get(obj_key) for obj_key in obj_keys
-                        ]
-
-                        # NOTE: batch_size must stay 1 for store.
-                        transfer_kv_per_object_group(
-                            cache_context,
-                            block_ids_per_group_gpu,
-                            memory_objs,
-                            object_group_id=obj_group_id,
-                            batch_size=1,
-                            skip_first_n_tokens=0,
-                            direction=lmcache_native.TransferDirection.D2H,
-                            transfer_key=transfer_key,
-                        )
+                    # NOTE: batch_size must stay 1 for store.
+                    transfer_kv_per_object_group(
+                        cache_context,
+                        block_ids_per_group_gpu,
+                        memory_objs,
+                        object_group_id=obj_group_id,
+                        batch_size=1,
+                        skip_first_n_tokens=0,
+                        direction=lmcache_native.TransferDirection.D2H,
+                        transfer_key=transfer_key,
+                    )
 
                 store_succeeded = True
             except Exception:
                 logger.exception("Cannot store keys due to exception")
             finally:
                 event_backend.record_event(event, cache_context.stream)
-                # Publish L1 and L0 only after every copy has reached this stream
-                # point. On a failed smoke L0 store, release unpublished GPU pages
-                # at the same stream point instead of freeing them while a D2D may
-                # still be in flight.
-                # Count logical stored objects, not physical tier copies.
-                # In imitation mode the same ObjectKey may be present in both
-                # L1 and L0 by design; counting the union preserves historical
-                # MP_STORE_END semantics while total_bytes still reflects the
-                # actual copy traffic submitted to both tiers.
-                stored_count = (
-                    len(set(all_l1_dict) | set(all_l0_dict))
-                    if store_succeeded
-                    else 0
-                )
-                if store_succeeded:
-                    if all_l1_dict:
-                        submit_callback_to_stream(
-                            cache_context.cupy_stream,
-                            "finish_write",
-                            list(all_l1_dict.keys()),
-                        )
-                    if all_l0_dict:
-                        submit_callback_to_stream(
-                            cache_context.cupy_stream,
-                            "finish_l0_write",
-                            list(all_l0_dict.keys()),
-                        )
-                else:
-                    if all_l0_dict:
-                        submit_callback_to_stream(
-                            cache_context.cupy_stream,
-                            "abort_l0_write",
-                            list(all_l0_dict.keys()),
-                        )
-                    total_bytes = 0
-
-                if smoke_l0:
-                    logger.info(
-                        "[L0_SMOKE_STORE] request_id=%s worker=%s "
-                        "global_chunks=[%d,%d) L0_reserved=%d L1_reserved=%d "
-                        "success=%s",
-                        key.request_id,
-                        key.worker_id,
-                        global_start_chunk,
-                        global_start_chunk + num_chunks,
-                        len(all_l0_dict),
-                        len(all_l1_dict),
-                        store_succeeded,
+                # Fail closed: commit the reserved objects only when every chunk
+                # copied successfully; otherwise the whole store is skipped.
+                stored_count = len(all_dict) if store_succeeded else 0
+                if stored_count:
+                    submit_callback_to_stream(
+                        cache_context.cupy_stream,
+                        "finish_write",
+                        list(all_dict.keys()),
                     )
-                if gnn_dynamic:
+                else:
+                    total_bytes = 0
+                if _GNN_DYNAMIC_STORE_ENABLED:
+                    # [SC] Keep resolved semantic counts in the run log for
+                    # placement-vs-physical-residency auditing.
                     logger.info(
                         "[GNN_DYNAMIC_STORE] request_id=%s worker=%s "
-                        "global_chunks=[%d,%d) target_gpu=%d target_cpu=%d "
-                        "target_disk=%d l1_backing=%s host_reserved=%d "
-                        "reserved_gpu=%d reserved_cpu=%d reserved_disk=%d "
-                        "host_bytes=%d logical_stored=%d success=%s",
+                        "target_gpu=%d target_cpu=%d target_disk=%d "
+                        "l1_backing=%s host_reserved=%d reserved_gpu=%d "
+                        "reserved_cpu=%d reserved_disk=%d host_bytes=%d success=%s",
                         key.request_id,
                         key.worker_id,
-                        global_start_chunk,
-                        global_start_chunk + num_chunks,
-                        gnn_target_counts["L0"],
-                        gnn_target_counts["L1"],
-                        gnn_target_counts["L2"],
+                        gnn_target_counts["gpu"],
+                        gnn_target_counts["cpu"],
+                        gnn_target_counts["disk"],
                         _GNN_L1_BACKING_ENABLED,
-                        len(all_l1_dict),
-                        gnn_host_reserved_counts["L0"],
-                        gnn_host_reserved_counts["L1"],
-                        gnn_host_reserved_counts["L2"],
-                        sum(obj.get_size() for obj in all_l1_dict.values()),
-                        stored_count,
-                        store_succeeded,
-                    )
-                if gnn_exclusive:
-                    logger.info(
-                        "[GNN_EXCLUSIVE_STORE] request_id=%s worker=%s "
-                        "global_chunks=[%d,%d) target_L0=%d target_L1=%d target_L2=%d "
-                        "L0_reserved=%d L1_stage_reserved=%d l0_bytes=%d host_stage_bytes=%d "
-                        "logical_stored=%d success=%s",
-                        key.request_id, key.worker_id, global_start_chunk,
-                        global_start_chunk + num_chunks,
-                        gnn_target_counts["L0"], gnn_target_counts["L1"],
-                        gnn_target_counts["L2"], len(all_l0_dict), len(all_l1_dict),
-                        sum(obj.get_size() for obj in all_l0_dict.values()),
-                        sum(obj.get_size() for obj in all_l1_dict.values()),
-                        stored_count, store_succeeded,
-                    )
-                if imitation_l0:
-                    logger.info(
-                        "[L0_VPC_IMITATION_STORE] request_id=%s worker=%s "
-                        "route=%s global_chunks=[%d,%d) L0_reserved=%d "
-                        "L1_reserved=%d logical_stored=%d success=%s",
-                        key.request_id,
-                        key.worker_id,
-                        _L0_ROUTE_MODE,
-                        global_start_chunk,
-                        global_start_chunk + num_chunks,
-                        len(all_l0_dict),
-                        len(all_l1_dict),
-                        stored_count,
+                        len(all_dict),
+                        gnn_reserved_counts["gpu"],
+                        gnn_reserved_counts["cpu"],
+                        gnn_reserved_counts["disk"],
+                        sum(obj.get_size() for obj in all_dict.values()),
                         store_succeeded,
                     )
                 num_tokens = (
                     stored_count * self._ctx.chunk_size
-                    if gnn_dynamic
+                    if _GNN_DYNAMIC_STORE_ENABLED
                     else num_chunks * self._ctx.chunk_size if stored_count else 0
                 )
                 self._ctx.event_bus.publish_on_stream(

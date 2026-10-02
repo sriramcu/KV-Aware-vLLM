@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# [SC] Project-specific changes in this upstream file are marked with [SC];
+# see repo-root docs/SC_MODIFICATIONS.md for rationale and provenance.
+
 # Standard
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -66,6 +69,8 @@ logger = init_logger(__name__)
 class LoadSpec:
     # Number of tokens cached in vLLM
     vllm_cached_tokens: int
+    # [SC] Separate raw LMCache hit length from the scheduler-authorized load
+    # endpoint. Same bug class as https://github.com/LMCache/LMCache/issues/4614.
     # Number of tokens that are cached in LMCache (lookup result / metrics).
     lmcache_cached_tokens: int
     # Exclusive token endpoint the scheduler actually allocated for external
@@ -822,6 +827,7 @@ class LMCacheConnectorV1Impl:
             )
             token_mask[:masked_token_count] = False
 
+            # [SC] Retrieve only through the scheduler-authorized endpoint.
             lmcache_cached_tokens = request.load_spec.load_end_tokens
             if self.use_layerwise:
                 if idx == last_idx:
@@ -1477,6 +1483,7 @@ class LMCacheConnectorV1Impl:
                 max(need_to_allocate, 0),
             )
 
+        # [SC] Chunked-load accounting feeds an explicit scheduler-authorized endpoint.
         # Chunked KV loading: cap the number of tokens reported
         # to the scheduler to avoid exhausting the GPU block pool
         # when many concurrent requests each need large allocations.
@@ -1504,6 +1511,9 @@ class LMCacheConnectorV1Impl:
                 self._max_tokens_per_load,
             )
 
+        # [SC] Keep the raw lookup hit for accounting, but make load_end_tokens
+        # authoritative for allocation/retrieve correctness:
+        # https://github.com/LMCache/LMCache/issues/4614
         scheduled_load_tokens = max(need_to_allocate, 0)
         self.load_specs[req_id] = LoadSpec(
             vllm_cached_tokens=num_computed_tokens,
@@ -1573,6 +1583,8 @@ class LMCacheConnectorV1Impl:
             self.load_specs[request.request_id].can_load = False
             return
 
+        # [SC] Validate exactly the range authorized by the scheduler rather
+        # than reconstructing N-vs-N-1 semantics from the raw lookup hit.
         load_spec = self.load_specs[request.request_id]
         expected_external_tokens = load_spec.load_end_tokens - load_spec.vllm_cached_tokens
         assert num_external_tokens == expected_external_tokens, (

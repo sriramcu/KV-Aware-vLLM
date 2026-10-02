@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# [SC] Project-specific changes in this upstream file are marked with [SC];
+# see repo-root docs/SC_MODIFICATIONS.md for rationale and provenance.
+
 import itertools
-import math
+# [SC] Debug gate for validated KV-load rewind recovery.
 import os
 import time
 from collections import defaultdict, deque
@@ -210,6 +213,10 @@ class Scheduler(SchedulerInterface):
 
         # IDs of requests preempted since the last call to schedule().
         self.reset_preempted_req_ids: set[str] = set()
+        # [SC] Explicit KV-load rewind state. Upstream context:
+        # https://github.com/vllm-project/vllm/issues/49250
+        # https://github.com/vllm-project/vllm/pull/49252
+        # https://github.com/vllm-project/vllm/pull/53298
         # Requests explicitly rewound after a rejected/failed external KV load.
         # Kept until that request is next dispatched so Model Runner V2 can
         # restore its device-side optimistic state to the scheduler's accepted state.
@@ -390,67 +397,80 @@ class Scheduler(SchedulerInterface):
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
 
-        # Project Stage-1 fallback controls. The historical starvation path
-        # reacts only to complete scheduler stalls. The optional occupancy
-        # watchdog is complementary: it reacts when Stage-1 lookups leave too
-        # many execution slots idle for a bounded grace interval, even while
-        # some already-running requests continue to make progress. Both are
-        # independently gated and may be enabled in the same run.
+        # [SC] Two-pass Stage-1 liveness fallback. A request is eligible only
+        # before remote KV destination blocks are committed. Two complete
+        # WAITING scans with zero model scheduling progress are required before
+        # the oldest pending lookups are abandoned for local recomputation.
+        # Related LMCache timeout/recompute design: https://github.com/LMCache/LMCache/issues/4945
         self._stage1_starvation_scan_streak = 0
-        self._stage1_occupancy_underfilled_since: float | None = None
         self._stage1_starvation_fallback_enabled = False
-        self._stage1_occupancy_fallback_enabled = False
-        self._stage1_occupancy_low_fraction = 0.50
-        self._stage1_occupancy_target_fraction = 0.875
-        self._stage1_occupancy_grace_s = 2.0
         if kv_transfer_config is not None:
             self._stage1_starvation_fallback_enabled = bool(
                 kv_transfer_config.get_from_extra_config(
                     "lmcache.mp.starvation_fallback", True
                 )
             )
-            self._stage1_occupancy_fallback_enabled = bool(
-                kv_transfer_config.get_from_extra_config(
-                    "lmcache.mp.occupancy_fallback", False
-                )
+
+    def _maybe_release_starved_stage1_requests(
+        self,
+        stage1_pending_requests: list[Request],
+        *,
+        waiting_scan_exhausted: bool,
+        made_model_progress: bool,
+    ) -> None:
+        """Apply the project two-pass Stage-1 starvation fallback."""
+        num_running_for_slots = (
+            len(self.running) + self.num_waiting_for_streaming_input
+        )
+        available_slots = max(
+            0, self.max_num_running_reqs - num_running_for_slots
+        )
+        unique_candidates = {
+            req.request_id: req for req in stage1_pending_requests
+        }
+        candidates = sorted(
+            unique_candidates.values(), key=lambda req: req.arrival_time
+        )
+        abandon_stage1 = (
+            getattr(self.connector, "abandon_stage1_lookup", None)
+            if self.connector is not None
+            else None
+        )
+        starved = (
+            self._stage1_starvation_fallback_enabled
+            and waiting_scan_exhausted
+            and available_slots > 0
+            and not made_model_progress
+            and bool(candidates)
+            and callable(abandon_stage1)
+        )
+        if not starved:
+            self._stage1_starvation_scan_streak = 0
+            return
+
+        self._stage1_starvation_scan_streak += 1
+        if self._stage1_starvation_scan_streak < 2:
+            return
+
+        abandoned_ids: list[str] = []
+        for candidate in candidates:
+            if len(abandoned_ids) >= available_slots:
+                break
+            if abandon_stage1(candidate.request_id):
+                abandoned_ids.append(candidate.request_id)
+
+        if abandoned_ids:
+            logger.warning(
+                "[KV_STAGE1_STARVATION_FALLBACK] two consecutive full WAITING "
+                "scans made no scheduling progress; logically abandoning %d "
+                "Stage-1 KV lookup(s) to fill %d available execution slot(s). "
+                "stage1_pending_seen=%d request_ids=%s",
+                len(abandoned_ids),
+                available_slots,
+                len(unique_candidates),
+                abandoned_ids,
             )
-            self._stage1_occupancy_low_fraction = float(
-                kv_transfer_config.get_from_extra_config(
-                    "lmcache.mp.occupancy_low_fraction", 0.50
-                )
-            )
-            self._stage1_occupancy_target_fraction = float(
-                kv_transfer_config.get_from_extra_config(
-                    "lmcache.mp.occupancy_target_fraction", 0.875
-                )
-            )
-            self._stage1_occupancy_grace_s = float(
-                kv_transfer_config.get_from_extra_config(
-                    "lmcache.mp.occupancy_grace_s", 2.0
-                )
-            )
-        if not 0.0 <= self._stage1_occupancy_low_fraction < 1.0:
-            raise ValueError("lmcache.mp.occupancy_low_fraction must be in [0, 1)")
-        if not (
-            self._stage1_occupancy_low_fraction
-            < self._stage1_occupancy_target_fraction
-            <= 1.0
-        ):
-            raise ValueError(
-                "lmcache.mp.occupancy_target_fraction must be in "
-                "(occupancy_low_fraction, 1]"
-            )
-        if self._stage1_occupancy_grace_s < 0.0:
-            raise ValueError("lmcache.mp.occupancy_grace_s must be >= 0")
-        if self._stage1_occupancy_fallback_enabled:
-            logger.info(
-                "[KV_STAGE1_OCCUPANCY_CONFIG] low_fraction=%.3f "
-                "target_fraction=%.3f grace_s=%.3f max_num_seqs=%d",
-                self._stage1_occupancy_low_fraction,
-                self._stage1_occupancy_target_fraction,
-                self._stage1_occupancy_grace_s,
-                self.max_num_running_reqs,
-            )
+        self._stage1_starvation_scan_streak = 0
 
     def _mamba_block_aligned_split(
         self,
@@ -841,6 +861,7 @@ class Scheduler(SchedulerInterface):
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         # Next, schedule the WAITING requests.
+        # [SC] Track Stage-1 lookups seen during this full WAITING scan.
         stage1_kv_pending_requests: list[Request] = []
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
@@ -930,7 +951,7 @@ class Scheduler(SchedulerInterface):
                         )
 
                         if ext_tokens is None:
-                            # Stage 1: the connector has not yet committed GPU
+                            # [SC] Stage 1: the connector has not yet committed GPU
                             # destination blocks for this request, so it is safe
                             # for the project starvation fallback to convert this
                             # lookup into a logical miss later.
@@ -1277,137 +1298,16 @@ class Scheduler(SchedulerInterface):
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
 
-            # Stage-1 requests have not committed GPU destination blocks yet,
-            # so either fallback below may safely convert them to local
-            # recomputation. Stage 2 (WAITING_FOR_REMOTE_KVS) is deliberately
-            # excluded.
-            waiting_scan_exhausted = not self.waiting and not self.skipped_waiting
-            num_running_for_slots = (
-                len(self.running) + self.num_waiting_for_streaming_input
-            )
-            available_slots = max(
-                0, self.max_num_running_reqs - num_running_for_slots
-            )
-            unique_candidates = {
-                req.request_id: req for req in stage1_kv_pending_requests
-            }
-            candidates = sorted(
-                unique_candidates.values(), key=lambda req: req.arrival_time
-            )
-            abandon_stage1 = (
-                getattr(self.connector, "abandon_stage1_lookup", None)
-                if self.connector is not None
-                else None
-            )
-
-            def abandon_oldest_stage1(limit: int) -> list[str]:
-                if limit <= 0 or not callable(abandon_stage1):
-                    return []
-                abandoned_ids: list[str] = []
-                for candidate in candidates:
-                    if len(abandoned_ids) >= limit:
-                        break
-                    if abandon_stage1(candidate.request_id):
-                        abandoned_ids.append(candidate.request_id)
-                return abandoned_ids
-
-            # Existing hard-starvation fallback: two complete WAITING scans
-            # with no model scheduling progress. Keep this behavior independent
-            # of the occupancy watchdog so both can be enabled together.
-            stage1_starved = (
-                self._stage1_starvation_fallback_enabled
-                and waiting_scan_exhausted
-                and available_slots > 0
-                and not num_scheduled_tokens
-                and bool(candidates)
-                and self.connector is not None
-            )
-            if stage1_starved:
-                self._stage1_starvation_scan_streak += 1
-            else:
-                self._stage1_starvation_scan_streak = 0
-
-            released_by_starvation: list[str] = []
-            if stage1_starved and self._stage1_starvation_scan_streak >= 2:
-                released_by_starvation = abandon_oldest_stage1(available_slots)
-                if released_by_starvation:
-                    logger.warning(
-                        "[KV_STAGE1_STARVATION_FALLBACK] two consecutive "
-                        "full WAITING scans made no scheduling progress; "
-                        "logically abandoning %d Stage-1 KV lookup(s) to "
-                        "fill %d available execution slot(s). "
-                        "stage1_pending_seen=%d request_ids=%s",
-                        len(released_by_starvation),
-                        available_slots,
-                        len(unique_candidates),
-                        released_by_starvation,
-                    )
-                # Require two new no-progress scans before another release wave.
-                self._stage1_starvation_scan_streak = 0
-
-            # Occupancy-aware fallback: partial scheduler progress must not keep
-            # resetting the liveness policy while half of max_num_seqs sits
-            # unused behind Stage-1 lookups. After a bounded grace interval,
-            # abandon only enough oldest Stage-1 requests to refill toward the
-            # configured target occupancy. A hard-starvation release in this
-            # same step takes precedence and resets this watchdog.
-            low_running = int(
-                self.max_num_running_reqs * self._stage1_occupancy_low_fraction
-            )
-            target_running = min(
-                self.max_num_running_reqs,
-                max(
-                    low_running + 1,
-                    math.ceil(
-                        self.max_num_running_reqs
-                        * self._stage1_occupancy_target_fraction
-                    ),
+            # [SC] Stage 1 has not committed remote-KV destination blocks, so
+            # the two-pass fallback may safely switch these requests to local
+            # recomputation. Stage 2 (WAITING_FOR_REMOTE_KVS) is excluded.
+            self._maybe_release_starved_stage1_requests(
+                stage1_kv_pending_requests,
+                waiting_scan_exhausted=(
+                    not self.waiting and not self.skipped_waiting
                 ),
+                made_model_progress=bool(num_scheduled_tokens),
             )
-            occupancy_underfilled = (
-                self._stage1_occupancy_fallback_enabled
-                and available_slots > 0
-                and num_running_for_slots <= low_running
-                and bool(candidates)
-                and self.connector is not None
-            )
-            now = time.monotonic()
-            if released_by_starvation:
-                self._stage1_occupancy_underfilled_since = None
-            elif occupancy_underfilled:
-                if self._stage1_occupancy_underfilled_since is None:
-                    self._stage1_occupancy_underfilled_since = now
-                underfilled_age_s = (
-                    now - self._stage1_occupancy_underfilled_since
-                )
-                if underfilled_age_s >= self._stage1_occupancy_grace_s:
-                    release_budget = min(
-                        available_slots,
-                        max(0, target_running - num_running_for_slots),
-                    )
-                    released_by_occupancy = abandon_oldest_stage1(release_budget)
-                    if released_by_occupancy:
-                        logger.warning(
-                            "[KV_STAGE1_OCCUPANCY_FALLBACK] execution occupancy "
-                            "stayed low for %.3fs; running=%d max=%d low=%d "
-                            "target=%d available_slots=%d stage1_pending_seen=%d "
-                            "abandoned=%d request_ids=%s",
-                            underfilled_age_s,
-                            num_running_for_slots,
-                            self.max_num_running_reqs,
-                            low_running,
-                            target_running,
-                            available_slots,
-                            len(unique_candidates),
-                            len(released_by_occupancy),
-                            released_by_occupancy,
-                        )
-                    # Whether candidates completed during the final recheck or
-                    # were abandoned, require another full grace interval before
-                    # the next occupancy release wave.
-                    self._stage1_occupancy_underfilled_since = None
-            else:
-                self._stage1_occupancy_underfilled_since = None
 
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:
@@ -1420,7 +1320,6 @@ class Scheduler(SchedulerInterface):
 
         if preempted_reqs or self._pause_state != PauseState.UNPAUSED:
             self._stage1_starvation_scan_streak = 0
-            self._stage1_occupancy_underfilled_since = None
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
@@ -1451,6 +1350,10 @@ class Scheduler(SchedulerInterface):
             scheduled_new_reqs.extend(scheduled_resumed_reqs)
             scheduled_resumed_reqs.clear()
 
+            # [SC] Recovery-only marker cleanup when V2 recreates worker state.
+            # https://github.com/vllm-project/vllm/issues/49250
+            # https://github.com/vllm-project/vllm/pull/49252
+            # https://github.com/vllm-project/vllm/pull/53298
             # V2 add_requests() removes any old worker state and recreates the
             # request from NewRequestData. A KV-load rewind therefore needs no
             # later CachedRequestData rewind marker for requests entering via
@@ -1807,6 +1710,10 @@ class Scheduler(SchedulerInterface):
                 req.num_output_tokens + req.num_output_placeholders
             )
 
+        # [SC] Dispatch authoritative rewind state only to requests scheduled now.
+        # https://github.com/vllm-project/vllm/issues/49250
+        # https://github.com/vllm-project/vllm/pull/49252
+        # https://github.com/vllm-project/vllm/pull/53298
         dispatched_rewinds = self.kv_rewound_req_ids.intersection(req_ids)
         rewound_all_token_ids = {
             req.request_id: list(req.all_token_ids)
@@ -2726,6 +2633,7 @@ class Scheduler(SchedulerInterface):
 
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
+        # [SC] Do not retain recovery metadata after request teardown.
         self.kv_rewound_req_ids.discard(request_id)
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
@@ -3152,6 +3060,11 @@ class Scheduler(SchedulerInterface):
             assert req_id in self.requests
             self._free_blocks(self.requests[req_id])
 
+    # [SC] Sanitize scheduler state before retrying a failed external-KV load.
+    # Upstream context:
+    # https://github.com/vllm-project/vllm/issues/49250
+    # https://github.com/vllm-project/vllm/pull/49252
+    # https://github.com/vllm-project/vllm/pull/53298
     def _mark_kv_load_rewind(self, request: Request, old_num_computed: int) -> None:
         """Record and sanitize a backward KV-load-recovery transition.
 
@@ -3261,6 +3174,7 @@ class Scheduler(SchedulerInterface):
 
                 marked_invalid_block = True
                 # Truncate the computed tokens at the first failed block.
+                # [SC] Preserve an explicit scheduler->worker rewind transition.
                 old_num_computed = request.num_computed_tokens
                 request.num_computed_tokens = idx * self.block_size
                 self._mark_kv_load_rewind(request, old_num_computed)
@@ -3283,6 +3197,7 @@ class Scheduler(SchedulerInterface):
                     total_affected_tokens += (
                         request.num_computed_tokens - req_num_computed_tokens
                     )
+                    # [SC] Same rewind protocol for shared invalid blocks.
                     old_num_computed = request.num_computed_tokens
                     request.num_computed_tokens = req_num_computed_tokens
                     self._mark_kv_load_rewind(request, old_num_computed)

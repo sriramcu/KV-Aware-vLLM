@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
+// [SC] Project-specific changes in this upstream file are marked with [SC];
+// see repo-root docs/SC_MODIFICATIONS.md for rationale and provenance.
+
 #include <pybind11/pybind11.h>
+// [SC] Bind optional fs_native per-operation worker counts.
 #include <utility>
 #include "../connector_pybind_utils.h"
 #include "connector.h"
@@ -8,6 +12,7 @@ namespace py = pybind11;
 
 PYBIND11_MODULE(lmcache_fs, m) {
   py::class_<lmcache::connector::FSConnector>(m, "LMCacheFSClient")
+      // [SC] Parse nonzero lane counts; no separate feature gate is needed.
       .def(py::init([](std::string base_path, int num_workers,
                        std::string relative_tmp_dir, bool use_odirect,
                        size_t read_ahead_size, py::object per_op_workers) {

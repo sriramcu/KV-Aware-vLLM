@@ -1,191 +1,219 @@
-"""Aggregate 32 block-tier predictions into one 512-token chunk placement.
+"""Aggregate Short-Q block predictions into one LMCache chunk placement.
 
-To change chunk aggregation later, change only `_selected_vote_policy`.
+The normal experiment configuration remains Python-native: choose the default
+vote function by changing ``_selected_vote_policy`` and change numeric knobs in
+``DEFAULT_VOTE_CONFIG``. Launchers may optionally override the policy and knobs
+through environment variables without editing this module.
+
+Policy precedence: explicit caller policy > ``GNN_CHUNK_VOTE_POLICY`` >
+``_selected_vote_policy``.
+Config precedence: explicit caller config > environment overrides >
+``DEFAULT_VOTE_CONFIG``.
 """
 
 from __future__ import annotations
 
+import os
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
+
+VALID_PLACEMENTS = ("gpu", "cpu", "disk")
 
 
-VALID_TIERS = ("L0", "L1", "L2")
-
-
-class BlockTierVote(str):
-    """String-compatible tier vote with optional block-level metadata.
-
-    The value itself is still exactly "L0", "L1", or "L2", so existing
-    policies using Counter(), equality, membership, etc. continue to work
-    unchanged.
-
-    Extra metadata is available to policies that need it.
-    """
+class BlockPlacementVote(str):
+    """String-compatible placement vote with optional block metadata."""
 
     def __new__(
         cls,
-        tier: str,
+        placement: str,
         *,
         cpu_top2: bool = False,
-    ) -> "BlockTierVote":
-        if tier not in VALID_TIERS:
-            raise ValueError(f"invalid tier: {tier}")
-
-        obj = str.__new__(cls, tier)
+    ) -> "BlockPlacementVote":
+        if placement not in VALID_PLACEMENTS:
+            raise ValueError(f"invalid placement: {placement}")
+        obj = str.__new__(cls, placement)
         obj.cpu_top2 = bool(cpu_top2)
         return obj
 
 
-def make_block_tier_vote(
-    tier: str,
+def make_block_placement_vote(
+    placement: str,
     *,
     cpu_top2: bool = False,
-) -> BlockTierVote:
-    """Construct one enriched block-tier vote."""
-    return BlockTierVote(
-        tier,
-        cpu_top2=cpu_top2,
-    )
+) -> BlockPlacementVote:
+    return BlockPlacementVote(placement, cpu_top2=cpu_top2)
 
 
-def plurality_cold_tiebreak(block_tiers: Sequence[str]) -> str:
-    """Plurality vote; ties prefer colder storage: L2 > L1 > L0."""
-    if not block_tiers:
-        raise ValueError("cannot vote an empty block tier list")
+@dataclass(frozen=True)
+class ChunkVoteConfig:
+    """Numeric knobs shared by chunk-voting policies."""
 
-    bad = [tier for tier in block_tiers if tier not in VALID_TIERS]
+    expected_blocks: int = 32
+    gpu_min: int = 8
+    cpu_min: int = 2
+    cpu_top2_min: int = 6
+
+
+# Edit this object for the normal Python-defined experiment thresholds.
+DEFAULT_VOTE_CONFIG = ChunkVoteConfig(
+    gpu_min=8,
+    cpu_min=2,
+    cpu_top2_min=6,
+)
+
+
+def _validate_votes(
+    block_placements: Sequence[str], expected_blocks: int | None
+) -> None:
+    if expected_blocks is not None and len(block_placements) != expected_blocks:
+        raise ValueError(
+            f"expected exactly {expected_blocks} block predictions for one chunk, "
+            f"got {len(block_placements)}"
+        )
+    if not block_placements:
+        raise ValueError("cannot vote an empty block placement list")
+    bad = [value for value in block_placements if value not in VALID_PLACEMENTS]
     if bad:
-        raise ValueError(f"invalid tier(s): {bad[:4]}")
+        raise ValueError(f"invalid placement(s): {bad[:4]}")
 
-    counts = Counter(block_tiers)
+
+def plurality_cold_tiebreak(
+    block_placements: Sequence[str], config: ChunkVoteConfig
+) -> str:
+    """Plurality vote; ties prefer colder storage: disk > cpu > gpu."""
+    _validate_votes(block_placements, None)
+    counts = Counter(block_placements)
     best = max(counts.values())
-
-    for tier in ("L2", "L1", "L0"):
-        if counts[tier] == best:
-            return tier
-
+    for placement in ("disk", "cpu", "gpu"):
+        if counts[placement] == best:
+            return placement
     raise AssertionError("unreachable")
 
 
-def hottest_wins(block_tiers: Sequence[str]) -> str:
-    if "L0" in block_tiers:
-        return "L0"
-
-    if "L1" in block_tiers:
-        return "L1"
-
-    return "L2"
-
-
-def gpu6_cpu5_else_l2(block_tiers: Sequence[str]) -> str:
-    """
-    Threshold promotion policy for one 512-token / 32-block chunk.
-
-    Block mapping before this function:
-        gpu       -> L0
-        cpu       -> L1
-        disk/drop -> L2
-
-    Policy:
-        >= 6 GPU/L0 blocks -> L0
-        else >= 5 CPU/L1 blocks -> L1
-        else -> L2
-
-    L0 has priority if both thresholds are satisfied.
-    """
-    if len(block_tiers) != 32:
-        raise ValueError(
-            f"expected exactly 32 block predictions for a 512-token chunk, "
-            f"got {len(block_tiers)}"
-        )
-
-    bad = [tier for tier in block_tiers if tier not in VALID_TIERS]
-    if bad:
-        raise ValueError(f"invalid tier(s): {bad[:4]}")
-
-    counts = Counter(block_tiers)
-
-    if counts["L0"] >= 6:
-        return "L0"
-
-    if counts["L1"] >= 5:
-        return "L1"
-
-    return "L2"
+def hottest_wins(block_placements: Sequence[str], config: ChunkVoteConfig) -> str:
+    """Choose the hottest placement present in the chunk."""
+    _validate_votes(block_placements, None)
+    if "gpu" in block_placements:
+        return "gpu"
+    if "cpu" in block_placements:
+        return "cpu"
+    return "disk"
 
 
-def gpu6_cpu5_cpu_top2_8_else_l2(
-    block_tiers: Sequence[str],
+def threshold(block_placements: Sequence[str], config: ChunkVoteConfig) -> str:
+    """Promote a chunk when enough argmax block votes target GPU or CPU."""
+    _validate_votes(block_placements, config.expected_blocks)
+    counts = Counter(block_placements)
+    if counts["gpu"] >= config.gpu_min:
+        return "gpu"
+    if counts["cpu"] >= config.cpu_min:
+        return "cpu"
+    return "disk"
+
+
+def threshold_with_cpu_top2(
+    block_placements: Sequence[str], config: ChunkVoteConfig
 ) -> str:
+    """Threshold policy with a CPU top-2 rescue path.
+
+    Current defaults preserve the effective policy used by the latest uploaded
+    tree: GPU argmax >= 8 -> gpu; CPU argmax >= 2 -> cpu; otherwise CPU top-2
+    >= 6 -> cpu; else disk.
     """
-    Threshold + CPU top-2 rescue policy.
+    _validate_votes(block_placements, config.expected_blocks)
+    counts = Counter(block_placements)
+    if counts["gpu"] >= config.gpu_min:
+        return "gpu"
+    if counts["cpu"] >= config.cpu_min:
+        return "cpu"
 
-    Policy:
-        >= 6 GPU/L0 argmax blocks -> L0
-        else >= 5 CPU/L1 argmax blocks -> L1
-        else CPU is top-2 for >= 8 blocks -> L1
-        else -> L2
-
-    `block_tiers` still contains the normal argmax-derived physical tier.
-    The CPU top-2 flag is attached as metadata to each BlockTierVote.
-
-    Rank score is not used.
-    """
-    if len(block_tiers) != 32:
-        raise ValueError(
-            f"expected exactly 32 block predictions for a 512-token chunk, "
-            f"got {len(block_tiers)}"
-        )
-
-    bad = [tier for tier in block_tiers if tier not in VALID_TIERS]
-    if bad:
-        raise ValueError(f"invalid tier(s): {bad[:4]}")
-
-    counts = Counter(block_tiers)
-
-    if counts["L0"] >= 8:
-        return "L0"
-
-    if counts["L1"] >= 2:
-        return "L1"
-
-    # Fail loudly if somebody tries to use this policy without the
-    # one-time top-2 metadata plumbing.
     missing_metadata = [
-        i
-        for i, tier in enumerate(block_tiers)
-        if not hasattr(tier, "cpu_top2")
+        i for i, vote in enumerate(block_placements) if not hasattr(vote, "cpu_top2")
     ]
     if missing_metadata:
         raise RuntimeError(
-            "gpu6_cpu5_cpu_top2_8_else_l2 requires enriched "
-            "BlockTierVote inputs carrying cpu_top2 metadata; "
-            f"missing metadata at block(s) {missing_metadata[:4]}"
+            "threshold_with_cpu_top2 requires BlockPlacementVote inputs carrying "
+            f"cpu_top2 metadata; missing metadata at block(s) {missing_metadata[:4]}"
         )
-
-    cpu_top2_count = sum(
-        1
-        for tier in block_tiers
-        if bool(tier.cpu_top2)
-    )
-
-    if cpu_top2_count >= 6:
-        return "L1"
-
-    return "L2"
+    if sum(bool(vote.cpu_top2) for vote in block_placements) >= config.cpu_top2_min:
+        return "cpu"
+    return "disk"
 
 
-# ----------------------------------------------------------------------
-# Edit ONLY this binding for block -> chunk aggregation experiments.
-# ----------------------------------------------------------------------
+VotePolicy = Callable[[Sequence[str], ChunkVoteConfig], str]
+POLICIES: dict[str, VotePolicy] = {
+    "plurality_cold_tiebreak": plurality_cold_tiebreak,
+    "hottest_wins": hottest_wins,
+    "threshold": threshold,
+    "threshold_with_cpu_top2": threshold_with_cpu_top2,
+}
 
-_selected_vote_policy = gpu6_cpu5_cpu_top2_8_else_l2
+# ---------------------------------------------------------------------------
+# Normal source-controlled selection point. Change only this binding to switch
+# policies in Python. GNN_CHUNK_VOTE_POLICY is an optional launcher override.
+# ---------------------------------------------------------------------------
+_selected_vote_policy: VotePolicy = threshold_with_cpu_top2
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    return default if value is None or value == "" else int(value)
+
+
+def resolve_vote_config(explicit: ChunkVoteConfig | None = None) -> ChunkVoteConfig:
+    """Resolve numeric knobs using explicit > environment > source defaults."""
+    if explicit is not None:
+        config = explicit
+    else:
+        config = replace(
+            DEFAULT_VOTE_CONFIG,
+            expected_blocks=_env_int(
+                "GNN_CHUNK_EXPECTED_BLOCKS", DEFAULT_VOTE_CONFIG.expected_blocks
+            ),
+            gpu_min=_env_int("GNN_CHUNK_GPU_MIN", DEFAULT_VOTE_CONFIG.gpu_min),
+            cpu_min=_env_int("GNN_CHUNK_CPU_MIN", DEFAULT_VOTE_CONFIG.cpu_min),
+            cpu_top2_min=_env_int(
+                "GNN_CHUNK_CPU_TOP2_MIN", DEFAULT_VOTE_CONFIG.cpu_top2_min
+            ),
+        )
+    if config.expected_blocks <= 0:
+        raise ValueError("expected_blocks must be > 0")
+    for name in ("gpu_min", "cpu_min", "cpu_top2_min"):
+        if getattr(config, name) < 0:
+            raise ValueError(f"{name} must be >= 0")
+    return config
+
+
+def resolve_vote_policy(
+    explicit: str | VotePolicy | None = None,
+) -> VotePolicy:
+    """Resolve policy using explicit > environment > source binding."""
+    if callable(explicit):
+        return explicit
+    name = explicit or os.getenv("GNN_CHUNK_VOTE_POLICY", "").strip()
+    if not name:
+        return _selected_vote_policy
+    if name not in POLICIES:
+        raise ValueError(
+            f"unknown chunk vote policy {name!r}; choose one of {sorted(POLICIES)}"
+        )
+    return POLICIES[name]
 
 
 def selected_vote_policy_name() -> str:
-    """Canonical policy name for diagnostics / experiment metadata."""
-    return _selected_vote_policy.__name__
+    return resolve_vote_policy().__name__
 
 
-def vote_chunk_placement(block_tiers: Sequence[str]) -> str:
-    return _selected_vote_policy(block_tiers)
+def selected_vote_config() -> ChunkVoteConfig:
+    return resolve_vote_config()
+
+
+def vote_chunk_placement(
+    block_placements: Sequence[str],
+    config: ChunkVoteConfig | None = None,
+    policy: str | VotePolicy | None = None,
+) -> str:
+    resolved_config = resolve_vote_config(config)
+    resolved_policy = resolve_vote_policy(policy)
+    return resolved_policy(block_placements, resolved_config)

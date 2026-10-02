@@ -55,7 +55,7 @@ LMCACHE_L1_SIZE_GB="${LMCACHE_L1_SIZE_GB:-32}"
 LMCACHE_MAX_WORKERS="${LMCACHE_MAX_WORKERS:-8}"
 LMCACHE_L2_WORKERS="${LMCACHE_L2_WORKERS:-8}"
 LMCACHE_MP_TIMEOUT="${LMCACHE_MP_TIMEOUT:-30}"
-LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT="${LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT:-}"
+LMCACHE_L2_LOAD_MAX_IN_FLIGHT="${LMCACHE_L2_LOAD_MAX_IN_FLIGHT:-${LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT:-}}"
 
 # Fresh state across ALL prior MP cache tags unless explicitly disabled.
 CLEAN_OLD_LMCACHE="${CLEAN_OLD_LMCACHE:-1}"
@@ -78,7 +78,7 @@ MAX_TOKENS="${MAX_TOKENS:-512}"
 TOP_P="${TOP_P:-0.95}"
 
 # Real project baseline: VPC enabled. Set ENABLE_VPC=0 only for targeted
-# isolation experiments later (especially during L0 validation).
+# isolation experiments later.
 ENABLE_VPC="${ENABLE_VPC:-1}"
 
 # Preserve legacy compiled-mode intent by default. Set to 1 if debugging.
@@ -448,8 +448,8 @@ LMCACHE_ARGS=(
     --max-workers "$LMCACHE_MAX_WORKERS"
     --l2-adapter "$L2_ADAPTER_JSON"
 )
-if [[ -n "$LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT" ]]; then
-    LMCACHE_ARGS+=(--l2-prefetch-max-in-flight "$LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT")
+if [[ -n "$LMCACHE_L2_LOAD_MAX_IN_FLIGHT" ]]; then
+    LMCACHE_ARGS+=(--l2-load-max-in-flight "$LMCACHE_L2_LOAD_MAX_IN_FLIGHT")
 fi
 lmcache "${LMCACHE_ARGS[@]}" > "${LOG_DIR}/lmcache.log" 2>&1 &
 

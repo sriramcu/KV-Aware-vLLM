@@ -1,6 +1,6 @@
 """Resolve request-conditioned duplicate-hash placement conflicts.
 
-Runtime metadata is intentionally only ``chunk_hash -> final tier``.  We still
+Runtime metadata is intentionally only ``chunk_hash -> final placement``.  We still
 score every request occurrence while the prediction cache is dormant, record
 conflicts in diagnostics, then use this small policy to pick the one runtime
 value for a repeated hash.

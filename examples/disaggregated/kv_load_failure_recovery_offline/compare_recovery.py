@@ -1,3 +1,4 @@
+# [SC] Recovery-regression comparator for the project KV-load rewind fix; see docs/SC_MODIFICATIONS.md.
 import json
 import sys
 

@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+# [SC] Project-specific changes in this upstream file are marked with [SC];
+# see repo-root docs/SC_MODIFICATIONS.md for rationale and provenance.
+
 import itertools
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -210,20 +213,21 @@ class KVCacheManager:
         self.prefix_cache_stats = PrefixCacheStats()
         return stats
 
+    # [SC] Apply Short-Q placement labels after upstream block allocation/cache.
     def _set_importance_for_request_blocks(self, request: Request) -> None:
         if not getattr(self.block_pool, "enable_kv_importance", False):
             return
 
-        tiers = getattr(request, "kv_importance_tiers", None)
-        if not tiers:
+        placements = getattr(request, "kv_importance_placements", None)
+        if not placements:
             return
 
         block_ids_by_group = self.get_block_ids(request.request_id)
         for group_block_ids in block_ids_by_group:
             for logical_block_idx, block_id in enumerate(group_block_ids):
-                tier = tiers.get(logical_block_idx)
-                if tier is not None:
-                    self.block_pool.set_block_importance(block_id, tier)
+                placement = placements.get(logical_block_idx)
+                if placement is not None:
+                    self.block_pool.set_block_importance(block_id, placement)
 
     def prefix_cache_lookup_enabled(self, request: Request) -> bool:
         """Whether a local prefix cache lookup may be run for this request."""
@@ -575,6 +579,7 @@ class KVCacheManager:
             request.num_tokens,
         )
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
+        # [SC] Tag newly cached request blocks with resolved placement intent.
         self._set_importance_for_request_blocks(request)
 
         return self.create_kv_cache_blocks(new_blocks)

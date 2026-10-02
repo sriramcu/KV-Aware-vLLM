@@ -1,0 +1,22 @@
+Validation performed before packaging
+=====================================
+
+1. `git diff --check` -> PASS
+2. Changed Python sources compiled -> PASS (44 files before final commit)
+3. `PYTHONPATH=. pytest -q --confcutdir=tests/kvaware tests/kvaware` -> 4 passed
+4. Bash syntax checks for modified/current launch scripts -> PASS
+5. Upstream-diff [SC] audit:
+   every changed hunk in an existing vLLM/LMCache file had a nearby `[SC]` marker -> PASS (0 missing)
+6. Retired-feature grep:
+   no project-specific occupancy fallback, old request-local importance gate,
+   or persistent-L0 configuration/runtime markers remained -> PASS
+7. Application verification:
+   - `kvaware_refactor_full.patch` applies cleanly to a fresh extraction of the uploaded latest ZIP
+   - `kvaware_refactor_core.patch` + `cleanup_obsolete_files.sh` applies cleanly
+   - both produced an exact byte/mode match to the refactored tree -> PASS
+
+Environment limitation
+----------------------
+The packaging container does not contain the built LMCache native extension/device ops,
+so the full LMCache runtime pytest suite was not executable here. Run those tests in the
+existing CodeNimbus vLLM/LMCache environment after applying the refactor.

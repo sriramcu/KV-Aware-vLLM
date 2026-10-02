@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# [SC] Project-specific changes in this upstream file are marked with [SC];
+# see repo-root docs/SC_MODIFICATIONS.md for rationale and provenance.
+
 """LookupModule: lookup, prefetch polling, and session lifecycle."""
 
 # Standard
@@ -121,6 +124,7 @@ class LookupModule:
         self._ctx = ctx
         self._prefetch_jobs: dict[str, _PrefetchJob] = {}
         self._prefetch_job_lock = threading.Lock()
+        # [SC] Optional conditional-hierarchy accounting for experiment traces.
         self._chthm_debug = os.getenv("LMCACHE_MP_CHTHM_DEBUG", "0") == "1"
         self._setup_metrics()
 
@@ -206,6 +210,8 @@ class LookupModule:
 
         num_kv_readers = key.require_num_kv_readers()
 
+        # [SC] Mutual-prefix lookups hash only the scheduler-authorized token
+        # range, preserving the vLLM-local prefix as an offset.
         chunk_hashes = self._ctx.token_hasher.compute_chunk_hashes(
             list(key.token_ids), start=key.start, end=key.end
         )
@@ -394,51 +400,41 @@ class LookupModule:
         # read-locked (see ``unfold``: full-attention groups lock the whole
         # hit prefix, sliding-window groups only its in-window suffix).
         session = self._ctx.session_manager.get_or_create(job.request_id)
+        # [SC] Session cleanup tracks absolute request chunk coordinates even
+        # when the lookup itself starts after a vLLM-local mutual prefix.
         lookup_key = session.lookup_ipc_key
         lookup_start_chunk = (
             lookup_key.start // self._ctx.chunk_size if lookup_key is not None else 0
         )
-        # Lock-release helpers operate in absolute chunk coordinates. The
-        # status result itself remains relative to the submitted lookup range.
         session.record_prefetch_result(
             lookup_start_chunk + found_count,
             tuple(range(job.attn_desc.num_object_groups)),
         )
 
-        if job.handle.l0_union_enabled:
-            # L0 union lookups may alternate L0/L1/L2 at chunk/object level,
-            # so the legacy monotonic L1-prefix/L2-suffix attribution is not
-            # meaningful. Keep the total exact and expose an explicit union
-            # flag; object-level L0 counters live in L0Manager.
-            l1_chunks = 0
-            l2_chunks = 0
-        else:
-            # ``l1_hit_chunks`` is the prefix L1 could serve on its own under
-            # each object group's window rule, so L2's contribution is however
-            # much further ``found_count`` reaches.
-            l1_chunks = job.handle.l1_hit_chunks
-            if l1_chunks > found_count:
-                logger.error(
-                    "L1 hit chunks exceed total hit chunks: "
-                    "l1=%d total=%d request=%s",
-                    l1_chunks,
-                    found_count,
-                    request_id,
-                )
-                l1_chunks = found_count
-            l2_chunks = found_count - l1_chunks
+        # ``l1_hit_chunks`` is the prefix L1 could serve on its own under each
+        # object group's window rule, so L2's contribution is however much
+        # further ``found_count`` reaches -- not a count of L1-resident keys.
+        l1_chunks = job.handle.l1_hit_chunks
+        if l1_chunks > found_count:
+            logger.error(
+                "L1 hit chunks exceed total hit chunks: l1=%d total=%d request=%s",
+                l1_chunks,
+                found_count,
+                request_id,
+            )
+            l1_chunks = found_count
+        l2_chunks = found_count - l1_chunks
 
+        # [SC] Optional source-attribution trace for scheduler-useful CHTHM.
         if self._chthm_debug:
             logger.info(
                 "[MP_CHTHM_LOOKUP] request=%s requested_tokens=%d "
-                "total_hit_tokens=%d l1_hit_tokens=%d l2_hit_tokens=%d "
-                "l0_union=%s",
+                "total_hit_tokens=%d l1_hit_tokens=%d l2_hit_tokens=%d",
                 request_id,
                 job.requested_tokens,
                 found_count * self._ctx.chunk_size,
                 l1_chunks * self._ctx.chunk_size,
                 l2_chunks * self._ctx.chunk_size,
-                job.handle.l0_union_enabled,
             )
 
         self._ctx.event_bus.publish(
@@ -451,7 +447,6 @@ class LookupModule:
                     "hit_tokens": found_count * self._ctx.chunk_size,
                     "l1_hit_tokens": l1_chunks * self._ctx.chunk_size,
                     "l2_hit_tokens": l2_chunks * self._ctx.chunk_size,
-                    "l0_union_enabled": job.handle.l0_union_enabled,
                     "early_exit_reason": job.early_exit_reason,
                     "model_name": job.model_name,
                     "cache_salt": job.cache_salt,

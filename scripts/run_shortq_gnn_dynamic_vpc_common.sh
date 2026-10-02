@@ -12,8 +12,12 @@ PREFIX_SORT_DEPTH=2
 REQUEST_ORDER_SEED=0
 WARM_ORDER="${WARM_ORDER:-reverse}"
 LMCACHE_CHUNK_SIZE=512
-LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT="${LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT:-2}"
-LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT="${LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT:-}"
+# Separate admission for fast lookup/discovery and slow L2 loads.  The old
+# LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT name is accepted here as a launcher-only
+# compatibility alias; LMCache itself now uses explicit load/lookup names.
+LMCACHE_L2_LOAD_MAX_IN_FLIGHT="${LMCACHE_L2_LOAD_MAX_IN_FLIGHT:-${LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT:-2}}"
+LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT="${LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT:-16}"
+LMCACHE_MP_MAX_INFLIGHT_STORE_GB="${LMCACHE_MP_MAX_INFLIGHT_STORE_GB:-0}"
 LMCACHE_MAX_WORKERS="${LMCACHE_MAX_WORKERS:-8}"
 LMCACHE_MP_TIMEOUT="${LMCACHE_MP_TIMEOUT:-120}"
 LMCACHE_MP_HEARTBEAT_INTERVAL="${LMCACHE_MP_HEARTBEAT_INTERVAL:-40}"
@@ -39,34 +43,25 @@ KV_STORE_BARRIER_TIMEOUT_S="${KV_STORE_BARRIER_TIMEOUT_S:-7200}"
 KV_STORE_BARRIER_POLL_S="${KV_STORE_BARRIER_POLL_S:-1}"
 KV_STORE_BARRIER_STABLE_POLLS="${KV_STORE_BARRIER_STABLE_POLLS:-5}"
 
-# Three independently gated scheduler/storage fixes. Defaults preserve the
-# pre-patch dynamic-VPC experiment except for the historical starvation
-# fallback, which was already enabled.
+# Current scheduler/cache controls.  The retired occupancy/GPU-utilization
+# fallback is intentionally absent; the remaining Stage-1 fallback is the
+# validated two-consecutive-full-scan rule.
 KV_VPC_SUFFICIENT_BYPASS="${KV_VPC_SUFFICIENT_BYPASS:-0}"
 KV_MUTUAL_PREFIX="${KV_MUTUAL_PREFIX:-0}"
 KV_STAGE1_STARVATION_FALLBACK="${KV_STAGE1_STARVATION_FALLBACK:-1}"
-KV_STAGE1_OCCUPANCY_FALLBACK="${KV_STAGE1_OCCUPANCY_FALLBACK:-0}"
-KV_STAGE1_OCCUPANCY_LOW_FRACTION="${KV_STAGE1_OCCUPANCY_LOW_FRACTION:-0.50}"
-KV_STAGE1_OCCUPANCY_TARGET_FRACTION="${KV_STAGE1_OCCUPANCY_TARGET_FRACTION:-0.875}"
-KV_STAGE1_OCCUPANCY_GRACE_S="${KV_STAGE1_OCCUPANCY_GRACE_S:-2.0}"
-KV_FS_PER_OP_WORKERS="${KV_FS_PER_OP_WORKERS:-0}"
 
-# num_workers is the shared/fallback pool once dedicated lanes exist.
-if [[ "$KV_FS_PER_OP_WORKERS" == "1" ]]; then
-  KV_FS_SHARED_WORKERS="${KV_FS_SHARED_WORKERS:-3}"
-else
-  KV_FS_SHARED_WORKERS="${KV_FS_SHARED_WORKERS:-8}"
-fi
-
+# Dedicated worker counts are self-enabling: a zero count means that operation
+# uses the shared pool.  Selected production topology is 5 shared + 1 lookup
+# + 2 retrieve workers.
+KV_FS_SHARED_WORKERS="${KV_FS_SHARED_WORKERS:-5}"
 KV_FS_LOOKUP_WORKERS="${KV_FS_LOOKUP_WORKERS:-1}"
-KV_FS_RETRIEVE_WORKERS="${KV_FS_RETRIEVE_WORKERS:-4}"
+KV_FS_RETRIEVE_WORKERS="${KV_FS_RETRIEVE_WORKERS:-2}"
 KV_FS_STORE_WORKERS="${KV_FS_STORE_WORKERS:-0}"
 KV_FS_DELETE_WORKERS="${KV_FS_DELETE_WORKERS:-0}"
 
 for name in KV_GNN_AWARE_VPC KV_GNN_L1_BACKING KV_GNN_L2_BACKING \
   KV_COLD_WARM_STORE_BARRIER KV_VPC_SUFFICIENT_BYPASS KV_MUTUAL_PREFIX \
-  KV_STAGE1_STARVATION_FALLBACK KV_STAGE1_OCCUPANCY_FALLBACK \
-  KV_FS_PER_OP_WORKERS; do
+  KV_STAGE1_STARVATION_FALLBACK; do
   value="${!name}"
   [[ "$value" == "0" || "$value" == "1" ]] || {
     echo "ERROR: $name must be 0 or 1, got $value" >&2
@@ -74,16 +69,17 @@ for name in KV_GNN_AWARE_VPC KV_GNN_L1_BACKING KV_GNN_L2_BACKING \
   }
 done
 
-"$VENV/bin/python" - "$KV_STAGE1_OCCUPANCY_LOW_FRACTION" \
-  "$KV_STAGE1_OCCUPANCY_TARGET_FRACTION" "$KV_STAGE1_OCCUPANCY_GRACE_S" \
+"$VENV/bin/python" - "$LMCACHE_L2_LOAD_MAX_IN_FLIGHT" \
+  "$LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT" "$LMCACHE_MP_MAX_INFLIGHT_STORE_GB" \
   "$KV_FS_SHARED_WORKERS" "$KV_FS_LOOKUP_WORKERS" "$KV_FS_RETRIEVE_WORKERS" \
   "$KV_FS_STORE_WORKERS" "$KV_FS_DELETE_WORKERS" <<'PY'
 import sys
-low, target, grace = map(float, sys.argv[1:4])
+load_pf, lookup_pf = map(int, sys.argv[1:3])
+store_cap_gb = float(sys.argv[3])
 shared = int(sys.argv[4])
 workers = list(map(int, sys.argv[5:]))
-assert 0 <= low < target <= 1, (low, target)
-assert grace >= 0, grace
+assert load_pf > 0 and lookup_pf > 0, (load_pf, lookup_pf)
+assert store_cap_gb >= 0, store_cap_gb
 assert shared > 0, shared
 assert all(x >= 0 for x in workers), workers
 PY
@@ -99,7 +95,7 @@ case "$PROFILE" in
     MIN_TOKENS="${MIN_TOKENS:-32}"; MAX_TOKENS="${MAX_TOKENS:-128}"
     RUN_LABEL=h100_shortq_gnn_dynamic_vpc_smoke
     L2_DIR="/scratch2/sriramc2/lmcache_mp_l2/gnn_dynamic_vpc_smoke_${SLURM_JOB_ID}"
-    SMOKE_FORCE_MIN_UNIQUE_PER_TIER="${SMOKE_FORCE_MIN_UNIQUE_PER_TIER:-2}"
+    SMOKE_FORCE_MIN_UNIQUE_PER_PLACEMENT="${SMOKE_FORCE_MIN_UNIQUE_PER_PLACEMENT:-2}"
     ;;
   h100_q650)
     CUDA_HOME=/usr/local/cuda-13.1
@@ -110,7 +106,7 @@ case "$PROFILE" in
     MIN_TOKENS=128; MAX_TOKENS=512
     RUN_LABEL=h100_shortq_gnn_dynamic_vpc_q650
     L2_DIR="/scratch2/sriramc2/lmcache_mp_l2/gnn_dynamic_vpc_q650_${SLURM_JOB_ID}"
-    SMOKE_FORCE_MIN_UNIQUE_PER_TIER=0
+    SMOKE_FORCE_MIN_UNIQUE_PER_PLACEMENT=0
     ;;
   *)
     echo "unknown KV_GNN_DYNAMIC_PROFILE=$PROFILE" >&2
@@ -151,7 +147,7 @@ RUN_DIR="$(reserve_unique_run_dir "${RUN_ROOT}/${RUN_LABEL}${RUN_LABEL_SUFFIX}_$
 LOG_DIR="${RUN_DIR}/logs"
 RESULT_DIR="${RUN_DIR}/results"
 PLACEMENT_DIR="${RUN_DIR}/placement"
-RUNTIME_METADATA="${PLACEMENT_DIR}/runtime_hash_to_tier.json"
+RUNTIME_METADATA="${PLACEMENT_DIR}/runtime_hash_to_placement.json"
 VPC_IMPORTANCE_SIDECAR="${PLACEMENT_DIR}/vpc_importance_by_request.json"
 PLACEMENT_TRACE="${PLACEMENT_DIR}/gnn_chunk_placements.jsonl"
 HASH_PREDICTION_TRACE="${PLACEMENT_DIR}/gnn_hash_prediction_occurrences.jsonl"
@@ -216,24 +212,26 @@ check_gpu_exclusivity() {
 
 check_gpu_exclusivity || exit $?
 
-GNN_CHUNK_VOTE_POLICY="$(python - <<'PY'
-from Hierarchical_KV.shortq_placement.chunk_voting import selected_vote_policy_name
-print(selected_vote_policy_name())
+GNN_CHUNK_VOTE_CONFIG_JSON="$(python - <<'PY'
+import json
+from dataclasses import asdict
+from Hierarchical_KV.shortq_placement.chunk_voting import (
+    selected_vote_config,
+    selected_vote_policy_name,
+)
+print(json.dumps({
+    "policy": selected_vote_policy_name(),
+    "config": asdict(selected_vote_config()),
+}, sort_keys=True))
 PY
 )"
-
-# Keep old fixed-L0 and historical request-local importance paths explicitly off.
-export VLLM_KV_IMPORTANCE_ENABLE=0
 export VLLM_GNN_AWARE_VPC="$KV_GNN_AWARE_VPC"
 export VLLM_GNN_AWARE_VPC_WINDOW
-export VLLM_KV_IMPORTANCE_TIERS="$VPC_IMPORTANCE_SIDECAR"
-export LMCACHE_GNN_EXCLUSIVE_PLACEMENT=0
+export VLLM_KV_IMPORTANCE_PLACEMENTS="$VPC_IMPORTANCE_SIDECAR"
 export LMCACHE_GNN_DYNAMIC_STORE=1
 export LMCACHE_GNN_L1_BACKING="$KV_GNN_L1_BACKING"
 export LMCACHE_GNN_L2_BACKING="$KV_GNN_L2_BACKING"
 export LMCACHE_GNN_PLACEMENT_METADATA="$RUNTIME_METADATA"
-export LMCACHE_L0_SMOKE_STORE=0
-export LMCACHE_L0_VPC_IMITATION=0
 
 export VLLM_KV_RECOMPUTE_DEBUG=1
 export LMCACHE_KV_ACCOUNTING_DEBUG=1
@@ -291,10 +289,11 @@ cat > "${RUN_DIR}/run_config.json" <<JSON
   "tp": $TP,
   "gpu_memory_utilization": $GPU_UTIL,
   "max_num_seqs": $MAX_SEQS,
-  "l0_enabled": false,
   "l1_gb": $L1_GB,
   "chunk_size": $LMCACHE_CHUNK_SIZE,
-  "prefetch_max_in_flight": $LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT,
+  "load_max_in_flight": $LMCACHE_L2_LOAD_MAX_IN_FLIGHT,
+  "lookup_max_in_flight": $LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT,
+  "store_max_inflight_gb": $LMCACHE_MP_MAX_INFLIGHT_STORE_GB,
   "vpc": true,
   "gnn_aware_vpc": $KV_GNN_AWARE_VPC,
   "gnn_aware_vpc_window": $VLLM_GNN_AWARE_VPC_WINDOW,
@@ -303,11 +302,6 @@ cat > "${RUN_DIR}/run_config.json" <<JSON
   "experiment_label": "$EXPERIMENT_LABEL",
   "prefix_diagnostics": $LMCACHE_MP_PREFIX_DIAGNOSTICS,
   "stage1_starvation_fallback": $KV_STAGE1_STARVATION_FALLBACK,
-  "stage1_occupancy_fallback": $KV_STAGE1_OCCUPANCY_FALLBACK,
-  "stage1_occupancy_low_fraction": $KV_STAGE1_OCCUPANCY_LOW_FRACTION,
-  "stage1_occupancy_target_fraction": $KV_STAGE1_OCCUPANCY_TARGET_FRACTION,
-  "stage1_occupancy_grace_s": $KV_STAGE1_OCCUPANCY_GRACE_S,
-  "fs_per_op_workers": $KV_FS_PER_OP_WORKERS,
   "fs_shared_workers": $KV_FS_SHARED_WORKERS,
   "fs_lookup_workers": $KV_FS_LOOKUP_WORKERS,
   "fs_retrieve_workers": $KV_FS_RETRIEVE_WORKERS,
@@ -320,11 +314,11 @@ cat > "${RUN_DIR}/run_config.json" <<JSON
   "store_barrier_poll_s": $KV_STORE_BARRIER_POLL_S,
   "store_barrier_stable_polls": $KV_STORE_BARRIER_STABLE_POLLS,
   "placement": "shortq_dynamic_vpc_plus_lower_backing",
-  "chunk_vote_policy": "$GNN_CHUNK_VOTE_POLICY",
+  "chunk_vote": $GNN_CHUNK_VOTE_CONFIG_JSON,
   "runtime_metadata": "$RUNTIME_METADATA",
   "vpc_importance_sidecar": "$VPC_IMPORTANCE_SIDECAR",
   "gnn_inference_batch_size": $GNN_INFERENCE_BATCH_SIZE,
-  "smoke_force_min_unique_per_tier": $SMOKE_FORCE_MIN_UNIQUE_PER_TIER
+  "smoke_force_min_unique_per_placement": $SMOKE_FORCE_MIN_UNIQUE_PER_PLACEMENT
 }
 JSON
 
@@ -338,22 +332,22 @@ python experiments/precompute_shortq_placements.py \
   --runtime_metadata "$RUNTIME_METADATA" --vpc_importance_sidecar "$VPC_IMPORTANCE_SIDECAR" \
   --placement_trace "$PLACEMENT_TRACE" --hash_prediction_trace "$HASH_PREDICTION_TRACE" \
   --timing_trace "$GNN_TIMING_TRACE" --summary "$PLACEMENT_SUMMARY" \
-  --smoke_force_min_unique_per_tier "$SMOKE_FORCE_MIN_UNIQUE_PER_TIER" \
+  --smoke_force_min_unique_per_placement "$SMOKE_FORCE_MIN_UNIQUE_PER_PLACEMENT" \
   > "${LOG_DIR}/gnn_precompute.log" 2>&1
 
 python - "$RUNTIME_METADATA" "$VPC_IMPORTANCE_SIDECAR" "$PLACEMENT_SUMMARY" <<'PY'
 import json, sys
 runtime=json.load(open(sys.argv[1])); sidecar=json.load(open(sys.argv[2])); summary=json.load(open(sys.argv[3]))
-assert runtime and all(v in {'L0','L1','L2'} for v in runtime.values())
+assert runtime and all(v in {'gpu','cpu','disk'} for v in runtime.values())
 assert len(sidecar) == summary['requests']
 valid={'gpu','cpu','disk'}
 assert all(all(v in valid for v in blocks.values()) for blocks in sidecar.values())
 print('placement_entries', len(runtime))
-print('tier_counts', summary['unique_runtime_tier_counts'])
+print('placement_counts', summary['unique_runtime_placement_counts'])
 print('vpc_sidecar_requests', len(sidecar))
 PY
 
-L2_JSON=$(python - "$L2_DIR" "$KV_FS_SHARED_WORKERS" "$KV_FS_PER_OP_WORKERS" \
+L2_JSON=$(python - "$L2_DIR" "$KV_FS_SHARED_WORKERS" \
   "$KV_FS_LOOKUP_WORKERS" "$KV_FS_RETRIEVE_WORKERS" \
   "$KV_FS_STORE_WORKERS" "$KV_FS_DELETE_WORKERS" <<'PY'
 import json,sys
@@ -363,29 +357,22 @@ spec = {
     'num_workers': int(sys.argv[2]),
     'use_odirect': False,
 }
-if int(sys.argv[3]):
-    names = ('lookup', 'retrieve', 'store', 'delete')
-    counts = map(int, sys.argv[4:8])
-    per_op = {name: count for name, count in zip(names, counts) if count > 0}
-    if per_op:
-        spec['per_op_workers'] = per_op
+names = ('lookup', 'retrieve', 'store', 'delete')
+counts = map(int, sys.argv[3:7])
+per_op = {name: count for name, count in zip(names, counts) if count > 0}
+if per_op:
+    spec['per_op_workers'] = per_op
 print(json.dumps(spec))
 PY
 )
 echo "fs_native adapter: $L2_JSON"
 
-LMCACHE_LOOKUP_PF_ARGS=()
-if [[ -n "$LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT" ]]; then
-  LMCACHE_LOOKUP_PF_ARGS+=(
-    --l2-lookup-max-in-flight "$LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT"
-  )
-fi
-
-echo "===== START LMCACHE (L0 OFF) ====="
+echo "===== START LMCACHE ====="
 lmcache server --host localhost --port 5556 --chunk-size "$LMCACHE_CHUNK_SIZE" \
   --l1-size-gb "$L1_GB" \
-  --l2-prefetch-max-in-flight "$LMCACHE_L2_PREFETCH_MAX_IN_FLIGHT" \
-  "${LMCACHE_LOOKUP_PF_ARGS[@]}" \
+  --l2-load-max-in-flight "$LMCACHE_L2_LOAD_MAX_IN_FLIGHT" \
+  --l2-lookup-max-in-flight "$LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT" \
+  --l2-store-max-inflight-gb "$LMCACHE_MP_MAX_INFLIGHT_STORE_GB" \
   --l2-store-policy gnn_dynamic --eviction-policy LRU --max-workers "$LMCACHE_MAX_WORKERS" \
   --l2-adapter "$L2_JSON" > "${LOG_DIR}/lmcache.log" 2>&1 &
 LMCACHE_PID=$!
@@ -393,10 +380,8 @@ wait_tcp 5556 "$LMCACHE_PID" 240 || { tail -200 "${LOG_DIR}/lmcache.log"; exit 3
 curl -sf http://127.0.0.1:8080/metrics > "${RUN_DIR}/lmcache_metrics_before.txt" || true
 
 KV_CONFIG=$(python - "$LMCACHE_MP_TIMEOUT" "$LMCACHE_MP_HEARTBEAT_INTERVAL" \
-  "$KV_STAGE1_STARVATION_FALLBACK" "$KV_STAGE1_OCCUPANCY_FALLBACK" \
-  "$KV_STAGE1_OCCUPANCY_LOW_FRACTION" \
-  "$KV_STAGE1_OCCUPANCY_TARGET_FRACTION" "$KV_STAGE1_OCCUPANCY_GRACE_S" \
-  "$KV_VPC_SUFFICIENT_BYPASS" "$KV_MUTUAL_PREFIX" <<'PY'
+  "$KV_STAGE1_STARVATION_FALLBACK" "$KV_VPC_SUFFICIENT_BYPASS" \
+  "$KV_MUTUAL_PREFIX" <<'PY'
 import json,sys
 timeout=float(sys.argv[1])
 heartbeat_interval=float(sys.argv[2])
@@ -412,12 +397,8 @@ print(json.dumps({
     'lmcache.mp.heartbeat_interval':heartbeat_interval,
     'lmcache.mp.lookup_timeout':0.0,
     'lmcache.mp.starvation_fallback':bool(int(sys.argv[3])),
-    'lmcache.mp.occupancy_fallback':bool(int(sys.argv[4])),
-    'lmcache.mp.occupancy_low_fraction':float(sys.argv[5]),
-    'lmcache.mp.occupancy_target_fraction':float(sys.argv[6]),
-    'lmcache.mp.occupancy_grace_s':float(sys.argv[7]),
-    'lmcache.mp.vpc_sufficient_bypass':bool(int(sys.argv[8])),
-    'lmcache.mp.mutual_prefix':bool(int(sys.argv[9])),
+    'lmcache.mp.vpc_sufficient_bypass':bool(int(sys.argv[4])),
+    'lmcache.mp.mutual_prefix':bool(int(sys.argv[5])),
   },
 }))
 PY
@@ -501,18 +482,17 @@ if l2_backing:
     assert re.search(r'\[GNN_DYNAMIC_L2_POLICY\].*backing_targets=[1-9]\d*.*l2_backing=True', lm), \
         'GNN L2 backing enabled but no GPU/L1 placement was targeted for L2 backing'
 assert '[GNN_PLACEMENT_METADATA_MISS]' not in lm, 'placement metadata miss detected'
-assert 'Initialized LMCache L0 arena' not in lm, 'L0 unexpectedly initialized'
 if aware:
     assert '[GNN_AWARE_VPC_INIT]' in vl, 'GNN-aware VPC was requested but not initialized'
 else:
     assert '[GNN_AWARE_VPC_INIT]' not in vl, 'GNN-aware VPC initialized while gate is off'
 
 if profile.endswith('_smoke'):
-    counts=placement['unique_runtime_tier_counts']
-    assert all(counts.get(t,0) >= 2 for t in ('L0','L1','L2')), counts
+    counts=placement['unique_runtime_placement_counts']
+    assert all(counts.get(t,0) >= 2 for t in ('gpu','cpu','disk')), counts
     if aware:
         for tier in ('gpu','cpu','disk'):
-            assert f'[GNN_AWARE_VPC_LABEL] first_tier={tier}' in vl, f'missing VPC label {tier}'
+            assert f'[GNN_AWARE_VPC_LABEL] first_placement={tier}' in vl, f'missing VPC label {tier}'
     if backing:
         assert re.search(r'\[GNN_DYNAMIC_STORE\].*l1_backing=True.*reserved_gpu=[1-9]\d*', lm), \
             'smoke never physically created an L1 backing copy for a GPU-labelled chunk'

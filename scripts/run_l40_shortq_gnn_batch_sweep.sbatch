@@ -62,12 +62,12 @@ for BS in "${BATCHES[@]}"; do
     --max_seq_len 8000 \
     --device cuda:0 \
     --inference_batch_size "$BS" \
-    --runtime_metadata "${OUT}/runtime_hash_to_tier.json" \
+    --runtime_metadata "${OUT}/runtime_hash_to_placement.json" \
     --placement_trace "${OUT}/gnn_chunk_placements.jsonl" \
     --hash_prediction_trace "${OUT}/gnn_hash_prediction_occurrences.jsonl" \
     --timing_trace "${OUT}/gnn_prediction_timing.jsonl" \
     --summary "${OUT}/gnn_placement_summary.json" \
-    --smoke_force_min_unique_per_tier 0 \
+    --smoke_force_min_unique_per_placement 0 \
     > "${OUT}/precompute.log" 2>&1
   RC=$?
   set -e
@@ -79,9 +79,9 @@ for BS in "${BATCHES[@]}"; do
   fi
 
   if [[ -z "$REF_METADATA" ]]; then
-    REF_METADATA="${OUT}/runtime_hash_to_tier.json"
+    REF_METADATA="${OUT}/runtime_hash_to_placement.json"
     MATCH=yes
-  elif cmp -s "$REF_METADATA" "${OUT}/runtime_hash_to_tier.json"; then
+  elif cmp -s "$REF_METADATA" "${OUT}/runtime_hash_to_placement.json"; then
     MATCH=yes
   else
     MATCH=NO
