@@ -7,8 +7,8 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
 #SBATCH --time=03:00:00
-#SBATCH --output=/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/logs/%x_%j.out
-#SBATCH --error=/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/logs/%x_%j.err
+#SBATCH --output=/mnt/shared/gpfs/home/sriramc2/runs/kvaware/%x_%j.out
+#SBATCH --error=/mnt/shared/gpfs/home/sriramc2/runs/kvaware/%x_%j.err
 set -Eeuo pipefail
 
 # Standalone Short-Q precompute/inference sweep ONLY.
@@ -18,7 +18,7 @@ set -Eeuo pipefail
 REPO=/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
 VENV=/mnt/shared/gpfs/home/sriramc2/venvs/kvaware-vllm029
 CUDA_HOME=/usr/local/cuda-13.1
-RUN_ROOT=/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro
+RUN_ROOT=/mnt/shared/gpfs/home/sriramc2/runs/kvaware
 
 BATCH_CSV="${1:-1,2,4,8,16}"
 NUM_QUESTIONS="${2:-96}"
@@ -30,7 +30,7 @@ SERVING_MODEL="${SERVING_MODEL:-meta-llama/Llama-3.3-70B-Instruct}"
 CHECKPOINT="${REPO}/Hierarchical_KV/shortq_placement/model.pt"
 
 SWEEP_DIR="${RUN_ROOT}/h100_shortq_gnn_batch_sweep_${SLURM_JOB_ID}"
-mkdir -p "$SWEEP_DIR" "${RUN_ROOT}/logs"
+mkdir -p "$SWEEP_DIR"
 
 cd "$REPO"
 source "${VENV}/bin/activate"

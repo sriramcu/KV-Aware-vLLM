@@ -6,8 +6,8 @@
 #SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=16
 #SBATCH --time=06:00:00
-#SBATCH --output=/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/logs/%x_%j.out
-#SBATCH --error=/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/logs/%x_%j.err
+#SBATCH --output=/mnt/shared/gpfs/home/sriramc2/runs/kvaware/%x_%j.out
+#SBATCH --error=/mnt/shared/gpfs/home/sriramc2/runs/kvaware/%x_%j.err
 
 set -Eeuo pipefail
 
@@ -21,7 +21,7 @@ CUDA_HOME=/usr/local/cuda-13.1
 
 LINEARRAG_ROOT="${REPO}/Hierarchical_KV/LinearRAG"
 
-RUN_ROOT=/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro
+RUN_ROOT=/mnt/shared/gpfs/home/sriramc2/runs/kvaware
 RUN_DIR="${RUN_ROOT}/h100_mp_nognn_notimeouts_${SLURM_JOB_ID}"
 LOG_DIR="${RUN_DIR}/logs"
 RESULT_DIR="${RUN_DIR}/results"

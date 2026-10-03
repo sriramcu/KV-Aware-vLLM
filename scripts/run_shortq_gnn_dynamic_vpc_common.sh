@@ -4,7 +4,7 @@ set -Eeuo pipefail
 PROFILE="${KV_GNN_DYNAMIC_PROFILE:?wrapper must set KV_GNN_DYNAMIC_PROFILE}"
 REPO=/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
 VENV=/mnt/shared/gpfs/home/sriramc2/venvs/kvaware-vllm029
-RUN_ROOT=/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro
+RUN_ROOT=/mnt/shared/gpfs/home/sriramc2/runs/kvaware
 DATASET_NAME=medical
 RETRIEVAL_TOP_K=5
 REQUEST_ORDER=legacy_prefix_hash

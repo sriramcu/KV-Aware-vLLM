@@ -6,8 +6,8 @@
 #SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=16
 #SBATCH --time=06:00:00
-#SBATCH --output=/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/logs/%x_%j.out
-#SBATCH --error=/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/logs/%x_%j.err
+#SBATCH --output=/mnt/shared/gpfs/home/sriramc2/runs/kvaware/%x_%j.out
+#SBATCH --error=/mnt/shared/gpfs/home/sriramc2/runs/kvaware/%x_%j.err
 
 set -Eeuo pipefail
 
@@ -21,7 +21,7 @@ CUDA_HOME=/usr/local/cuda-13.1
 
 LINEARRAG_ROOT="${REPO}/Hierarchical_KV/LinearRAG"
 
-RUN_ROOT=/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro
+RUN_ROOT=/mnt/shared/gpfs/home/sriramc2/runs/kvaware
 GRID_LABEL="${GRID_LABEL:-l1_${LMCACHE_L1_SIZE_GB:-200}_lpf_${LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT:-16}_gpf_${LMCACHE_L2_LOAD_MAX_IN_FLIGHT:-2}}"
 
 # Interactive reruns inside one srun allocation reuse SLURM_JOB_ID. Reserve a
