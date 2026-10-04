@@ -10,6 +10,7 @@ Distributed multi-tier storage manager for MP mode
 from contextlib import contextmanager
 from dataclasses import replace
 from typing import Iterator, Literal, Optional
+import os
 import threading
 import time
 
@@ -589,9 +590,39 @@ class StorageManager:
 
         if not l1_only and remaining_keys:
             prefetch_request_id = self._prefetch_controller.submit_prefetch_request(
-                replace(spec, keys=remaining_keys)
+                replace(
+                    spec,
+                    keys=remaining_keys,
+                    # [SC] PrefetchController sees only the suffix after the
+                    # first all-L1 prefix.  Preserve the prefix/total counts so
+                    # its raw CHTHM record can describe the whole MP lookup.
+                    initial_l1_hit_chunks=l1_hit_chunks,
+                    total_requested_chunks=num_chunks,
+                )
             )
             l2_orig_indices = tuple(range(l1_key_boundary, len(keys)))
+        elif (
+            os.getenv("LMCACHE_MP_CHTHM_DEBUG", "0") == "1"
+            and spec.external_request_id
+            and spec.token_chunk_size > 0
+        ):
+            # [SC] All-L1 (or deliberately L1-only) lookups never enter the
+            # PrefetchController, so emit their raw hierarchy record here.
+            # Missing suffix chunks remain explicit misses when L2 was skipped.
+            miss_chunks = max(0, num_chunks - l1_hit_chunks)
+            source_map = "C" * l1_hit_chunks + "M" * miss_chunks
+            logger.info(
+                "[MP_CHTHM_RAW] request=%s chunk_size=%d requested_chunks=%d "
+                "reachable_prefix_chunks=%d l1_hit_chunks=%d l2_hit_chunks=0 "
+                "miss_chunks=%d source_map=%s",
+                spec.external_request_id,
+                spec.token_chunk_size,
+                num_chunks,
+                l1_hit_chunks,
+                l1_hit_chunks,
+                miss_chunks,
+                source_map,
+            )
 
         submit_time = time.monotonic()
         logger.debug(

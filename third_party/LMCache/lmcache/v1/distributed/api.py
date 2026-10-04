@@ -441,11 +441,32 @@ class PrefetchRequestSpec:
     attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC
     mode: PrefetchMode = PrefetchMode.LOOKUP
 
+    # [SC] Optional end-to-end raw CHTHM metadata.  These fields are filled by
+    # the MP lookup path before StorageManager trims the already-L1 prefix and
+    # submits only the unresolved suffix to PrefetchController.  Keeping them
+    # on the immutable request spec lets the controller emit raw hierarchy
+    # availability as soon as EXISTS completes, before any L2->L1 staging or
+    # scheduler admission can erase a physically present hit.
+    external_request_id: str = ""
+    token_chunk_size: int = 0
+    initial_l1_hit_chunks: int = 0
+    total_requested_chunks: int = 0
+
     def __post_init__(self) -> None:
         if self.num_kv_readers < 1:
             raise ValueError(
                 f"PrefetchRequestSpec: num_kv_readers={self.num_kv_readers} "
                 "must be >= 1 (total read locks per key)"
+            )
+        if self.token_chunk_size < 0:
+            raise ValueError("PrefetchRequestSpec: token_chunk_size must be >= 0")
+        if self.initial_l1_hit_chunks < 0:
+            raise ValueError(
+                "PrefetchRequestSpec: initial_l1_hit_chunks must be >= 0"
+            )
+        if self.total_requested_chunks < 0:
+            raise ValueError(
+                "PrefetchRequestSpec: total_requested_chunks must be >= 0"
             )
         # A caller prefetching a SUBSET of the groups narrows attn_desc, so
         # extra layout entries are harmless; too FEW is the real mistake.

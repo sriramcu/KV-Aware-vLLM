@@ -217,6 +217,14 @@ class InFlightPrefetchRequest:
     loaded keys permanent and acquires no read lock; ``LOOKUP`` defers
     retention to the policy and read-locks loaded keys."""
 
+    # [SC] Raw CHTHM identity/geometry for the original MP lookup.  The
+    # controller normally sees only the suffix after StorageManager's initial
+    # all-L1 prefix; these fields let it reconstruct and log the full lookup.
+    external_request_id: str = ""
+    token_chunk_size: int = 0
+    initial_l1_hit_chunks: int = 0
+    total_requested_chunks: int = 0
+
     # Lookup phase: adapter_idx -> task_id (removed as results arrive)
     pending_lookup_tasks: dict[int, L2TaskId] = field(default_factory=dict)
     # Lookup phase: adapter_idx -> bitmap (populated as results arrive)
@@ -337,6 +345,9 @@ class PrefetchController(StorageControllerInterface):
         self._congestion_debug = (
             os.getenv("LMCACHE_MP_CONGESTION_DEBUG", "0") == "1"
         )
+        # [SC] Raw hierarchy accounting is emitted at lookup/EXISTS completion,
+        # before any L2->L1 staging, load queueing, or scheduler admission.
+        self._chthm_debug = os.getenv("LMCACHE_MP_CHTHM_DEBUG", "0") == "1"
         self._prefix_diag = (
             os.getenv("LMCACHE_MP_PREFIX_DIAGNOSTICS", "0") == "1"
         )
@@ -988,6 +999,10 @@ class PrefetchController(StorageControllerInterface):
             policy=spec.policy,
             attn_desc=spec.attn_desc,
             mode=spec.mode,
+            external_request_id=spec.external_request_id,
+            token_chunk_size=spec.token_chunk_size,
+            initial_l1_hit_chunks=spec.initial_l1_hit_chunks,
+            total_requested_chunks=spec.total_requested_chunks,
             group_layout_descs=spec.group_layout_descs,
             l1_readlocks=l1_readlocks,
             submitted_at=submitted_at,
@@ -1105,15 +1120,20 @@ class PrefetchController(StorageControllerInterface):
             request.attn_desc,
         )
 
-        # [SC] Diagnose prefix holes from already-captured state; no extra I/O.
-        if self._prefix_diag:
+        # [SC] Raw CHTHM is physical hierarchy availability at lookup time,
+        # before L2->L1 staging/load.  Count every logical chunk independently
+        # rather than truncating source attribution at the first prefix hole.
+        # A chunk is CPU/L1 if every rank/object-group shard is in L1; otherwise
+        # it is disk/L2 if L1 U L2 completes the chunk; otherwise it is a miss.
+        # This intentionally differs from ``hit_length`` below, which remains a
+        # contiguous-prefix/reachability quantity used by the serving path.
+        raw_l2: Bitmap | None = None
+        physical_union: Bitmap | None = None
+        physical_prefix_chunks = 0
+        stride = request.attn_desc.num_object_groups * request.attn_desc.world_size
+        num_chunks = num_keys // stride if stride else 0
+        if self._chthm_debug or self._prefix_diag:
             raw_l2 = merge_bitmaps(request.lookup_results.values(), num_keys)
-            pending_store = merge_bitmaps(
-                request.lookup_pending_store.values(), num_keys
-            )
-            ever_stored = merge_bitmaps(
-                request.lookup_ever_stored.values(), num_keys
-            )
             physical_union = raw_l2 | request.l1_readlocks
             physical_prefix_chunks, _ = build_trim_mask(
                 physical_union,
@@ -1121,11 +1141,84 @@ class PrefetchController(StorageControllerInterface):
                 request.policy,
                 request.attn_desc,
             )
-            stride = (
-                request.attn_desc.num_object_groups
-                * request.attn_desc.world_size
+
+        if (
+            self._chthm_debug
+            and request.external_request_id
+            and request.token_chunk_size > 0
+            and raw_l2 is not None
+            and physical_union is not None
+        ):
+            suffix_sources: list[str] = []
+            suffix_l1_chunks = 0
+            suffix_l2_chunks = 0
+            suffix_miss_chunks = 0
+            for chunk in range(num_chunks):
+                start = chunk * stride
+                end = min(start + stride, num_keys)
+                l1_complete = start < end and all(
+                    request.l1_readlocks.test(i) for i in range(start, end)
+                )
+                hierarchy_complete = start < end and all(
+                    physical_union.test(i) for i in range(start, end)
+                )
+                if l1_complete:
+                    suffix_sources.append("C")
+                    suffix_l1_chunks += 1
+                elif hierarchy_complete:
+                    suffix_sources.append("D")
+                    suffix_l2_chunks += 1
+                else:
+                    suffix_sources.append("M")
+                    suffix_miss_chunks += 1
+
+            initial_l1 = request.initial_l1_hit_chunks
+            total_requested = request.total_requested_chunks or (
+                initial_l1 + num_chunks
             )
-            num_chunks = num_keys // stride if stride else 0
+            source_map = "C" * initial_l1 + "".join(suffix_sources)
+            # Be fail-visible if a future caller provides inconsistent geometry
+            # rather than silently emitting a misleading denominator.
+            if len(source_map) != total_requested:
+                logger.warning(
+                    "Raw CHTHM geometry mismatch request=%s map_chunks=%d "
+                    "total_requested_chunks=%d initial_l1_chunks=%d suffix_chunks=%d",
+                    request.external_request_id or request.request_id,
+                    len(source_map),
+                    total_requested,
+                    initial_l1,
+                    num_chunks,
+                )
+                total_requested = len(source_map)
+
+            l1_chunks = initial_l1 + suffix_l1_chunks
+            l2_chunks = suffix_l2_chunks
+            miss_chunks = suffix_miss_chunks
+            reachable_prefix_chunks = initial_l1 + physical_prefix_chunks
+            logger.info(
+                "[MP_CHTHM_RAW] request=%s chunk_size=%d requested_chunks=%d "
+                "reachable_prefix_chunks=%d l1_hit_chunks=%d l2_hit_chunks=%d "
+                "miss_chunks=%d source_map=%s",
+                request.external_request_id or str(request.request_id),
+                request.token_chunk_size,
+                total_requested,
+                reachable_prefix_chunks,
+                l1_chunks,
+                l2_chunks,
+                miss_chunks,
+                source_map,
+            )
+
+        # [SC] Diagnose prefix holes from already-captured state; no extra I/O.
+        if self._prefix_diag:
+            assert raw_l2 is not None
+            assert physical_union is not None
+            pending_store = merge_bitmaps(
+                request.lookup_pending_store.values(), num_keys
+            )
+            ever_stored = merge_bitmaps(
+                request.lookup_ever_stored.values(), num_keys
+            )
             first_gap_chunk = (
                 physical_prefix_chunks
                 if physical_prefix_chunks < num_chunks

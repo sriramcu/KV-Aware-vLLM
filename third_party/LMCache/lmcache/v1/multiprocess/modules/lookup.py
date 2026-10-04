@@ -309,6 +309,12 @@ class LookupModule:
                 group_layout_descs=group_layout_descs,
                 num_kv_readers=num_kv_readers,
                 attn_desc=attn_desc,
+                # [SC] Carry the token/request identity down to the lookup
+                # controller so raw CHTHM can be emitted at EXISTS completion,
+                # before staging/load success affects the answer.
+                external_request_id=key.request_id,
+                token_chunk_size=self._ctx.chunk_size,
+                total_requested_chunks=len(chunk_hashes),
             ),
             external_request_id=key.request_id,
         )

@@ -22,10 +22,16 @@ LOOKUP_RE = re.compile(
     r"\[MP_CHTHM_LOOKUP\] request=(\S+) requested_tokens=(\d+) "
     r"total_hit_tokens=(\d+) l1_hit_tokens=(\d+) l2_hit_tokens=(\d+)"
 )
+RAW_RE = re.compile(
+    r"\[MP_CHTHM_RAW\] request=(\S+) chunk_size=(\d+) "
+    r"requested_chunks=(\d+) reachable_prefix_chunks=(\d+) "
+    r"l1_hit_chunks=(\d+) l2_hit_chunks=(\d+) miss_chunks=(\d+) "
+    r"source_map=([CDM]*)"
+)
 ADMIT_RE = re.compile(
     r"\[MP_CHTHM_ADMIT\] request=(\S+) decision=(\S+) prompt_tokens=(\d+) "
     r"vllm_hit_tokens=(\d+) lmcache_hit_tokens=(\d+) external_load_tokens=(\d+) "
-    r"lookup_age_s=([0-9.]+)"
+    r"(?:lookup_start_tokens=\d+ )?lookup_age_s=([0-9.]+)"
 )
 MUTUAL_PREFIX_RE = re.compile(
     r"\[MP_MUTUAL_PREFIX_LOOKUP\] request=(\S+) prompt_tokens=(\d+) "
@@ -106,14 +112,21 @@ def overlap(a0: int, a1: int, b0: int, b1: int) -> int:
 
 
 def source_token_counts(raw: dict, start: int, end: int) -> dict[str, int]:
-    """Attribute a requested interval to the monotonic L1-prefix/L2-extension plan."""
-    out = {"L1": 0, "L2": 0}
+    """Attribute an interval to the per-chunk physical hierarchy source map."""
+    out = {"L1": 0, "L2": 0, "MISS": 0}
     cs = raw["chunk_size"]
     offset = raw.get("start_token", 0)
     for i, tier in enumerate(raw["source_tiers"]):
         chunk_start = offset + i * cs
         out[tier] += overlap(start, end, chunk_start, chunk_start + cs)
     return out
+
+
+def reachable_prefix_tokens(raw: dict, start: int, end: int) -> int:
+    """Overlap ``[start,end)`` with the hierarchy's contiguous reachable prefix."""
+    prefix_start = raw.get("start_token", 0)
+    prefix_end = prefix_start + raw.get("reachable_prefix_chunks", 0) * raw["chunk_size"]
+    return overlap(start, end, prefix_start, prefix_end)
 
 
 def main() -> None:
@@ -125,6 +138,7 @@ def main() -> None:
     args = ap.parse_args()
 
     lookups: dict[str, dict] = {}
+    raw_lookups: dict[str, dict] = {}
     qwait: list[float] = []
     lookup_s: list[float] = []
     total_s: list[float] = []
@@ -135,6 +149,17 @@ def main() -> None:
     lifetimes: list[float] = []
 
     for line in lines(args.lmcache_log):
+        if m := RAW_RE.search(line):
+            source_map = m.group(8)
+            raw_lookups[m.group(1)] = {
+                "chunk_size": int(m.group(2)),
+                "requested_chunks": int(m.group(3)),
+                "reachable_prefix_chunks": int(m.group(4)),
+                "l1_hit_chunks": int(m.group(5)),
+                "l2_hit_chunks": int(m.group(6)),
+                "miss_chunks": int(m.group(7)),
+                "source_map": source_map,
+            }
         if m := LOOKUP_RE.search(line):
             lookups[m.group(1)] = {
                 "requested": int(m.group(2)),
@@ -193,22 +218,51 @@ def main() -> None:
             recovery_waves += 1
             recovered_request_events += int(m.group(1))
 
-    # Current MP_CHTHM_LOOKUP records describe a monotonic L1 prefix followed
-    # by the additional prefix extension found in L2. Under mutual prefix, the
-    # lookup range begins after the vLLM-local prefix, so preserve that offset.
+    # New MP_CHTHM_RAW records describe physical per-chunk L1/L2 availability
+    # immediately after lookup/EXISTS, before staging/load.  They intentionally
+    # include hits after a prefix hole.  Fall back to the legacy post-load
+    # monotonic MP_CHTHM_LOOKUP record only for old archives.
     raw: dict[str, dict] = {}
     chunk_size = 512
+    for rid, rec in raw_lookups.items():
+        cs = rec["chunk_size"]
+        tiers = {"C": "L1", "D": "L2", "M": "MISS"}
+        source_tiers = [tiers[ch] for ch in rec["source_map"]]
+        raw[rid] = {
+            "chunk_size": cs,
+            "requested_chunks": rec["requested_chunks"],
+            "total_hit_chunks": rec["l1_hit_chunks"] + rec["l2_hit_chunks"],
+            "l1_hit_chunks": rec["l1_hit_chunks"],
+            "l2_hit_chunks": rec["l2_hit_chunks"],
+            "miss_chunks": rec["miss_chunks"],
+            "reachable_prefix_chunks": rec["reachable_prefix_chunks"],
+            "source_tiers": source_tiers,
+            "start_token": mutual_lookup_starts.get(rid, 0),
+            "source": "MP_CHTHM_RAW",
+        }
+
     for rid, rec in lookups.items():
+        if rid in raw:
+            continue
         l1_chunks = rec["l1"] // chunk_size
         l2_chunks = rec["l2"] // chunk_size
+        requested_chunks = rec["requested"] // chunk_size
+        miss_chunks = max(0, requested_chunks - l1_chunks - l2_chunks)
         raw[rid] = {
             "chunk_size": chunk_size,
-            "requested_chunks": rec["requested"] // chunk_size,
+            "requested_chunks": requested_chunks,
             "total_hit_chunks": rec["total"] // chunk_size,
             "l1_hit_chunks": l1_chunks,
             "l2_hit_chunks": l2_chunks,
-            "source_tiers": ["L1"] * l1_chunks + ["L2"] * l2_chunks,
+            "miss_chunks": miss_chunks,
+            "reachable_prefix_chunks": l1_chunks + l2_chunks,
+            "source_tiers": (
+                ["L1"] * l1_chunks
+                + ["L2"] * l2_chunks
+                + ["MISS"] * miss_chunks
+            ),
             "start_token": mutual_lookup_starts.get(rid, 0),
+            "source": "MP_CHTHM_LOOKUP_LEGACY",
         }
 
     phases = phase_map(args.results_dir)
@@ -233,6 +287,7 @@ def main() -> None:
                 "l1_hit_tokens": 0,
                 "l2_hit_tokens": 0,
                 "known_hierarchy_miss_tokens": 0,
+                "reachable_external_prefix_tokens": 0,
                 "raw_external_opportunity_tokens": 0,
                 "observed_external_opportunity_tokens": 0,
                 "unobserved_external_opportunity_tokens": 0,
@@ -265,8 +320,10 @@ def main() -> None:
             src = source_token_counts(rr, vpc, chunk_addressable)
             rb["l1_hit_tokens"] += src["L1"]
             rb["l2_hit_tokens"] += src["L2"]
-            known_hit = src["L1"] + src["L2"]
-            rb["known_hierarchy_miss_tokens"] += max(0, external_opportunity - known_hit)
+            rb["known_hierarchy_miss_tokens"] += src["MISS"]
+            rb["reachable_external_prefix_tokens"] += reachable_prefix_tokens(
+                rr, vpc, chunk_addressable
+            )
         else:
             rb["unobserved_external_opportunity_tokens"] += external_opportunity
 
@@ -310,6 +367,11 @@ def main() -> None:
         bucket["known_hierarchy_miss_pct_all_prompt_lower_bound"] = (
             100.0 * bucket["known_hierarchy_miss_tokens"] / total if total else 0.0
         )
+        bucket["reachable_external_prefix_pct_all_prompt_lower_bound"] = (
+            100.0 * bucket["reachable_external_prefix_tokens"] / total
+            if total
+            else 0.0
+        )
         bucket["rates_exact"] = bucket["unobserved_external_opportunity_tokens"] == 0
 
     for bucket in useful_b.values():
@@ -344,8 +406,10 @@ def main() -> None:
             "disk/L2 hit is conditional on GPU+CPU miss; hierarchy miss/recompute is over all prompt tokens."
         ),
         "observation_note": (
-            "Raw tier rates are lower bounds when raw_external_observation_coverage_pct < 100. "
-            "Useful contribution is scheduler-consumed KV and remains exact from MP_CHTHM_ADMIT."
+            "MP_CHTHM_RAW is pre-load physical per-chunk hierarchy availability; "
+            "reachable_external_prefix is a separate contiguous-prefix metric. "
+            "Raw tier rates remain lower bounds when raw_external_observation_coverage_pct < 100. "
+            "Useful contribution is scheduler-consumed KV and remains separate."
         ),
         "freshness_guard": {
             "trigger_count": len(freshness),
@@ -378,7 +442,9 @@ def main() -> None:
             "native_pending_load": dist(pending["load"]),
             "native_pending_total": dist(pending["total"]),
         },
-        "lookup_records": len(lookups),
+        "raw_lookup_records": len(raw_lookups),
+        "legacy_lookup_records": len(lookups),
+        "lookup_records_used": len(raw),
         "scheduler_admit_records": len(admits),
     }
 

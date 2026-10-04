@@ -701,14 +701,17 @@ def wait_for_lmcache_store_barrier(
     timeout_s: float,
     poll_s: float,
     stable_polls: int,
+    stall_s: float,
 ) -> dict[str, Any]:
-    """Wait until cold-phase host writes and L2 stores are fully drained.
+    """Best-effort cold->warm store barrier with a no-progress escape hatch.
 
-    A single zero observation is not sufficient because worker-side GPU->L1
-    commits can arrive shortly after the cold HTTP responses have completed.
-    The barrier therefore requires the LMCache store controller to have no
-    listener backlog, no in-flight L2 store tasks, and no L1 write-locked
-    objects for ``stable_polls`` consecutive observations.
+    The preferred path still waits for listener backlog, in-flight L2 stores,
+    and L1 write locks to remain at zero.  The barrier is deliberately not a
+    liveness dependency, though: if the observable store state makes no
+    progress for ``stall_s`` seconds (or the overall timeout expires), record
+    the degraded state and continue to warm instead of hanging/failing the
+    experiment.  Terminal failed-store counters are also recorded rather than
+    treated as a reason to abort the workload.
     """
     if timeout_s <= 0:
         raise ValueError("store barrier timeout must be > 0")
@@ -716,29 +719,89 @@ def wait_for_lmcache_store_barrier(
         raise ValueError("store barrier poll interval must be > 0")
     if stable_polls < 1:
         raise ValueError("store barrier stable_polls must be >= 1")
+    if stall_s < 0:
+        raise ValueError("store barrier stall timeout must be >= 0")
 
     started = time.monotonic()
+    last_progress_at = started
+    last_signature: tuple[int, int, int, int, int] | None = None
     stable = 0
     polls = 0
     peak_pending = 0
     peak_in_flight = 0
     peak_write_locked = 0
     last_status: dict[str, Any] | None = None
+    warned_failed = False
     log_every_polls = max(1, int(round(30.0 / poll_s)))
 
     print(
         "[SC_STORE_BARRIER_START] "
         f"url={status_url} timeout_s={timeout_s:.1f} "
-        f"poll_s={poll_s:.2f} stable_polls={stable_polls}",
+        f"poll_s={poll_s:.2f} stable_polls={stable_polls} "
+        f"stall_s={stall_s:.1f}",
         flush=True,
     )
+
+    def finish_result(
+        *,
+        reason: str,
+        forced_continue: bool,
+        drained: bool,
+        pending: int,
+        in_flight: int,
+        completed_stores: int,
+        failed_stores: int,
+        write_locked: int,
+    ) -> dict[str, Any]:
+        now = time.monotonic()
+        result = {
+            "enabled": True,
+            "status_url": status_url,
+            "elapsed_s": now - started,
+            "polls": polls,
+            "stable_polls": stable_polls,
+            "stall_s": stall_s,
+            "drained": drained,
+            "forced_continue": forced_continue,
+            "reason": reason,
+            "degraded": forced_continue or failed_stores > 0,
+            "peak_pending_keys": peak_pending,
+            "peak_in_flight_stores": peak_in_flight,
+            "peak_l1_write_locked": peak_write_locked,
+            "completed_store_tasks": completed_stores,
+            "failed_store_tasks": failed_stores,
+            "final_pending_keys": pending,
+            "final_in_flight_stores": in_flight,
+            "final_l1_write_locked": write_locked,
+            "no_progress_s": now - last_progress_at,
+        }
+        marker = (
+            "[SC_STORE_BARRIER_BYPASS]"
+            if forced_continue
+            else "[SC_STORE_BARRIER_DONE]"
+        )
+        print(
+            marker + " " + json.dumps(result, sort_keys=True, separators=(",", ":")),
+            flush=True,
+        )
+        return result
+
+    # Keep final counters in scope so the overall-timeout path can return a
+    # useful record instead of raising after hours of work.
+    pending = in_flight = completed_stores = failed_stores = write_locked = 0
 
     while True:
         elapsed = time.monotonic() - started
         if elapsed > timeout_s:
-            raise TimeoutError(
-                "LMCache cold->warm store barrier timed out after "
-                f"{elapsed:.1f}s; last_status={last_status}"
+            return finish_result(
+                reason="timeout",
+                forced_continue=True,
+                drained=False,
+                pending=pending,
+                in_flight=in_flight,
+                completed_stores=completed_stores,
+                failed_stores=failed_stores,
+                write_locked=write_locked,
             )
 
         response = requests.get(
@@ -769,16 +832,32 @@ def wait_for_lmcache_store_barrier(
                 "LMCache /status is missing store-barrier fields: "
                 f"store={store}, l1={l1}"
             )
-        if failed_stores:
-            raise RuntimeError(
-                "LMCache reported failed L2 store task(s) before warm: "
-                f"failed_store_task_count={failed_stores}; store={store}"
+        if failed_stores and not warned_failed:
+            warned_failed = True
+            print(
+                "[SC_STORE_BARRIER_DEGRADED] "
+                f"failed_store_task_count={failed_stores}; "
+                "continuing best-effort instead of aborting warm replay",
+                flush=True,
             )
 
         polls += 1
         peak_pending = max(peak_pending, pending)
         peak_in_flight = max(peak_in_flight, in_flight)
         peak_write_locked = max(peak_write_locked, write_locked)
+
+        signature = (
+            pending,
+            in_flight,
+            completed_stores,
+            failed_stores,
+            write_locked,
+        )
+        now = time.monotonic()
+        if last_signature is None or signature != last_signature:
+            last_signature = signature
+            last_progress_at = now
+        no_progress_s = now - last_progress_at
 
         drained = pending == 0 and in_flight == 0 and write_locked == 0
         stable = stable + 1 if drained else 0
@@ -792,32 +871,34 @@ def wait_for_lmcache_store_barrier(
                 f"elapsed_s={elapsed:.2f} pending_keys={pending} "
                 f"inflight_stores={in_flight} completed_stores={completed_stores} "
                 f"failed_stores={failed_stores} l1_write_locked={write_locked} "
+                f"no_progress_s={no_progress_s:.2f} "
                 f"stable={stable}/{stable_polls}",
                 flush=True,
             )
 
         if stable >= stable_polls:
-            result = {
-                "enabled": True,
-                "status_url": status_url,
-                "elapsed_s": time.monotonic() - started,
-                "polls": polls,
-                "stable_polls": stable_polls,
-                "peak_pending_keys": peak_pending,
-                "peak_in_flight_stores": peak_in_flight,
-                "peak_l1_write_locked": peak_write_locked,
-                "completed_store_tasks": completed_stores,
-                "failed_store_tasks": failed_stores,
-                "final_pending_keys": pending,
-                "final_in_flight_stores": in_flight,
-                "final_l1_write_locked": write_locked,
-            }
-            print(
-                "[SC_STORE_BARRIER_DONE] "
-                + json.dumps(result, sort_keys=True, separators=(",", ":")),
-                flush=True,
+            return finish_result(
+                reason="drained",
+                forced_continue=False,
+                drained=True,
+                pending=pending,
+                in_flight=in_flight,
+                completed_stores=completed_stores,
+                failed_stores=failed_stores,
+                write_locked=write_locked,
             )
-            return result
+
+        if stall_s > 0 and not drained and no_progress_s >= stall_s:
+            return finish_result(
+                reason="stalled_no_progress",
+                forced_continue=True,
+                drained=False,
+                pending=pending,
+                in_flight=in_flight,
+                completed_stores=completed_stores,
+                failed_stores=failed_stores,
+                write_locked=write_locked,
+            )
 
         time.sleep(poll_s)
 
@@ -945,6 +1026,16 @@ def parse_arguments():
         choices=("same", "reverse", "random"),
         default="reverse",
     )
+    parser.add_argument(
+        "--warm_order_seed",
+        type=int,
+        default=None,
+        help=(
+            "Seed for warm_order=random. Defaults to request_order_seed for "
+            "backward compatibility; set it independently to avoid replaying "
+            "the same random permutation used for cold."
+        ),
+    )
 
     parser.add_argument(
         "--server_url",
@@ -984,6 +1075,16 @@ def parse_arguments():
     parser.add_argument("--store_barrier_poll_s", type=float, default=1.0)
     parser.add_argument("--store_barrier_stable_polls", type=int, default=5)
     parser.add_argument(
+        "--store_barrier_stall_s",
+        type=float,
+        default=120.0,
+        help=(
+            "If the observable store-barrier counters do not change for this "
+            "many seconds, record a degraded barrier and continue to warm. "
+            "Set 0 to disable the no-progress escape hatch."
+        ),
+    )
+    parser.add_argument(
         "--store_barrier_result_path",
         default="",
         help="Optional JSON path for cold->warm store-barrier measurements.",
@@ -1013,6 +1114,11 @@ def parse_arguments():
 
 def main():
     args = parse_arguments()
+    warm_order_seed = (
+        args.request_order_seed
+        if args.warm_order_seed is None
+        else args.warm_order_seed
+    )
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1038,6 +1144,7 @@ def main():
                 "prefix_sort_depth": args.prefix_sort_depth,
                 "request_order_seed": args.request_order_seed,
                 "warm_order": args.warm_order,
+                "warm_order_seed": warm_order_seed,
                 "submission_batch_size": args.submission_batch_size,
                 "server_url": args.server_url,
                 "policy": "none",
@@ -1099,7 +1206,7 @@ def main():
         )
     elif args.warm_order == "random":
         warm_source_indices = list(range(num_requests))
-        random.Random(args.request_order_seed).shuffle(warm_source_indices)
+        random.Random(warm_order_seed).shuffle(warm_source_indices)
     else:
         warm_source_indices = list(range(num_requests))
 
@@ -1109,6 +1216,7 @@ def main():
         f"prefix_sort_depth={args.prefix_sort_depth}, "
         f"request_order_seed={args.request_order_seed}, "
         f"warm_order={args.warm_order}, "
+        f"warm_order_seed={warm_order_seed}, "
         f"requests={num_requests}",
         flush=True,
     )
@@ -1137,6 +1245,7 @@ def main():
         "prefix_sort_depth": args.prefix_sort_depth,
         "request_order_seed": args.request_order_seed,
         "warm_order": args.warm_order,
+        "warm_order_seed": warm_order_seed,
         "submission_batch_size": args.submission_batch_size,
         "sampling": {
             "temperature": args.temperature,
@@ -1225,6 +1334,7 @@ def main():
             timeout_s=args.store_barrier_timeout_s,
             poll_s=args.store_barrier_poll_s,
             stable_polls=args.store_barrier_stable_polls,
+            stall_s=args.store_barrier_stall_s,
         )
         if args.store_barrier_result_path:
             barrier_path = Path(args.store_barrier_result_path)

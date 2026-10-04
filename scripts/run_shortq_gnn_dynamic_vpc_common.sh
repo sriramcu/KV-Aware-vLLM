@@ -42,6 +42,7 @@ KV_COLD_WARM_STORE_BARRIER="${KV_COLD_WARM_STORE_BARRIER:-0}"
 KV_STORE_BARRIER_TIMEOUT_S="${KV_STORE_BARRIER_TIMEOUT_S:-7200}"
 KV_STORE_BARRIER_POLL_S="${KV_STORE_BARRIER_POLL_S:-1}"
 KV_STORE_BARRIER_STABLE_POLLS="${KV_STORE_BARRIER_STABLE_POLLS:-5}"
+KV_STORE_BARRIER_STALL_S="${KV_STORE_BARRIER_STALL_S:-120}"
 
 # Current scheduler/cache controls.  The retired occupancy/GPU-utilization
 # fallback is intentionally absent; the remaining Stage-1 fallback is the
@@ -103,7 +104,7 @@ case "$PROFILE" in
     TP=2; QUANTIZATION=fp8; GPU_UTIL=0.65; MAX_SEQS="${MAX_NUM_SEQS:-16}"
     L1_GB="$LMCACHE_L1_SIZE_GB"
     NUM_QUESTIONS=650; SUBMISSION_BATCH_SIZE="${SUBMISSION_BATCH_SIZE:-650}"
-    MIN_TOKENS=128; MAX_TOKENS=512
+    MIN_TOKENS="${MIN_TOKENS:-128}"; MAX_TOKENS="${MAX_TOKENS:-512}"
     RUN_LABEL=h100_shortq_gnn_dynamic_vpc_q650
     L2_DIR="/scratch2/sriramc2/lmcache_mp_l2/gnn_dynamic_vpc_q650_${SLURM_JOB_ID}"
     SMOKE_FORCE_MIN_UNIQUE_PER_PLACEMENT=0
@@ -113,6 +114,13 @@ case "$PROFILE" in
     exit 2
     ;;
 esac
+
+# [SC] Keep the historical defaults above, but allow controlled benchmark
+# runs to choose an independent cold permutation without rewriting legacy
+# launch behavior.  WARM_ORDER already has its historical env override.
+REQUEST_ORDER="${KV_REQUEST_ORDER:-$REQUEST_ORDER}"
+REQUEST_ORDER_SEED="${KV_REQUEST_ORDER_SEED:-$REQUEST_ORDER_SEED}"
+WARM_ORDER_SEED="${WARM_ORDER_SEED:-$REQUEST_ORDER_SEED}"
 
 EXPERIMENT_LABEL="${EXPERIMENT_LABEL:-}"
 RUN_LABEL_SUFFIX="${EXPERIMENT_LABEL:+_${EXPERIMENT_LABEL}}"
@@ -299,6 +307,12 @@ cat > "${RUN_DIR}/run_config.json" <<JSON
   "gnn_aware_vpc_window": $VLLM_GNN_AWARE_VPC_WINDOW,
   "vpc_sufficient_bypass": $KV_VPC_SUFFICIENT_BYPASS,
   "mutual_prefix": $KV_MUTUAL_PREFIX,
+  "request_order": "$REQUEST_ORDER",
+  "request_order_seed": $REQUEST_ORDER_SEED,
+  "warm_order": "$WARM_ORDER",
+  "warm_order_seed": $WARM_ORDER_SEED,
+  "min_tokens": $MIN_TOKENS,
+  "max_tokens": $MAX_TOKENS,
   "experiment_label": "$EXPERIMENT_LABEL",
   "prefix_diagnostics": $LMCACHE_MP_PREFIX_DIAGNOSTICS,
   "stage1_starvation_fallback": $KV_STAGE1_STARVATION_FALLBACK,
@@ -313,6 +327,7 @@ cat > "${RUN_DIR}/run_config.json" <<JSON
   "store_barrier_timeout_s": $KV_STORE_BARRIER_TIMEOUT_S,
   "store_barrier_poll_s": $KV_STORE_BARRIER_POLL_S,
   "store_barrier_stable_polls": $KV_STORE_BARRIER_STABLE_POLLS,
+  "store_barrier_stall_s": $KV_STORE_BARRIER_STALL_S,
   "placement": "shortq_dynamic_vpc_plus_lower_backing",
   "chunk_vote": $GNN_CHUNK_VOTE_CONFIG_JSON,
   "runtime_metadata": "$RUNTIME_METADATA",
@@ -424,6 +439,7 @@ DARGS=(
   --retrieval_top_k "$RETRIEVAL_TOP_K" --llm_model "$MODEL"
   --request_order "$REQUEST_ORDER" --prefix_sort_depth "$PREFIX_SORT_DEPTH"
   --request_order_seed "$REQUEST_ORDER_SEED" --warm_order "$WARM_ORDER"
+  --warm_order_seed "$WARM_ORDER_SEED"
   --submission_batch_size "$SUBMISSION_BATCH_SIZE"
   --server_url http://127.0.0.1:8000 --request_timeout_s 7200
   --temperature 0 --top_p 0.95 --min_tokens "$MIN_TOKENS" --max_tokens "$MAX_TOKENS"
@@ -438,6 +454,7 @@ if [[ "$KV_COLD_WARM_STORE_BARRIER" == "1" ]]; then
     --store_barrier_timeout_s "$KV_STORE_BARRIER_TIMEOUT_S"
     --store_barrier_poll_s "$KV_STORE_BARRIER_POLL_S"
     --store_barrier_stable_polls "$KV_STORE_BARRIER_STABLE_POLLS"
+    --store_barrier_stall_s "$KV_STORE_BARRIER_STALL_S"
     --store_barrier_result_path "${RUN_DIR}/store_barrier.json"
     --metrics_after_barrier_path "${RUN_DIR}/metrics_after_barrier.txt"
   )

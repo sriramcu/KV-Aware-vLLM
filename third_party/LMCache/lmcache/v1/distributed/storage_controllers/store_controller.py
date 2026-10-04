@@ -70,6 +70,35 @@ def _group_keys_by_shape(
     return groups
 
 
+# [SC] A TP-logical object is one chunk/object-group replicated across every
+# KV rank in the same parallel layout.  The rolling PUT cap must admit these
+# rank shards together; otherwise disk bytes can be consumed by orphan rank
+# files that can never satisfy a TP lookup.
+def _tp_logical_group_id(key: ObjectKey) -> tuple:
+    world_size = ObjectKey.WorldSizeFromKVRank(key.kv_rank)
+    # Some upstream/unit-test keys use an unpacked kv_rank=0.  Treat those as
+    # single-rank objects so the atomic path remains backward compatible.
+    if world_size <= 0:
+        world_size = 1
+    local_world_size = (key.kv_rank >> 8) & 0xFF
+    return (
+        key.model_name,
+        key.chunk_hash,
+        key.object_group_id,
+        key.cache_salt,
+        world_size,
+        local_world_size,
+    )
+
+
+def _global_rank_from_kv_rank(kv_rank: int) -> int:
+    world_size = ObjectKey.WorldSizeFromKVRank(kv_rank)
+    if world_size <= 0:
+        return 0
+    return (kv_rank >> 16) & 0xFF
+
+
+
 # Helper classes (module-level, before main class)
 
 
@@ -293,9 +322,19 @@ class StoreController(StorageControllerInterface):
         self._status_store_cap_skipped_key_count: int = 0
         self._status_store_cap_skipped_bytes: int = 0
 
+        # [SC] With a finite store cap, wait until every TP shard for one
+        # logical chunk/object-group has arrived, then make one admission
+        # decision for the whole group.  Preapproved (adapter,key) pairs let
+        # the existing per-shape submission path bypass its old per-rank cap
+        # check after the aggregate decision has been made.
+        self._pending_tp_store_groups: dict[tuple, dict[int, ObjectKey]] = {}
+        self._store_cap_preapproved: set[tuple[int, ObjectKey]] = set()
+
         logger.info(
-            "[MP_STORE_CAP_INIT] max_inflight_store_bytes=%d enabled=%s",
+            "[MP_STORE_CAP_INIT] max_inflight_store_bytes=%d enabled=%s "
+            "tp_atomic=%s",
             self._max_inflight_store_bytes,
+            self._max_inflight_store_bytes > 0,
             self._max_inflight_store_bytes > 0,
         )
 
@@ -361,10 +400,19 @@ class StoreController(StorageControllerInterface):
         """Return a status dict for the store controller."""
         is_healthy = self._thread.is_alive()
         num_draining = len(self._draining)
+        # ``_pending_tp_store_groups`` is only rendezvous metadata.  It does
+        # not hold an L1 lock or represent submitted L2 work.  Incomplete
+        # groups are intentionally best-effort and must never wedge a
+        # cold->warm barrier.
+        pending_tp_keys = sum(
+            len(group) for group in self._pending_tp_store_groups.values()
+        )
         return {
             "is_healthy": is_healthy,
             "thread_alive": is_healthy,
             "pending_keys_count": self._listener.pending_count(),
+            "pending_tp_store_key_count": pending_tp_keys,
+            "pending_tp_store_group_count": len(self._pending_tp_store_groups),
             "in_flight_task_count": self._status_in_flight_count,
             # [SC] Expose byte-budget and completion state to barriers/diagnostics.
             "in_flight_store_bytes": self._status_in_flight_bytes,
@@ -607,21 +655,152 @@ class StoreController(StorageControllerInterface):
             done.set()
 
     def _process_new_keys(self, keys: list[ObjectKey]) -> None:
-        """
-        Process a batch of newly written keys.
+        """Process a batch of newly written keys.
 
-        1. Ask the policy which adapters each key should go to.
-        2. For each adapter target, reserve read access on L1 to get
-           MemoryObj references (skip keys that fail — best-effort).
-        3. Submit store tasks to L2 adapters.
-        4. Track in-flight tasks for later cleanup.
-
-        Args:
-            keys (list[ObjectKey]): Keys that finished writing to L1.
+        With a finite store cap, wait until every TP shard for one logical
+        object has emitted ``L1_WRITE_FINISHED`` before making one admission
+        decision for the full logical group.  Never reconstruct a missing
+        sibling from L1: doing so can resubmit a group when the sibling's real
+        notification arrives later.  An incomplete rendezvous is lightweight
+        metadata only and is deliberately ignored by the cold->warm barrier.
         """
 
-        for group in _group_keys_by_shape(keys).values():
-            self._submit_store_for_single_shape(group)
+        if self._max_inflight_store_bytes <= 0:
+            for group in _group_keys_by_shape(keys).values():
+                self._submit_store_for_single_shape(group)
+            return
+
+        for key in keys:
+            group_id = _tp_logical_group_id(key)
+            expected_ranks = max(1, int(group_id[4]))
+            global_rank = _global_rank_from_kv_rank(key.kv_rank)
+            bucket = self._pending_tp_store_groups.setdefault(group_id, {})
+            bucket[global_rank] = key
+            if len(bucket) < expected_ranks:
+                continue
+            if len(bucket) > expected_ranks:
+                logger.error(
+                    "TP-atomic store group has too many ranks: expected=%d got=%d "
+                    "model=%s object_group=%d",
+                    expected_ranks,
+                    len(bucket),
+                    key.model_name,
+                    key.object_group_id,
+                )
+                # Drop malformed rendezvous metadata rather than allowing it
+                # to accumulate forever or falling back to per-rank stores.
+                self._pending_tp_store_groups.pop(group_id, None)
+                continue
+
+            logical_keys = [bucket[r] for r in sorted(bucket)]
+            self._pending_tp_store_groups.pop(group_id, None)
+            self._submit_store_for_tp_logical_group(logical_keys)
+
+    # [SC] Make a single rolling-cap admission decision for every rank shard
+    # of one logical chunk/object-group, then reuse the existing shape-safe
+    # submission path for the actual adapter tasks.
+    def _submit_store_for_tp_logical_group(self, keys: list[ObjectKey]) -> None:
+        routing_descriptors = [
+            desc
+            for adapter_id, desc in self._adapter_descriptors.items()
+            if adapter_id not in self._draining
+        ]
+        plan = self._policy.select_store_targets(keys, routing_descriptors)
+
+        target_pairs: list[tuple[int, ObjectKey]] = []
+        key_set = set(keys)
+        for adapter_index, target_keys in plan.items():
+            if not target_keys:
+                continue
+            if adapter_index not in self._l2_adapters:
+                logger.error(
+                    "StorePolicy returned invalid adapter id %d "
+                    "(not among attached adapters). Skipping logical TP group.",
+                    adapter_index,
+                )
+                return
+            # Current project policies route a logical chunk identically on
+            # every TP rank.  Never fall back to per-rank admission here.
+            if set(target_keys) != key_set:
+                logger.error(
+                    "TP-atomic store rejected inconsistent policy routing: "
+                    "adapter=%d routed=%d/%d rank shards",
+                    adapter_index,
+                    len(target_keys),
+                    len(keys),
+                )
+                return
+            target_pairs.extend((adapter_index, key) for key in target_keys)
+
+        # Nothing in this logical chunk is intended for L2 (e.g. a GNN
+        # gpu/cpu placement with L2 backing disabled).
+        if not target_pairs:
+            return
+
+        unique_target_keys = list(dict.fromkeys(key for _, key in target_pairs))
+        read_results = self._l1_manager.reserve_read(unique_target_keys)
+        readable: dict[ObjectKey, object] = {}
+        for key in unique_target_keys:
+            result = read_results.get(key)
+            if result is None:
+                continue
+            err, obj = result
+            if err == L1Error.SUCCESS and obj is not None:
+                readable[key] = obj
+
+        if len(readable) != len(unique_target_keys):
+            if readable:
+                self._l1_manager.finish_read(list(readable))
+            # Both notifications arrived, but one sibling is no longer
+            # readable.  Drop the entire logical group.  This preserves the
+            # all-or-none TP contract and, importantly, does not create a new
+            # retry/rendezvous state that could hang the run.
+            logger.warning(
+                "[MP_STORE_TP_DROP_INCOMPLETE] readable=%d/%d model=%s "
+                "object_group=%d",
+                len(readable),
+                len(unique_target_keys),
+                keys[0].model_name if keys else "<none>",
+                keys[0].object_group_id if keys else -1,
+            )
+            return
+
+        required_bytes = sum(
+            readable[key].get_size() for _adapter_index, key in target_pairs
+        )
+        self._l1_manager.finish_read(unique_target_keys)
+        remaining_bytes = max(
+            0, self._max_inflight_store_bytes - self._status_in_flight_bytes
+        )
+        if required_bytes > remaining_bytes:
+            delete_keys = self._policy.select_l1_deletions_on_store_skip(
+                unique_target_keys
+            )
+            if delete_keys:
+                self._l1_manager.delete(delete_keys)
+            self._status_store_cap_skipped_key_count += len(target_pairs)
+            self._status_store_cap_skipped_bytes += required_bytes
+            logger.info(
+                "[MP_STORE_CAP_SKIP] adapter=-1 skipped_keys=%d skipped_bytes=%d "
+                "candidate_bytes=%d inflight_bytes=%d cap_bytes=%d "
+                "admitted_keys=0 tp_atomic=true logical_groups=1",
+                len(target_pairs),
+                required_bytes,
+                required_bytes,
+                self._status_in_flight_bytes,
+                self._max_inflight_store_bytes,
+            )
+            return
+
+        self._store_cap_preapproved.update(target_pairs)
+        try:
+            for group in _group_keys_by_shape(keys).values():
+                self._submit_store_for_single_shape(group)
+        finally:
+            # Any leftovers correspond to a policy/read-path anomaly where the
+            # normal submission did not consume a preapproval token.
+            for pair in target_pairs:
+                self._store_cap_preapproved.discard(pair)
 
     # [SC] Apply the byte-accurate rolling store budget after read reservation
     # reveals the per-object size. Returns the admitted prefix; skipped keys are
@@ -633,6 +812,12 @@ class StoreController(StorageControllerInterface):
         objs: list,
     ) -> tuple[list[ObjectKey], list]:
         if not keys or self._max_inflight_store_bytes <= 0:
+            return keys, objs
+
+        preapproved = [(adapter_index, key) for key in keys]
+        if preapproved and all(pair in self._store_cap_preapproved for pair in preapproved):
+            for pair in preapproved:
+                self._store_cap_preapproved.discard(pair)
             return keys, objs
 
         object_bytes = objs[0].get_size()
