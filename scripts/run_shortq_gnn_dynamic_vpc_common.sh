@@ -222,6 +222,7 @@ check_gpu_exclusivity || exit $?
 
 GNN_CHUNK_VOTE_CONFIG_JSON="$(python - <<'PY'
 import json
+import os
 from dataclasses import asdict
 from Hierarchical_KV.shortq_placement.chunk_voting import (
     selected_vote_config,
@@ -230,6 +231,8 @@ from Hierarchical_KV.shortq_placement.chunk_voting import (
 print(json.dumps({
     "policy": selected_vote_policy_name(),
     "config": asdict(selected_vote_config()),
+    "random_chunk_seed": os.getenv("GNN_RANDOM_CHUNK_SEED", "0"),
+    "random_match_distribution": os.getenv("GNN_RANDOM_MATCH_DISTRIBUTION", ""),
 }, sort_keys=True))
 PY
 )"
@@ -353,7 +356,7 @@ python experiments/precompute_shortq_placements.py \
 python - "$RUNTIME_METADATA" "$VPC_IMPORTANCE_SIDECAR" "$PLACEMENT_SUMMARY" <<'PY'
 import json, sys
 runtime=json.load(open(sys.argv[1])); sidecar=json.load(open(sys.argv[2])); summary=json.load(open(sys.argv[3]))
-assert runtime and all(v in {'gpu','cpu','disk'} for v in runtime.values())
+assert runtime and all(v in {'gpu','cpu','disk','drop'} for v in runtime.values())
 assert len(sidecar) == summary['requests']
 valid={'gpu','cpu','disk'}
 assert all(all(v in valid for v in blocks.values()) for blocks in sidecar.values())

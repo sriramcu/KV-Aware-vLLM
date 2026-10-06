@@ -704,8 +704,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             all_dict: dict[ObjectKey, MemoryObj] = {}
             total_bytes: int = 0
             store_succeeded = False
-            gnn_target_counts = {"gpu": 0, "cpu": 0, "disk": 0}
-            gnn_reserved_counts = {"gpu": 0, "cpu": 0, "disk": 0}
+            gnn_target_counts = {"gpu": 0, "cpu": 0, "disk": 0, "drop": 0}
+            gnn_reserved_counts = {"gpu": 0, "cpu": 0, "disk": 0, "drop": 0}
             try:
                 for obj_group_id in range(num_object_groups):
                     obj_keys = obj_keys_per_obj_group[obj_group_id]
@@ -713,8 +713,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
 
                     # [SC] Dynamic Short-Q store admission. GPU placement is a
                     # vLLM retention preference, not an LMCache storage tier.
-                    # CPU/disk placements always enter host L1; gpu placement
-                    # enters host L1 only when safety backing is enabled.
+                    # CPU/disk placements enter host L1; gpu placement enters
+                    # host L1 only when safety backing is enabled. True drop is
+                    # deliberately excluded from host reservation/persistence.
                     if _GNN_DYNAMIC_STORE_ENABLED:
                         placements = [
                             get_chunk_placement(k.chunk_hash) if not skip_mask[i] else None
@@ -801,7 +802,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         "[GNN_DYNAMIC_STORE] request_id=%s worker=%s "
                         "target_gpu=%d target_cpu=%d target_disk=%d "
                         "l1_backing=%s host_reserved=%d reserved_gpu=%d "
-                        "reserved_cpu=%d reserved_disk=%d host_bytes=%d success=%s",
+                        "reserved_cpu=%d reserved_disk=%d host_bytes=%d success=%s "
+                        "target_drop=%d reserved_drop=%d",
                         key.request_id,
                         key.worker_id,
                         gnn_target_counts["gpu"],
@@ -814,6 +816,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         gnn_reserved_counts["disk"],
                         sum(obj.get_size() for obj in all_dict.values()),
                         store_succeeded,
+                        gnn_target_counts["drop"],
+                        gnn_reserved_counts["drop"],
                     )
                 num_tokens = (
                     stored_count * self._ctx.chunk_size

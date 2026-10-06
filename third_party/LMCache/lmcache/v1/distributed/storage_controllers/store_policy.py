@@ -228,15 +228,18 @@ class BufferOnlyStorePolicy(DefaultStorePolicy):
 register_store_policy("default", DefaultStorePolicy)
 register_store_policy("skip_l1", BufferOnlyStorePolicy)
 
-# [SC] Short-Q dynamic placement policy.  Semantic labels are gpu/cpu/disk;
-# LMCache itself remains a physical CPU-L1 / disk-L2 hierarchy.
+# [SC] Short-Q dynamic placement policy. Semantic labels are gpu/cpu/disk/drop;
+# LMCache itself remains a physical CPU-L1 / disk-L2 hierarchy. True drop
+# objects are never admitted to LMCache persistence.
 class GNNDynamicStorePolicy(StorePolicy):
     """Persist Short-Q-selected disk objects, optionally safety-back all objects.
 
     With ``LMCACHE_GNN_L2_BACKING=0`` only ``disk`` placements are sent to L2.
     With backing enabled, all host-resident objects get an L2 safety copy while
-    only true ``disk`` placements are deleted from L1 after commit.  This keeps
-    ``gpu``/``cpu`` placement objects resident in fast host memory when present.
+    only true ``disk`` placements are deleted from L1 after commit. ``drop``
+    placements are not host-resident and therefore never reach this policy.
+    This keeps ``gpu``/``cpu`` placement objects resident in fast host memory
+    when present.
     """
 
     def __init__(self) -> None:
@@ -261,8 +264,12 @@ class GNNDynamicStorePolicy(StorePolicy):
         else:
             l2_keys = [key for key in keys if placements[key] == "disk"]
 
-        persistent_l1 = sum(1 for key in keys if placements[key] != "disk")
-        backing_targets = sum(1 for key in l2_keys if placements[key] != "disk")
+        persistent_l1 = sum(
+            1 for key in keys if placements[key] in {"gpu", "cpu"}
+        )
+        backing_targets = sum(
+            1 for key in l2_keys if placements[key] in {"gpu", "cpu"}
+        )
         logger.info(
             "[GNN_DYNAMIC_L2_POLICY] candidates=%d persistent_l1=%d "
             "disk_targets=%d backing_targets=%d l2_backing=%s adapters=%d",

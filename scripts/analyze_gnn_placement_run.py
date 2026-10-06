@@ -13,6 +13,9 @@ DYNAMIC_STORE_RE = re.compile(
     r"l1_backing=(\S+) host_reserved=(\d+) reserved_gpu=(\d+) "
     r"reserved_cpu=(\d+) reserved_disk=(\d+) host_bytes=(\d+) success=(\S+)"
 )
+DYNAMIC_STORE_DROP_RE = re.compile(
+    r"\[GNN_DYNAMIC_STORE\].*target_drop=(\d+) reserved_drop=(\d+)"
+)
 POLICY_RE = re.compile(
     r"\[GNN_DYNAMIC_L2_POLICY\] candidates=(\d+) persistent_l1=(\d+) "
     r"disk_targets=(\d+) backing_targets=(\d+) l2_backing=(\S+) adapters=(\d+)"
@@ -122,6 +125,9 @@ def main() -> None:
             reserved["cpu"] += int(m.group(7))
             reserved["disk"] += int(m.group(8))
             bytes_seen["host_reserved_bytes"] += int(m.group(9))
+        if m := DYNAMIC_STORE_DROP_RE.search(line):
+            target["drop"] += int(m.group(1))
+            reserved["drop"] += int(m.group(2))
         if m := POLICY_RE.search(line):
             policies["candidates"] += int(m.group(1))
             policies["persistent_l1"] += int(m.group(2))

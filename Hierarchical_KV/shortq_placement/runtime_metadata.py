@@ -1,7 +1,8 @@
 """Runtime placement metadata format.
 
-The runtime file intentionally contains only ``chunk_hash_hex -> gpu/cpu/disk``.
-Physical LMCache tier details and experimental diagnostics live elsewhere.
+The runtime file intentionally contains only ``chunk_hash_hex -> gpu/cpu/disk/drop``.
+Physical LMCache tier details and experimental diagnostics live elsewhere. ``drop``
+means the chunk receives no LMCache persistence in the dynamic-store path.
 """
 
 from __future__ import annotations
@@ -9,7 +10,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-VALID_PLACEMENTS = {"gpu", "cpu", "disk"}
+VALID_PLACEMENTS = {"gpu", "cpu", "disk", "drop"}
 
 
 def write_runtime_metadata(path: str | Path, placements: dict[str, str]) -> None:

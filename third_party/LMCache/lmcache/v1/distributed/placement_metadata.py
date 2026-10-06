@@ -4,9 +4,10 @@
 
 """Short-Q hash -> semantic KV placement metadata.
 
-The values are placement intents (``gpu``, ``cpu``, ``disk``), not LMCache
-physical tier numbers.  In the current architecture GPU intent is consumed by
-vLLM's prefix-cache policy while LMCache provides CPU/L1 and disk/L2 backing.
+The values are placement intents (``gpu``, ``cpu``, ``disk``, ``drop``), not
+LMCache physical tier numbers. In the current architecture GPU intent is
+consumed by vLLM's prefix-cache policy, CPU intent receives L1 backing, disk
+intent targets L2, and drop receives no LMCache persistence.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from threading import Lock
 from lmcache.logging import init_logger
 
 logger = init_logger(__name__)
-_VALID_PLACEMENTS = {"gpu", "cpu", "disk"}
+_VALID_PLACEMENTS = {"gpu", "cpu", "disk", "drop"}
 _lock = Lock()
 _loaded_path: str | None = None
 _placements: dict[str, str] = {}

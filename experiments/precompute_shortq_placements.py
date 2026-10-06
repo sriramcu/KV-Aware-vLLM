@@ -36,6 +36,8 @@ from experiments.mp_nognn_project import (  # noqa: E402
 )
 from Hierarchical_KV.shortq_placement.block_prediction import get_block_predictions  # noqa: E402
 from Hierarchical_KV.shortq_placement.chunk_voting import (
+    assign_random_exclusive_placements,
+    is_random_exclusive_policy,
     make_block_placement_vote,
     selected_vote_config,
     selected_vote_policy_name,
@@ -220,7 +222,7 @@ def _block_features_batch(
 
 def _counter_dict(values: list[str]) -> dict[str, int]:
     c = Counter(values)
-    return {k: int(c.get(k, 0)) for k in ("gpu", "cpu", "disk")}
+    return {k: int(c.get(k, 0)) for k in ("gpu", "cpu", "disk", "drop")}
 
 
 def _sync(device: torch.device) -> None:
@@ -278,6 +280,10 @@ def _write_vpc_importance_sidecar(
         request_idx = str(int(row["request_order_index"]))
         chunk_idx = int(row["chunk_index"])
         importance = str(row["runtime_placement"])
+        # True DROP means no LMCache persistence, but it remains the coldest
+        # GNN-aware VPC priority rather than introducing a fourth VPC rank.
+        if importance == "drop":
+            importance = "disk"
         request_map = per_request.setdefault(request_idx, {})
         start = chunk_idx * blocks_per_chunk
         for block_idx in range(start, start + blocks_per_chunk):
@@ -308,7 +314,11 @@ def _force_smoke_placement_coverage(
     for target in ("gpu", "cpu", "disk"):
         while counts[target] < min_unique_per_placement:
             donor_placements = sorted(
-                (placement for placement in ("gpu", "cpu", "disk") if counts[placement] > min_unique_per_placement),
+                (
+                    placement
+                    for placement in ("gpu", "cpu", "disk", "drop")
+                    if counts[placement] > min_unique_per_placement
+                ),
                 key=lambda placement: (-counts[placement], placement),
             )
             if not donor_placements:
@@ -392,6 +402,8 @@ def main() -> None:
     runtime: dict[str, str] = {}
     vote_config = selected_vote_config()
     vote_policy_name = selected_vote_policy_name()
+    random_exclusive = is_random_exclusive_policy(vote_policy_name)
+    random_placement_summary: dict[str, Any] | None = None
 
     occurrences: list[dict[str, Any]] = []
     hash_prediction_rows: list[dict[str, Any]] = []
@@ -557,7 +569,7 @@ def main() -> None:
 
             for chunk_index, chunk_hash in enumerate(hashes):
                 h = chunk_hash.hex()
-                cached = lookup_prediction(h)
+                cached = None if random_exclusive else lookup_prediction(h)
                 if cached is not None:
                     cache_hits += 1
                     candidate = cached
@@ -569,10 +581,25 @@ def main() -> None:
                         raise RuntimeError(
                             "full LMCache chunk did not have 32 aligned block predictions"
                         )
-                    candidate = vote_chunk_placement(
-                        block_placements, config=vote_config, policy=vote_policy_name
-                    )
-                    store_prediction(h, candidate)
+                    if random_exclusive:
+                        # Placeholder only. Random-exclusive policies are assigned
+                        # once over the complete unique-hash set after inference.
+                        candidate = "disk"
+                    elif vote_policy_name == "threshold_with_drop_plurality":
+                        raw_block_classes = [
+                            CLASS_NAMES[int(x)] for x in class_ids[lo:hi]
+                        ]
+                        candidate = vote_chunk_placement(
+                            raw_block_classes,
+                            config=vote_config,
+                            policy=vote_policy_name,
+                        )
+                    else:
+                        candidate = vote_chunk_placement(
+                            block_placements, config=vote_config, policy=vote_policy_name
+                        )
+                    if not random_exclusive:
+                        store_prediction(h, candidate)
                 previous = runtime.get(h)
                 resolved = resolve_duplicate(previous, candidate)
                 conflict = previous is not None and previous != candidate
@@ -652,6 +679,32 @@ def main() -> None:
         int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else None
     )
 
+    if random_exclusive:
+        random_runtime, random_placement_summary = assign_random_exclusive_placements(
+            list(runtime.keys()), vote_policy_name
+        )
+        runtime.update(random_runtime)
+        occurrence_placements = []
+        candidate_by_hash = defaultdict(Counter)
+        conflict_occurrences = 0
+        for row in occurrences:
+            placement = runtime[row["chunk_hash"]]
+            row["candidate_placement"] = placement
+            row["runtime_placement"] = placement
+            row["duplicate_conflict"] = False
+            occurrence_placements.append(placement)
+            candidate_by_hash[row["chunk_hash"]][placement] += 1
+        for row in hash_prediction_rows:
+            placement = runtime[row["chunk_hash"]]
+            row["prediction"] = placement
+            row["runtime_placement"] = placement
+            row["duplicate_conflict"] = False
+        print(
+            "[SHORTQ_RANDOM_EXCLUSIVE] "
+            + json.dumps(random_placement_summary, sort_keys=True),
+            flush=True,
+        )
+
     smoke_overrides = _force_smoke_placement_coverage(
         runtime, args.smoke_force_min_unique_per_placement
     )
@@ -721,12 +774,25 @@ def main() -> None:
         "token_alignment_exact_requests": exact_alignment_requests,
         "prediction_cache_mode": "dormant",
         "prediction_cache_hits": cache_hits,
-        "block_policy": "argmax_class_logits",
-        "class_to_placement_mapping": {"drop": "disk", "disk": "disk", "cpu": "cpu", "gpu": "gpu"},
+        "block_policy": (
+            "argmax_class_logits_diagnostic_only"
+            if random_exclusive
+            else "argmax_class_logits"
+        ),
+        "class_to_placement_mapping": (
+            None
+            if random_exclusive
+            else (
+                {"drop": "drop", "disk": "disk", "cpu": "cpu", "gpu": "gpu"}
+                if vote_policy_name == "threshold_with_drop_plurality"
+                else {"drop": "disk", "disk": "disk", "cpu": "cpu", "gpu": "gpu"}
+            )
+        ),
         "chunk_vote": {
             "policy": vote_policy_name,
             "config": vote_config.__dict__,
         },
+        "random_chunk_placement": random_placement_summary,
         "duplicate_resolution": "first_seen_wins",
         "block_class_counts": {CLASS_NAMES[i]: int(class_occurrences[i]) for i in range(4)},
         "chunk_occurrences": len(occurrences),
