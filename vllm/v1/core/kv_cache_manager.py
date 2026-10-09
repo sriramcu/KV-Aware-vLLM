@@ -592,6 +592,9 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        # [SC] Last-chance labels for delayed-cache paths, before ref_cnt -> 0.
+        # Active KV is still owned by the request here.
+        self._set_importance_for_request_blocks(request)
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(
@@ -777,6 +780,9 @@ class KVCacheManager:
         """
         if self.enable_caching:
             self.coordinator.cache_blocks(request, num_computed_tokens)
+            # [SC] Cache-finalization paths outside allocate_slots (including
+            # delayed caching) must tag blocks before their eventual release.
+            self._set_importance_for_request_blocks(request)
 
     def create_kv_cache_blocks(
         self, blocks: tuple[list[KVCacheBlock], ...]

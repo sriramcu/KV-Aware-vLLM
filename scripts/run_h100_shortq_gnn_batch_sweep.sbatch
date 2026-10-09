@@ -7,8 +7,8 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
 #SBATCH --time=03:00:00
-#SBATCH --output=/mnt/shared/gpfs/home/sriramc2/runs/kvaware/%x_%j.out
-#SBATCH --error=/mnt/shared/gpfs/home/sriramc2/runs/kvaware/%x_%j.err
+#SBATCH --output=/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/logs/%x_%j.out
+#SBATCH --error=/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro/logs/%x_%j.err
 set -Eeuo pipefail
 
 # Standalone Short-Q precompute/inference sweep ONLY.
@@ -18,7 +18,7 @@ set -Eeuo pipefail
 REPO=/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
 VENV=/mnt/shared/gpfs/home/sriramc2/venvs/kvaware-vllm029
 CUDA_HOME=/usr/local/cuda-13.1
-RUN_ROOT=/mnt/shared/gpfs/home/sriramc2/runs/kvaware
+RUN_ROOT=/mnt/shared/gpfs/home/sriramc2/runs/kvaware_repro
 
 BATCH_CSV="${1:-1,2,4,8,16}"
 NUM_QUESTIONS="${2:-96}"
@@ -30,7 +30,7 @@ SERVING_MODEL="${SERVING_MODEL:-meta-llama/Llama-3.3-70B-Instruct}"
 CHECKPOINT="${REPO}/Hierarchical_KV/shortq_placement/model.pt"
 
 SWEEP_DIR="${RUN_ROOT}/h100_shortq_gnn_batch_sweep_${SLURM_JOB_ID}"
-mkdir -p "$SWEEP_DIR"
+mkdir -p "$SWEEP_DIR" "${RUN_ROOT}/logs"
 
 cd "$REPO"
 source "${VENV}/bin/activate"
@@ -84,12 +84,12 @@ for BS in "${BATCHES[@]}"; do
     --max_seq_len 8000 \
     --device cuda:0 \
     --inference_batch_size "$BS" \
-    --runtime_metadata "${OUT}/runtime_hash_to_placement.json" \
+    --runtime_metadata "${OUT}/runtime_hash_to_tier.json" \
     --placement_trace "${OUT}/gnn_chunk_placements.jsonl" \
     --hash_prediction_trace "${OUT}/gnn_hash_prediction_occurrences.jsonl" \
     --timing_trace "${OUT}/gnn_prediction_timing.jsonl" \
     --summary "${OUT}/gnn_placement_summary.json" \
-    --smoke_force_min_unique_per_placement 0 \
+    --smoke_force_min_unique_per_tier 0 \
     > "${OUT}/precompute.log" 2>&1
   RC=$?
   set -e
@@ -101,9 +101,9 @@ for BS in "${BATCHES[@]}"; do
   fi
 
   if [[ "$BS" == "1" ]]; then
-    REF_METADATA="${OUT}/runtime_hash_to_placement.json"
+    REF_METADATA="${OUT}/runtime_hash_to_tier.json"
     MATCH=yes
-  elif [[ -n "$REF_METADATA" ]] && cmp -s "$REF_METADATA" "${OUT}/runtime_hash_to_placement.json"; then
+  elif [[ -n "$REF_METADATA" ]] && cmp -s "$REF_METADATA" "${OUT}/runtime_hash_to_tier.json"; then
     MATCH=yes
   elif [[ -n "$REF_METADATA" ]]; then
     MATCH=NO

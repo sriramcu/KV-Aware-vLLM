@@ -1,0 +1,1014 @@
+diff --git a/docs/SC_VPC_POLICY_REFACTOR.md b/docs/SC_VPC_POLICY_REFACTOR.md
+new file mode 100644
+index 0000000..8a5f545
+--- /dev/null
++++ b/docs/SC_VPC_POLICY_REFACTOR.md
+@@ -0,0 +1,92 @@
++# [SC] Modular VPC policy refactor (vLLM 0.29.0)
++
++This patch is limited to the vLLM V1 GPU prefix-cache policy. It does **not**
++implement the future hindsight/oracle placement provider, its ranking file,
++or any LMCache L1/L2 policy changes.
++
++## Configuration
++
++Set `VLLM_VPC_POLICY` in the **vLLM scheduler/engine process**:
++
++| Value | Prefix-cache admission after final unref | Allocation / victim policy |
++| --- | --- | --- |
++| `vanilla` | Upstream | Original `FreeKVCacheBlockQueue.popleft_n`, O(1) per block |
++| `window` | Upstream | Existing Short-Q min-rank among oldest W cached blocks, O(W) |
++| `tierwise` | Upstream | Unlabeled -> disk -> cpu -> gpu; oldest within class, O(1) cached-victim selection |
++| `selective` | Retain only GPU-labelled blocks | Original upstream LRU bulk allocator |
++
++Default is **backward-compatible**: if `VLLM_VPC_POLICY` is omitted,
++`VLLM_GNN_AWARE_VPC=1` continues to select `window` and absence of this flag
++selects `vanilla`. The explicit mode always takes precedence. `window` uses
++`VLLM_GNN_AWARE_VPC_WINDOW=256` by default, as before. `enable_kv_importance`
++remains active for `window`, `tierwise`, and `selective` and inactive for
++`vanilla`. The existing request-to-block importance hook is retained.
++
++The physical block size remains **16 tokens**. The placement producer still
++assigns one class to each **512-token LMCache chunk** and propagates it to the
++native blocks through `request.kv_importance_placements`. Selective admission
++makes no independent blockwise prediction; unknown/unlabelled blocks are
++conservatively *not* retained after `ref_cnt` reaches zero.
++
++Tierwise uses secondary indexes over the stock free queue. Fixed-class victim
++selection and removal are O(1). The rare operation of changing the label of
++an already-free cached block may reinsert it in LRU order with O(N) metadata
++maintenance; that does not happen during victim selection. Explicit hash
++invalidations (including free-list interior entries) are handled by a separate
++uncached index. The original free list owns block availability/refcounts.
++
++## Logging
++
++`[VPC_POLICY_INIT]` appears in normal vLLM logs at initialization.
++`[GNN_AWARE_VPC_INIT]` and the first `[GNN_AWARE_VPC_BIAS]` are retained for
++window-mode backward compatibility.
++
++At **normal interpreter shutdown**, `[VPC_SUMMARY]` emits a cumulative JSON
++record in the normal vLLM log. The summary includes cached allocation-time
++reclaims by victim tier (counts and percentages), uncached allocations, total
++selection CPU time, approximate p95 (logarithmic histogram *upper boundary*),
++mean number of scanned candidates, LRU bypass rate, selective admission
++rejections, and explicit hash invalidations. The victim percentage denominator
++is *only cached blocks reclaimed for new allocations*: it excludes uncached
++free-slot reuse, explicit hash invalidation, and selective admission rejection.
++
++For snapshots every few seconds in a **separate file**, opt in with:
++
++```bash
++export VLLM_VPC_STATS_JSONL=/path/to/run/logs/vpc_periodic.jsonl
++export VLLM_VPC_STATS_INTERVAL_S=5
++```
++
++The writer is a daemon thread, not a write in the scheduler's eviction path.
++The actual output filename contains `.pid<PID>` before `.jsonl`, avoiding
++clobbering across processes. Snapshots are cumulative. The free-block count
++is included. IO errors are reported in the main log.
++
++**Reporting caveats:** Neither the BlockPool nor this patch knows the cold/warm
++phase boundary. Per-phase deltas can be calculated by subtracting snapshots,
++or a future runner can invoke `BlockPool.get_vpc_stats_snapshot()` at phase
++boundaries. Existing `results/summary.json` analyzers are untouched. Abrupt
++SIGKILL/SIGTERM may bypass the interpreter's shutdown hook, so keep periodic
++JSONL enabled for diagnostic runs or explicitly snapshot before stopping the
++engine. The periodic reader does not acquire scheduler locks; snapshots are
++best-effort and can momentarily reflect partially updated counters.
++
++## Safety and validation
++
++The patch adds no launch-script, GNN predictor, LMCache, GPU kernel, or
++external-cache changes. `KVCacheManager.cache_blocks()` and `.free()` additionally
++ensure importance propagation before release even on delayed paths. An
++existing cached-hash copy-on-write transfer now transfers the old content's
++importance label to the destination physical block.
++
++On CodeNimbus after applying the patch to the matching project commit:
++
++```bash
++$VENV/bin/python -m pytest -q tests/v1/core/test_sc_vpc_policies.py
++$VENV/bin/python -m pytest -q tests/v1/core/test_prefix_caching.py
++$VENV/bin/python -m pytest -q tests/v1/core/test_kv_cache_utils.py
++```
++
++Start with smoke requests before Q650. Check that all modes initialize with
++the intended configuration and all cached block accounting remains correct.
++Do not interpret local unit-test passing as production/TP2 validation.
+diff --git a/tests/v1/core/test_sc_vpc_policies.py b/tests/v1/core/test_sc_vpc_policies.py
+new file mode 100644
+index 0000000..783bed1
+--- /dev/null
++++ b/tests/v1/core/test_sc_vpc_policies.py
+@@ -0,0 +1,213 @@
++# SPDX-License-Identifier: Apache-2.0
++# [SC] Unit tests for the four VPC policies on real BlockPool metadata.
++import pytest
++
++from vllm.v1.core.block_pool import BlockPool
++
++
++def _make_pool(monkeypatch, mode: str, *, window: int = 3):
++    monkeypatch.setenv("VLLM_VPC_POLICY", mode)
++    monkeypatch.setenv("VLLM_GNN_AWARE_VPC_WINDOW", str(window))
++    monkeypatch.delenv("VLLM_VPC_STATS_JSONL", raising=False)
++    pool = BlockPool(num_gpu_blocks=12, enable_caching=True, hash_block_size=16)
++    blocks = pool.get_new_blocks(11)  # Block 0 is the null block.
++    for i, block in enumerate(blocks):
++        # A unique, prefix-like hash for each physical block.
++        pool._insert_block_hash(b"sc-vpc-" + i.to_bytes(2, "big") + b"\0\0\0\0",
++                                block, num_tokens=(i + 1) * 16)
++    return pool, blocks
++
++
++def test_vpc_legacy_policy_default(monkeypatch):
++    monkeypatch.delenv("VLLM_VPC_POLICY", raising=False)
++    monkeypatch.setenv("VLLM_GNN_AWARE_VPC", "1")
++    pool = BlockPool(8, True, 16)
++    assert pool.vpc_policy_name == "window"
++    monkeypatch.setenv("VLLM_VPC_POLICY", "vanilla")
++    pool = BlockPool(8, True, 16)
++    assert pool.vpc_policy_name == "vanilla"
++
++
++def test_window_matches_bounded_minimum(monkeypatch):
++    pool, blocks = _make_pool(monkeypatch, "window", window=3)
++    # Reversed free order: newest ID is the oldest eviction candidate.
++    for block in blocks:
++        pool.set_block_importance(
++            block.block_id, "disk" if block is blocks[-2] else "gpu"
++        )
++    pool.free_blocks(reversed(blocks))
++    victim = pool.get_new_blocks(1)[0]
++    assert victim is blocks[-2]  # disk within the oldest three
++    assert pool.vpc_stats.bypassed_lru == 1
++    assert pool.vpc_stats.scanned == 3
++
++
++def test_tierwise_priorities_touch_and_explicit_invalidation(monkeypatch):
++    pool, blocks = _make_pool(monkeypatch, "tierwise")
++    # Every block is cached. Label one free block each disk, cpu, gpu;
++    # the rest are deliberately left unlabeled.
++    for block in blocks:
++        pool.set_block_importance(block.block_id, "gpu")
++    pool.set_block_importance(blocks[2].block_id, "disk")  # actually max gpu - no downgrade
++    pool.free_blocks(reversed(blocks))
++    assert pool.get_new_blocks(1)[0] is blocks[-1]
++    # A free cached block can be touched; it must disappear from the index.
++    touched = blocks[0]
++    pool.touch([touched])
++    assert touched.ref_cnt == 1
++    pool.free_blocks([touched])
++    # Explicit invalidation leaves an uncacheable block in the free list.
++    victim = blocks[4]
++    pool.evict_blocks({victim.block_id})
++    assert victim.block_hash is None
++    assert pool.get_new_blocks(1)[0] is victim
++
++
++def test_tierwise_strict_order_and_relabel(monkeypatch):
++    pool, blocks = _make_pool(monkeypatch, "tierwise")
++    # Assign explicit different priorities before the free operation.
++    pool.set_block_importance(blocks[-1].block_id, "gpu")
++    pool.set_block_importance(blocks[-2].block_id, "cpu")
++    pool.set_block_importance(blocks[-3].block_id, "disk")
++    pool.free_blocks(reversed(blocks))
++    # Remaining unlabelled blocks are evicted first, even when older labelled
++    # blocks precede them in the global LRU queue.
++    assert pool.get_new_blocks(1)[0] is blocks[-4]
++    # Relabel an already-free disk block to GPU: it must move tier queues.
++    pool.set_block_importance(blocks[-3].block_id, "gpu")
++    for _ in range(7):
++        assert pool.get_new_blocks(1)[0].block_id in {
++            block.block_id for block in blocks[:7]
++        }
++    assert pool.get_new_blocks(1)[0] is blocks[-2]  # CPU before GPU
++
++
++def test_selective_only_keeps_gpu_hashes(monkeypatch):
++    pool, blocks = _make_pool(monkeypatch, "selective")
++    pool.set_block_importance(blocks[2].block_id, "gpu")
++    pool.set_block_importance(blocks[1].block_id, "cpu")
++    pool.set_block_importance(blocks[0].block_id, "disk")
++    pool.free_blocks(reversed(blocks))
++    assert blocks[2].block_hash is not None
++    assert all(block.block_hash is None for block in blocks if block is not blocks[2])
++    assert pool.get_num_free_blocks() == 11
++    assert sum(pool.vpc_stats.admission_rejects.values()) == 10
++
++
++def test_all_policies_recycle_same_number_of_blocks(monkeypatch):
++    for mode in ("vanilla", "window", "tierwise", "selective"):
++        pool, blocks = _make_pool(monkeypatch, mode)
++        pool.free_blocks(reversed(blocks))
++        assert pool.get_num_free_blocks() == 11
++        allocated = pool.get_new_blocks(11)
++        assert {block.block_id for block in allocated} == {
++            block.block_id for block in blocks
++        }
++        assert pool.get_num_free_blocks() == 0
++        assert all(block.ref_cnt == 1 for block in allocated)
++        pool.free_blocks(reversed(allocated))
++        assert pool.get_num_free_blocks() == 11
++
++
++def test_selective_waits_for_last_reference_and_removes_all_hashes(monkeypatch):
++    pool, blocks = _make_pool(monkeypatch, "selective")
++    block = blocks[0]
++    additional_hash = b"sc-vpc-extra\0\0\0\0"
++    pool._insert_block_hash(additional_hash, block, num_tokens=16)
++    block.ref_cnt += 1  # A second live owner still needs the same KV.
++    pool.free_blocks([block])
++    assert block.ref_cnt == 1
++    assert block.block_hash is not None
++    pool.free_blocks([block])
++    assert block.ref_cnt == 0
++    assert block.block_hash is None
++    assert not pool.cached_block_hash_to_block.contain(additional_hash, block.block_id)
++    assert block.block_id not in pool.cached_block_hashes_by_block
++
++
++def test_move_block_hashes_transfers_importance(monkeypatch):
++    pool, blocks = _make_pool(monkeypatch, "tierwise")
++    src, dst = blocks[0], blocks[1]
++    pool.set_block_importance(src.block_id, "gpu")
++    assert pool._maybe_evict_cached_block(dst)
++    pool.move_block_hashes(src, dst)
++    assert src.block_hash is None
++    assert dst.block_hash is not None
++    assert pool.kv_importance_by_block_id.get(src.block_id) is None
++    assert pool.kv_importance_by_block_id[dst.block_id] == "gpu"
++    pool.free_blocks(reversed(blocks))
++    assert pool.get_num_free_blocks() == 11
++    # All unlabeled cached blocks are preferable victims to the GPU block.
++    for _ in range(9):
++        assert pool.get_new_blocks(1)[0] is not dst
++
++
++def test_vpc_stats_snapshot_counts_and_percentages(monkeypatch):
++    pool, blocks = _make_pool(monkeypatch, "window")
++    for block in blocks:
++        pool.set_block_importance(block.block_id, "disk")
++    pool.free_blocks(reversed(blocks))
++    before = pool.get_vpc_stats_snapshot()
++    pool.get_new_blocks(2)
++    report = pool.get_vpc_stats_snapshot()
++    assert report["cached_reclaims"] == 2
++    assert report["victim_counts"]["disk"] == 2
++    assert report["victim_pct"]["disk"] == 100.0
++    assert report["select_calls"] == before["select_calls"] + 2
++    assert report["mean_candidates"] == pytest.approx(6 / 13, abs=0.001)
++
++
++def test_tierwise_free_index_randomized_lifecycle(monkeypatch):
++    import random
++
++    rng = random.Random(17)
++    monkeypatch.setenv("VLLM_VPC_POLICY", "tierwise")
++    monkeypatch.delenv("VLLM_VPC_STATS_JSONL", raising=False)
++    pool = BlockPool(65, True, 16)
++    active = {}
++    next_hash = 0
++    for _ in range(1400):
++        free = pool.free_block_queue.get_all_free_blocks()
++        operation = rng.random()
++        if operation < 0.44 and free:
++            block = pool.get_new_blocks(1)[0]
++            next_hash += 1
++            if rng.random() < .75:
++                pool._insert_block_hash(
++                    f"unique-{next_hash}".encode() + b"\0\0\0\0",
++                    block, num_tokens=16,
++                )
++                if rng.random() < .80:
++                    pool.set_block_importance(
++                        block.block_id, rng.choice(("disk", "cpu", "gpu"))
++                    )
++            active[block.block_id] = block
++        elif operation < .81 and active:
++            block_id = rng.choice(list(active))
++            block = active.pop(block_id)
++            pool.free_blocks([block])
++        elif operation < .93:
++            cached_free = [b for b in free if b.block_hash is not None]
++            if cached_free:
++                block = rng.choice(cached_free)
++                pool.evict_blocks({block.block_id})
++        elif free:
++            cached_free = [b for b in free if b.block_hash is not None]
++            if cached_free:
++                block = rng.choice(cached_free)
++                pool.touch([block])
++                active[block.block_id] = block
++        assert pool.get_num_free_blocks() == len(pool.free_block_queue.get_all_free_blocks())
++        index = pool._tierwise_eviction
++        indexed_cached = set().union(*(set(q) for q in index.cached.values()))
++        indexed_uncached = set(index.uncached)
++        assert not (indexed_cached & indexed_uncached)
++        assert indexed_cached | indexed_uncached == {
++            block.block_id for block in pool.free_block_queue.get_all_free_blocks()
++        }
++        actual_by_tier = {tier: [] for tier in index.cached}
++        for block in pool.free_block_queue.get_all_free_blocks():
++            if block.block_hash is not None:
++                actual_by_tier[index.tier(block)].append(block.block_id)
++        for tier, expected in actual_by_tier.items():
++            assert list(index.cached[tier]) == expected
+diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
+index 1a55f42..c9141ce 100644
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -5,6 +5,7 @@
+ 
+ # [SC] Environment-gated Short-Q VPC policy.
+ import os
++import time
+ from collections.abc import Iterable, Sequence
+ from typing import Any
+ 
+@@ -31,6 +32,10 @@ from vllm.v1.core.kv_cache_utils import (
+     resolve_block_hashes,
+ )
+ from vllm.v1.request import Request
++from vllm.v1.core.vpc_policies.stats import VPCStats
++from vllm.v1.core.vpc_policies.window import WindowEviction
++from vllm.v1.core.vpc_policies.tierwise import TierwiseEviction
++from vllm.v1.core.vpc_policies.selective import admit_for_reuse
+ 
+ logger = init_logger(__name__)
+ 
+@@ -173,11 +178,18 @@ class BlockPool:
+         metrics_collector: KVCacheMetricsCollector | None = None,
+     ):
+         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
+-        # [SC] Short-Q bounded VPC bias. This is inert unless explicitly
+-        # enabled and only changes victim selection inside the oldest cached
+-        # LRU window; normal free-list ordering remains upstream behavior.
+-        self.enable_gnn_aware_vpc = os.environ.get("VLLM_GNN_AWARE_VPC") == "1"
+-        self.enable_kv_importance = self.enable_gnn_aware_vpc
++        # [SC] Select once at initialization. Legacy enable flag remains an
++        # alias for window mode when VLLM_VPC_POLICY is unset.
++        legacy_enabled = os.environ.get("VLLM_GNN_AWARE_VPC") == "1"
++        self.vpc_policy_name = os.environ.get(
++            "VLLM_VPC_POLICY", "window" if legacy_enabled else "vanilla"
++        ).strip().lower()
++        if self.vpc_policy_name not in (
++            "vanilla", "window", "tierwise", "selective"
++        ):
++            raise ValueError(f"Unknown VLLM_VPC_POLICY={self.vpc_policy_name!r}")
++        self.enable_gnn_aware_vpc = self.vpc_policy_name == "window"
++        self.enable_kv_importance = self.vpc_policy_name != "vanilla"
+         self.gnn_aware_vpc_window = int(
+             os.environ.get("VLLM_GNN_AWARE_VPC_WINDOW", "256")
+         )
+@@ -185,7 +197,6 @@ class BlockPool:
+             raise ValueError("VLLM_GNN_AWARE_VPC_WINDOW must be >= 1")
+         self.kv_importance_by_block_id: dict[int, str] = {}
+         self._logged_importance_placements: set[str] = set()
+-        self._logged_gnn_bias = False
+         self.num_gpu_blocks = num_gpu_blocks
+         self.enable_caching = enable_caching
+         self.hash_block_size = hash_block_size
+@@ -212,12 +223,34 @@ class BlockPool:
+         self.kv_event_queue: list[KVCacheEvent] = []
+ 
+         self.metrics_collector = metrics_collector
+-
+-        if self.enable_gnn_aware_vpc:
++        # [SC] Vanilla/selective retain upstream bulk popleft_n allocation.
++        self.vpc_stats = VPCStats(
++            self.vpc_policy_name,
++            self.gnn_aware_vpc_window if self.vpc_policy_name == "window" else None,
++        )
++        self.vpc_stats.free_blocks_provider = self.get_num_free_blocks
++        self._window_eviction = (
++            WindowEviction(self, self.gnn_aware_vpc_window)
++            if self.vpc_policy_name == "window" else None
++        )
++        self._tierwise_eviction = (
++            TierwiseEviction(self) if self.vpc_policy_name == "tierwise" else None
++        )
++        if self.vpc_policy_name == "window":
++            self._pop_policy_victim = self._window_eviction.pop
++        elif self.vpc_policy_name == "tierwise":
++            self._pop_policy_victim = self._tierwise_eviction.pop
++        else:
++            self._pop_policy_victim = None
++        logger.info(
++            "[VPC_POLICY_INIT] mode=%s window=%d enabled_caching=%s num_gpu_blocks=%d",
++            self.vpc_policy_name, self.gnn_aware_vpc_window,
++            self.enable_caching, self.num_gpu_blocks,
++        )
++        if self.vpc_policy_name == "window":
+             logger.info(
+                 "[GNN_AWARE_VPC_INIT] enabled=1 window=%d num_gpu_blocks=%d",
+-                self.gnn_aware_vpc_window,
+-                self.num_gpu_blocks,
++                self.gnn_aware_vpc_window, self.num_gpu_blocks,
+             )
+ 
+     @staticmethod
+@@ -240,6 +273,8 @@ class BlockPool:
+         previous = self.kv_importance_by_block_id.get(block_id)
+         if previous is None or self._importance_rank(placement) > self._importance_rank(previous):
+             self.kv_importance_by_block_id[block_id] = placement
++            if self._tierwise_eviction is not None:
++                self._tierwise_eviction.on_label_changed(self.blocks[block_id])
+         if placement not in self._logged_importance_placements:
+             self._logged_importance_placements.add(placement)
+             logger.info(
+@@ -256,53 +291,6 @@ class BlockPool:
+             return -1
+         return self._importance_rank(placement)
+ 
+-    # [SC] Bounded semantic victim selection layered on upstream LRU.
+-    def _pop_gnn_aware_victim(self) -> KVCacheBlock:
+-        """Pop one free block using bounded GNN-biased LRU.
+-
+-        Uncached blocks retain normal front-of-queue reuse priority. Once the
+-        oldest free block is cached, inspect at most ``window`` consecutive
+-        reclaimable cached blocks and choose the least-important placement within
+-        that old window. Ties preserve LRU order. This intentionally prevents
+-        semantic importance from dominating global recency.
+-        """
+-        head = self.free_block_queue.fake_free_list_head.next_free_block
+-        tail = self.free_block_queue.fake_free_list_tail
+-        if head is None or head is tail:
+-            raise ValueError("No free blocks available")
+-        if head.block_hash is None or not self.enable_caching:
+-            return self.free_block_queue.popleft()
+-
+-        candidates: list[KVCacheBlock] = []
+-        current = head
+-        while current is not None and current is not tail:
+-            if current.block_hash is None:
+-                break
+-            candidates.append(current)
+-            if len(candidates) >= self.gnn_aware_vpc_window:
+-                break
+-            current = current.next_free_block
+-
+-        victim = min(candidates, key=self.get_block_importance_rank)
+-        if victim is head:
+-            return self.free_block_queue.popleft()
+-
+-        self.free_block_queue.remove(victim)
+-        if not self._logged_gnn_bias:
+-            self._logged_gnn_bias = True
+-            logger.info(
+-                "[GNN_AWARE_VPC_BIAS] window=%d oldest_block=%d oldest_placement=%s "
+-                "selected_block=%d selected_placement=%s",
+-                len(candidates),
+-                head.block_id,
+-                self.kv_importance_by_block_id.get(head.block_id, "unlabeled"),
+-                victim.block_id,
+-                self.kv_importance_by_block_id.get(
+-                    victim.block_id, "unlabeled"
+-                ),
+-            )
+-        return victim
+-
+     def get_cached_block(
+         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
+     ) -> list[KVCacheBlock] | None:
+@@ -751,6 +739,15 @@ class BlockPool:
+         for block_hash in self._remove_cached_block_hashes(src_block):
+             # `num_tokens` only applies to the first (primary) insertion.
+             self._insert_block_hash(block_hash, dst_block, num_tokens=num_tokens)
++        # [SC] A CoW hash transfer also transfers the label of that KV content.
++        # Source blocks can be mutated afterward; they must not retain the
++        # old content's priority while the private cached copy lacks it.
++        old_label = self.kv_importance_by_block_id.pop(src_block.block_id, None)
++        if old_label is not None:
++            self.set_block_importance(dst_block.block_id, old_label)
++        if self._tierwise_eviction is not None:
++            self._tierwise_eviction.on_hash_invalidated(src_block)
++            self._tierwise_eviction.on_label_changed(dst_block)
+ 
+     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
+         """Get new blocks from the free block pool.
+@@ -766,15 +763,27 @@ class BlockPool:
+         if num_blocks > self.get_num_free_blocks():
+             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
+ 
+-        # [SC] Select a bounded semantic victim only when the policy is enabled.
+-        if self.enable_gnn_aware_vpc and self.enable_caching:
+-            ret = [self._pop_gnn_aware_victim() for _ in range(num_blocks)]
+-        else:
++        # [SC] Dispatch once via an initialization-selected callable; the
++        # vanilla and selective modes use the original bulk fast path.
++        if self._pop_policy_victim is None or not self.enable_caching:
+             ret = self.free_block_queue.popleft_n(num_blocks)
++        else:
++            ret = []
++            for _ in range(num_blocks):
++                start_ns = time.perf_counter_ns()
++                victim, candidates, bypass = self._pop_policy_victim()
++                self.vpc_stats.record_selection(
++                    time.perf_counter_ns() - start_ns, candidates, bypass
++                )
++                ret.append(victim)
+ 
+         # In order to only iterate the list once, we duplicated code a bit
+         if self.enable_caching:
+             for block in ret:
++                self.vpc_stats.record_reclaim(
++                    self.kv_importance_by_block_id.get(block.block_id),
++                    cached=block.block_hash is not None,
++                )
+                 self._maybe_evict_cached_block(block)
+                 # [SC] The old object's label was needed for victim selection, but the
+                 # physical block is now being allocated to new content.
+@@ -786,6 +795,7 @@ class BlockPool:
+                     self.metrics_collector.on_block_allocated(block)
+         else:
+             for block in ret:
++                self.vpc_stats.record_reclaim(None, cached=False)
+                 self.kv_importance_by_block_id.pop(block.block_id, None)
+                 assert block.ref_cnt == 0
+                 block.ref_cnt += 1
+@@ -809,6 +819,8 @@ class BlockPool:
+             self.metrics_collector.on_block_evicted(block)
+ 
+         evicted_hashes = self._remove_cached_block_hashes(block)
++        if evicted_hashes and self._tierwise_eviction is not None:
++            self._tierwise_eviction.on_hash_invalidated(block)
+         if not evicted_hashes:
+             # The block doesn't have hash, eviction is not needed
+             return False
+@@ -828,6 +840,8 @@ class BlockPool:
+             # ref_cnt=0 means this block is in the free list (i.e. eviction
+             # candidate), so remove it.
+             if block.ref_cnt == 0 and not block.is_null:
++                if self._tierwise_eviction is not None:
++                    self._tierwise_eviction.discard(block)
+                 self.free_block_queue.remove(block)
+             block.ref_cnt += 1
+             if self.metrics_collector:
+@@ -845,16 +859,23 @@ class BlockPool:
+             ordered_blocks: A list of blocks to free ordered by their eviction
+                 priority.
+         """
+-        # [SC] Keep upstream release/LRU ordering intact. The GNN policy acts
+-        # only when selecting a reclaimable cached victim in get_new_blocks().
+-        blocks_list = list(ordered_blocks)
+-
++        # [SC] Policy-specific admission is evaluated only at ref_cnt == 0.
++        # No policy can reject/reclaim KV still referenced by active requests.
+         # Identify blocks with hash (LRU cache) and without it (never match APC)
+         blocks_to_evict_last = []
+         blocks_to_evict_first = []
+-        for block in blocks_list:
++        for block in ordered_blocks:
+             block.ref_cnt -= 1
+             if block.ref_cnt == 0 and not block.is_null:
++                if (self.vpc_policy_name == "selective" and self.enable_caching
++                        and block.block_hash is not None
++                        and not admit_for_reuse(block, self.kv_importance_by_block_id)):
++                    self.vpc_stats.record_reject(
++                        self.kv_importance_by_block_id.get(block.block_id)
++                    )
++                    # Use upstream multi-hash invalidation, including partial
++                    # prefix entries and corresponding KV-cache events.
++                    self._maybe_evict_cached_block(block)
+                 if block.block_hash is None or not self.enable_caching:
+                     # LIFO reuse of non-cached blocks for better GPU locality.
+                     blocks_to_evict_first.append(block)
+@@ -866,6 +887,10 @@ class BlockPool:
+         self.free_block_queue.prepend_n(blocks_to_evict_first)
+         # Blocks to reuse last are appended to the end of the free queue.
+         self.free_block_queue.append_n(blocks_to_evict_last)
++        if self._tierwise_eviction is not None:
++            self._tierwise_eviction.on_free(
++                blocks_to_evict_first, blocks_to_evict_last
++            )
+ 
+     def evict_blocks(self, block_ids: set[int]) -> None:
+         """evict blocks from the prefix cache by their block IDs.
+@@ -884,7 +909,8 @@ class BlockPool:
+                 f"only report block IDs that were allocated by the scheduler."
+             )
+             block = self.blocks[block_id]
+-            self._maybe_evict_cached_block(block)
++            if self._maybe_evict_cached_block(block):
++                self.vpc_stats.explicit_hash_invalidations += 1
+ 
+     def reset_prefix_cache(self) -> bool:
+         """Reset prefix cache. This function may be used in RLHF
+@@ -911,6 +937,10 @@ class BlockPool:
+         # Remove all hashes from all blocks.
+         for block in self.blocks:
+             block.reset_hash()
++        self.kv_importance_by_block_id.clear()
++        if self._tierwise_eviction is not None:
++            self._tierwise_eviction = TierwiseEviction(self)
++            self._pop_policy_victim = self._tierwise_eviction.pop
+ 
+         if self.metrics_collector:
+             self.metrics_collector.reset()
+@@ -922,6 +952,10 @@ class BlockPool:
+ 
+         return True
+ 
++    def get_vpc_stats_snapshot(self) -> dict[str, Any]:
++        """Read-only cumulative VPC policy metrics for diagnostics/phase barriers."""
++        return self.vpc_stats.snapshot()
++
+     def get_num_free_blocks(self) -> int:
+         """Get the number of free blocks in the pool.
+ 
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index 2f37cac..784a68f 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -592,6 +592,9 @@ class KVCacheManager:
+         Args:
+             request: The request to free the blocks.
+         """
++        # [SC] Last-chance labels for delayed-cache paths, before ref_cnt -> 0.
++        # Active KV is still owned by the request here.
++        self._set_importance_for_request_blocks(request)
+         self.coordinator.free(request.request_id)
+ 
+     def remove_skipped_blocks(
+@@ -777,6 +780,9 @@ class KVCacheManager:
+         """
+         if self.enable_caching:
+             self.coordinator.cache_blocks(request, num_computed_tokens)
++            # [SC] Cache-finalization paths outside allocate_slots (including
++            # delayed caching) must tag blocks before their eventual release.
++            self._set_importance_for_request_blocks(request)
+ 
+     def create_kv_cache_blocks(
+         self, blocks: tuple[list[KVCacheBlock], ...]
+diff --git a/vllm/v1/core/vpc_policies/__init__.py b/vllm/v1/core/vpc_policies/__init__.py
+new file mode 100644
+index 0000000..cb8fbe1
+--- /dev/null
++++ b/vllm/v1/core/vpc_policies/__init__.py
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: Apache-2.0
++# [SC] VPC policies. BlockPool remains the sole owner of block/hash lifecycles.
+diff --git a/vllm/v1/core/vpc_policies/selective.py b/vllm/v1/core/vpc_policies/selective.py
+new file mode 100644
+index 0000000..3464bbd
+--- /dev/null
++++ b/vllm/v1/core/vpc_policies/selective.py
+@@ -0,0 +1,18 @@
++# SPDX-License-Identifier: Apache-2.0
++# [SC] Selective VPC admission at the *existing* 16-token block lifecycle.
++from __future__ import annotations
++
++from typing import TYPE_CHECKING
++
++if TYPE_CHECKING:
++    from vllm.v1.core.kv_cache_utils import KVCacheBlock
++
++
++def admit_for_reuse(block: KVCacheBlock, labels: dict[int, str]) -> bool:
++    """Only GPU-labelled blocks retain searchable prefix hashes on release.
++
++    Chunk->block label propagation remains with the existing placement producer;
++    no independent blockwise prediction or oracle is performed here. A missing
++    label is conservatively rejected. Referenced blocks are never invalidated.
++    """
++    return labels.get(block.block_id) == "gpu"
+diff --git a/vllm/v1/core/vpc_policies/stats.py b/vllm/v1/core/vpc_policies/stats.py
+new file mode 100644
+index 0000000..ac881a5
+--- /dev/null
++++ b/vllm/v1/core/vpc_policies/stats.py
+@@ -0,0 +1,141 @@
++# SPDX-License-Identifier: Apache-2.0
++# [SC] Cheap in-memory VPC accounting; optional off-path periodic JSONL writer.
++from __future__ import annotations
++
++import atexit
++import json
++import os
++import threading
++import time
++from collections import Counter
++from pathlib import Path
++from typing import Any, Callable
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++
++class VPCStats:
++    """Counters are scheduler-owned; the reporter reads best-effort snapshots.
++
++    The periodic writer never runs in the eviction call stack. Every JSONL
++    path gains a PID suffix to avoid clobbering other engine processes.
++    """
++
++    def __init__(self, mode: str, window: int | None = None):
++        self.mode = mode
++        self.window = window
++        self.start_ns = time.monotonic_ns()
++        self.cached_reclaims: Counter[str] = Counter()
++        self.admission_rejects: Counter[str] = Counter()
++        self.uncached_allocations = 0
++        self.explicit_hash_invalidations = 0
++        self.free_blocks_provider: Callable[[], int] | None = None
++        self.select_calls = 0
++        self.scanned = 0
++        self.bypassed_lru = 0
++        self.select_ns = 0
++        # Coarse logarithmic histogram (nanosecond-scale buckets) for
++        # constant-space latency distribution, including approximated p95.
++        self.latency_hist: Counter[int] = Counter()
++        self._closed = False
++        self._shutdown = threading.Event()
++        self._thread: threading.Thread | None = None
++        target = os.environ.get("VLLM_VPC_STATS_JSONL", "").strip()
++        self.periodic_path: Path | None = None
++        if target:
++            requested = Path(target).expanduser()
++            self.periodic_path = requested.with_name(
++                f"{requested.stem}.pid{os.getpid()}{requested.suffix or '.jsonl'}"
++            )
++            interval = float(os.environ.get("VLLM_VPC_STATS_INTERVAL_S", "5"))
++            if interval <= 0:
++                raise ValueError("VLLM_VPC_STATS_INTERVAL_S must be > 0")
++            self._thread = threading.Thread(
++                target=self._periodic_writer, args=(interval,),
++                name="vpc-periodic-stats", daemon=True,
++            )
++            self._thread.start()
++        atexit.register(self.emit_final)
++
++    def record_selection(self, elapsed_ns: int, candidates: int, bypass: bool) -> None:
++        self.select_calls += 1
++        self.select_ns += elapsed_ns
++        self.scanned += candidates
++        self.bypassed_lru += int(bypass)
++        self.latency_hist[max(0, elapsed_ns).bit_length()] += 1
++
++    def record_reclaim(self, label: str | None, cached: bool) -> None:
++        if cached:
++            self.cached_reclaims[label or "unlabeled"] += 1
++        else:
++            self.uncached_allocations += 1
++
++    def record_reject(self, label: str | None) -> None:
++        self.admission_rejects[label or "unlabeled"] += 1
++
++    def snapshot(self, free_blocks: int | None = None) -> dict[str, Any]:
++        n = sum(self.cached_reclaims.values())
++        histogram = sorted(self.latency_hist.items())
++        cutoff = max(1, int(self.select_calls * 0.95 + 0.9999))
++        passed = 0
++        p95_upper_us: float | None = None
++        for bit_length, count in histogram:
++            passed += count
++            if passed >= cutoff:
++                p95_upper_us = (2 ** bit_length) / 1000
++                break
++        return {
++            "policy": self.mode,
++            "window": self.window,
++            "pid": os.getpid(),
++            "elapsed_s": round((time.monotonic_ns() - self.start_ns) / 1e9, 3),
++            "free_blocks": free_blocks if free_blocks is not None
++                else (self.free_blocks_provider() if self.free_blocks_provider else None),
++            "explicit_hash_invalidations": self.explicit_hash_invalidations,
++            "cached_reclaims": n,
++            "victim_counts": {tier: self.cached_reclaims[tier]
++                              for tier in ("unlabeled", "disk", "cpu", "gpu")},
++            "victim_pct": {tier: round(100 * self.cached_reclaims[tier] / n, 3)
++                           if n else 0.0
++                           for tier in ("unlabeled", "disk", "cpu", "gpu")},
++            "uncached_allocations": self.uncached_allocations,
++            "select_calls": self.select_calls,
++            "selection_time_ms": round(self.select_ns / 1e6, 3),
++            "selection_p95_upper_us": p95_upper_us,
++            "mean_candidates": round(self.scanned / self.select_calls, 3)
++                               if self.select_calls else 0.0,
++            "different_from_lru_pct": round(
++                100 * self.bypassed_lru / self.select_calls, 3
++            ) if self.select_calls else 0.0,
++            "admission_reject_counts": dict(self.admission_rejects),
++        }
++
++    def _periodic_writer(self, interval: float) -> None:
++        assert self.periodic_path is not None
++        while not self._shutdown.wait(interval):
++            try:
++                self.periodic_path.parent.mkdir(parents=True, exist_ok=True)
++                with self.periodic_path.open("a", encoding="utf-8") as stream:
++                    stream.write(json.dumps(self.snapshot(), sort_keys=True) + "\n")
++            except OSError as exc:
++                logger.warning("[VPC_STATS_IO] periodic=%s error=%s",
++                               self.periodic_path, exc)
++
++    def emit_final(self) -> None:
++        if self._closed:
++            return
++        self._closed = True
++        self._shutdown.set()
++        report = self.snapshot()
++        logger.info("[VPC_SUMMARY] %s", json.dumps(report, sort_keys=True))
++        if self.periodic_path is not None:
++            try:
++                self.periodic_path.parent.mkdir(parents=True, exist_ok=True)
++                with self.periodic_path.open("a", encoding="utf-8") as stream:
++                    stream.write(json.dumps({**report, "final": True},
++                                            sort_keys=True) + "\n")
++            except OSError as exc:
++                logger.warning("[VPC_STATS_IO] final=%s error=%s",
++                               self.periodic_path, exc)
+diff --git a/vllm/v1/core/vpc_policies/tierwise.py b/vllm/v1/core/vpc_policies/tierwise.py
+new file mode 100644
+index 0000000..24da1b8
+--- /dev/null
++++ b/vllm/v1/core/vpc_policies/tierwise.py
+@@ -0,0 +1,116 @@
++# SPDX-License-Identifier: Apache-2.0
++# [SC] O(1) strict-tier victim selection with secondary free-block indexes.
++from __future__ import annotations
++
++from collections import OrderedDict
++from typing import TYPE_CHECKING
++
++if TYPE_CHECKING:
++    from vllm.v1.core.block_pool import BlockPool
++    from vllm.v1.core.kv_cache_utils import KVCacheBlock
++
++TIERS = ("unlabeled", "disk", "cpu", "gpu")
++
++
++class TierwiseEviction:
++    """The upstream doubly linked free list is authoritative.
++
++    Secondary indexes track uncached free blocks and reclaimable cached blocks
++    in release (LRU) order. A fixed four-tier scan is O(1); removing a known
++    free block from the upstream queue is O(1). Rare free-block relabelling
++    may require O(N) index maintenance to preserve LRU-within-tier order.
++    """
++
++    def __init__(self, pool: BlockPool):
++        self.pool = pool
++        self.cached: dict[str, OrderedDict[int, KVCacheBlock]] = {
++            tier: OrderedDict() for tier in TIERS
++        }
++        self.uncached: OrderedDict[int, KVCacheBlock] = OrderedDict()
++        # Initial queue includes all unallocated blocks (except null).
++        for block in pool.free_block_queue.get_all_free_blocks():
++            if block.block_hash is None:
++                self.uncached[block.block_id] = block
++            else:
++                self.cached[self.tier(block)][block.block_id] = block
++
++    def tier(self, block: KVCacheBlock) -> str:
++        return self.pool.kv_importance_by_block_id.get(block.block_id, "unlabeled")
++
++    def discard(self, block: KVCacheBlock) -> None:
++        """O(1) removal for pop/touch/hash-invalidation lifecycle events."""
++        block_id = block.block_id
++        self.uncached.pop(block_id, None)
++        for queue in self.cached.values():
++            queue.pop(block_id, None)
++
++    def on_free(self, uncached: list[KVCacheBlock], cached: list[KVCacheBlock]) -> None:
++        # Upstream prepends uncached in supplied order (LIFO reuse).
++        for block in reversed(uncached):
++            self.discard(block)
++            self.uncached[block.block_id] = block
++            self.uncached.move_to_end(block.block_id, last=False)
++        # Upstream appends cached at the tail, preserving release order.
++        for block in cached:
++            self.discard(block)
++            self.cached[self.tier(block)][block.block_id] = block
++
++    def on_hash_invalidated(self, block: KVCacheBlock) -> None:
++        """Handle explicit eviction while block remains on the free list."""
++        self.discard(block)
++        if (not block.is_null and block.ref_cnt == 0
++                and block.prev_free_block is not None):
++            self.uncached[block.block_id] = block
++
++    def on_label_changed(self, block: KVCacheBlock) -> None:
++        """Preserve LRU within tier even for a rare already-free relabel."""
++        if (block.is_null or block.ref_cnt != 0 or block.block_hash is None
++                or block.prev_free_block is None):
++            return
++        self.discard(block)
++        destination = self.cached[self.tier(block)]
++        # A free-block relabel is rare; follow authoritative LRU ordering.
++        # This costs O(N) only on metadata updates, never on victim selection.
++        following = block.next_free_block
++        while following is not None and following is not self.pool.free_block_queue.fake_free_list_tail:
++            if following.block_id in destination:
++                break
++            following = following.next_free_block
++        if following is None or following is self.pool.free_block_queue.fake_free_list_tail:
++            destination[block.block_id] = block
++        else:
++            rebuilt = OrderedDict()
++            for block_id, value in destination.items():
++                if block_id == following.block_id:
++                    rebuilt[block.block_id] = block
++                rebuilt[block_id] = value
++            self.cached[self.tier(block)] = rebuilt
++
++    def pop(self) -> tuple[KVCacheBlock, int, bool]:
++        queue = self.pool.free_block_queue
++        head = queue.fake_free_list_head.next_free_block
++        tail = queue.fake_free_list_tail
++        if head is None or head is tail:
++            raise ValueError("No free blocks available")
++        # Reproduce stock LIFO behavior for normal noncached head blocks.
++        if head.block_hash is None:
++            victim = queue.popleft()
++            self.discard(victim)
++            return victim, 0, False
++        # Prefer uncached free blocks even if explicit hash invalidation left
++        # one in the interior of the authoritative free queue.
++        if self.uncached:
++            victim = next(iter(self.uncached.values()))
++            queue.remove(victim)
++            self.discard(victim)
++            return victim, 0, victim is not head
++        for tier in TIERS:
++            if self.cached[tier]:
++                victim = next(iter(self.cached[tier].values()))
++                if victim is head:
++                    queue.popleft()
++                else:
++                    queue.remove(victim)
++                self.discard(victim)
++                return victim, 1, victim is not head
++        raise RuntimeError("Tierwise free-block index diverged from upstream queue")
+diff --git a/vllm/v1/core/vpc_policies/window.py b/vllm/v1/core/vpc_policies/window.py
+new file mode 100644
+index 0000000..06058cb
+--- /dev/null
++++ b/vllm/v1/core/vpc_policies/window.py
+@@ -0,0 +1,63 @@
++# SPDX-License-Identifier: Apache-2.0
++# [SC] Bounded GNN-aware eviction; exact victim order of the original W policy.
++from __future__ import annotations
++
++from typing import TYPE_CHECKING
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++if TYPE_CHECKING:
++    from vllm.v1.core.block_pool import BlockPool
++    from vllm.v1.core.kv_cache_utils import KVCacheBlock
++
++
++class WindowEviction:
++    def __init__(self, pool: BlockPool, window: int):
++        if window < 1:
++            raise ValueError("VLLM_GNN_AWARE_VPC_WINDOW must be >= 1")
++        self.pool = pool
++        self.window = window
++        self.logged_bias = False
++
++    def pop(self) -> tuple[KVCacheBlock, int, bool]:
++        """Return (victim, candidates_examined, bypassed_lru_head).
++
++        The original policy always uses an uncached head first and scans only
++        consecutive cached blocks from the head. Ties preserve FIFO/LRU order.
++        """
++        pool = self.pool
++        queue = pool.free_block_queue
++        head = queue.fake_free_list_head.next_free_block
++        tail = queue.fake_free_list_tail
++        if head is None or head is tail:
++            raise ValueError("No free blocks available")
++        if head.block_hash is None or not pool.enable_caching:
++            return queue.popleft(), 0, False
++
++        candidates = []
++        current = head
++        while current is not None and current is not tail:
++            if current.block_hash is None:
++                break
++            candidates.append(current)
++            if len(candidates) >= self.window:
++                break
++            current = current.next_free_block
++        victim = min(candidates, key=pool.get_block_importance_rank)
++        if victim is head:
++            return queue.popleft(), len(candidates), False
++
++        queue.remove(victim)
++        if not self.logged_bias:
++            self.logged_bias = True
++            logger.info(
++                "[GNN_AWARE_VPC_BIAS] window=%d oldest_block=%d "
++                "oldest_placement=%s selected_block=%d selected_placement=%s",
++                len(candidates), head.block_id,
++                pool.kv_importance_by_block_id.get(head.block_id, "unlabeled"),
++                victim.block_id,
++                pool.kv_importance_by_block_id.get(victim.block_id, "unlabeled"),
++            )
++        return victim, len(candidates), True
