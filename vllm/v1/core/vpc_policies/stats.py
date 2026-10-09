@@ -63,6 +63,12 @@ class VPCStats:
         self.uncached_allocations = 0
         self.explicit_hash_invalidations = 0
         self.free_blocks_provider: Callable[[], int] | None = None
+        self.diagnostic_sample: dict[str, Any] | None = None
+        self.first_gpu_reclaim: dict[str, Any] | None = None
+        self.gpu_chunk_reclaims: Counter[bytes] = Counter()
+        self.gpu_chunk_reclaim_physical_events = 0
+        self.gpu_chunk_complete_idle_breaks = 0
+        self.gpu_chunk_complete_any_breaks = 0
         self.select_calls = 0
         self.scanned = 0
         self.bypassed_lru = 0
@@ -108,6 +114,7 @@ class VPCStats:
 
     def snapshot(self, free_blocks: int | None = None) -> dict[str, Any]:
         n = sum(self.cached_reclaims.values())
+        chunk_reclaims = sorted(self.gpu_chunk_reclaims.values())
         histogram = sorted(self.latency_hist.items())
         cutoff = max(1, int(self.select_calls * 0.95 + 0.9999))
         passed = 0
@@ -141,6 +148,25 @@ class VPCStats:
                 100 * self.bypassed_lru / self.select_calls, 3
             ) if self.select_calls else 0.0,
             "admission_reject_counts": dict(self.admission_rejects),
+            "vpc_diagnostics": self.diagnostic_sample,
+            "first_gpu_reclaim": self.first_gpu_reclaim,
+            "gpu_chunk_reclaim_diagnostics": {
+                "physical_reclaim_events_touching_observed_gpu_chunks":
+                    self.gpu_chunk_reclaim_physical_events,
+                "distinct_observed_gpu_chunks_affected": len(chunk_reclaims),
+                "chunk_affects_total": sum(chunk_reclaims),
+                "affects_per_chunk_p50": chunk_reclaims[len(chunk_reclaims) // 2]
+                    if chunk_reclaims else 0,
+                "affects_per_chunk_p95": chunk_reclaims[
+                    min(len(chunk_reclaims) - 1, int(0.95 * len(chunk_reclaims)))]
+                    if chunk_reclaims else 0,
+                "affects_per_chunk_max": chunk_reclaims[-1]
+                    if chunk_reclaims else 0,
+                "complete_idle_to_incomplete_transitions":
+                    self.gpu_chunk_complete_idle_breaks,
+                "complete_any_to_incomplete_transitions":
+                    self.gpu_chunk_complete_any_breaks,
+            },
         }
 
     def _periodic_writer(self, interval: float) -> None:

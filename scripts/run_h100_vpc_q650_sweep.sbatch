@@ -11,7 +11,8 @@
 
 # Four-mode, actual H100 TP2 Q650 policy sweep. Uses the existing project
 # GNN + LMCache MP runner, but validates explicit VPC policy selection.
-# Never deletes shared /scratch2/sriramc2 contents.
+# The inherited CLEAN_OLD_LMCACHE setting may delete shared scratch data;
+# confirm that /scratch2/sriramc2 is safe to clean before setting it to 1.
 set -Eeuo pipefail
 
 REPO=/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
@@ -63,12 +64,27 @@ export KV_FS_LOOKUP_WORKERS=1
 export KV_FS_RETRIEVE_WORKERS=2
 export KV_FS_STORE_WORKERS=0
 export KV_FS_DELETE_WORKERS=0
+# Preserve the existing GNN reference path by default. Explicit hindsight
+# mode uses the same precompute outputs with oracle labels (not GPU pinning).
+if [[ "${KV_CHUNK_PLACEMENT_MODE:-gnn}" == "oracle" ]]; then
+  [[ "$VLLM_VPC_POLICY" == "selective" ]] || {
+    echo "Oracle requires VLLM_VPC_POLICY=selective" >&2; exit 2;
+  }
+  [[ -n "${KV_ORACLE_RANKING_FILE:-}" ]] || {
+    echo "Oracle requires KV_ORACLE_RANKING_FILE" >&2; exit 2;
+  }
+fi
 export GNN_CHUNK_VOTE_POLICY=threshold_with_drop_plurality
 export GNN_RANDOM_CHUNK_SEED=0
 unset GNN_RANDOM_MATCH_DISTRIBUTION || true
 
 export CLEAN_OLD_LMCACHE="${CLEAN_OLD_LMCACHE:-1}"
 export VLLM_VPC_STATS_INTERVAL_S=5
+export VLLM_VPC_DIAGNOSTICS="${VLLM_VPC_DIAGNOSTICS:-0}"
+[[ "$VLLM_VPC_DIAGNOSTICS" == "0" || "$VLLM_VPC_DIAGNOSTICS" == "1" ]] || {
+  echo "VLLM_VPC_DIAGNOSTICS must be 0 or 1" >&2; exit 2;
+}
+export VLLM_VPC_DIAG_INTERVAL_S="${VLLM_VPC_DIAG_INTERVAL_S:-5}"
 
 EXPERIMENT_LABEL="${EXPERIMENT_LABEL:-vpc4_gnn_drop_u025_${VLLM_VPC_POLICY}_${SLURM_JOB_ID}}"
 [[ "$EXPERIMENT_LABEL" =~ ^[A-Za-z0-9_.-]+$ ]] || {
@@ -121,7 +137,9 @@ replace_once(
 replace_once(
     '  "vpc": true,\n',
     '  "vpc": true,\n'
-    '  "vpc_policy": "$VLLM_VPC_POLICY",\n',
+    '  "vpc_policy": "$VLLM_VPC_POLICY",\n'
+    '  "vpc_diagnostics": "$VLLM_VPC_DIAGNOSTICS",\n'
+    '  "chunk_placement_mode": "${KV_CHUNK_PLACEMENT_MODE:-gnn}",\n',
     'run configuration policy field',
 )
 replace_once(

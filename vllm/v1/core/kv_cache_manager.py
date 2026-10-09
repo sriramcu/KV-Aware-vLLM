@@ -265,6 +265,11 @@ class KVCacheManager:
         # disabled or the request is marked as skipping kv cache read
         # (which happens when the request requires prompt logprobs
         # or calls a pooling model with all pooling).
+        if getattr(self.block_pool, "vpc_diagnostics_enabled", False):
+            group = self.kv_cache_config.kv_cache_groups[0]
+            self.block_pool.observe_vpc_request_prefix(
+                request, group.kv_cache_spec.block_size, 0,
+            )
         if not self.prefix_cache_lookup_enabled(request):
             return self.empty_kv_cache_blocks, 0, 0
 

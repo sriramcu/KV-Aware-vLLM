@@ -33,6 +33,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.request import Request
 from vllm.v1.core.vpc_policies.stats import VPCStats
+from vllm.v1.core.vpc_policies.runtime_diagnostics import VPCDiagnostics
 from vllm.v1.core.vpc_policies.window import WindowEviction
 from vllm.v1.core.vpc_policies.tierwise import TierwiseEviction
 from vllm.v1.core.vpc_policies.selective import admit_for_reuse
@@ -229,6 +230,12 @@ class BlockPool:
             self.gnn_aware_vpc_window if self.vpc_policy_name == "window" else None,
         )
         self.vpc_stats.free_blocks_provider = self.get_num_free_blocks
+        self.vpc_diagnostics_enabled = os.environ.get("VLLM_VPC_DIAGNOSTICS", "0") == "1"
+        self._vpc_diagnostics = (
+            VPCDiagnostics(self, interval_s=float(os.environ.get(
+                "VLLM_VPC_DIAG_INTERVAL_S", "5")))
+            if self.vpc_diagnostics_enabled else None
+        )
         self._window_eviction = (
             WindowEviction(self, self.gnn_aware_vpc_window)
             if self.vpc_policy_name == "window" else None
@@ -749,6 +756,19 @@ class BlockPool:
             self._tierwise_eviction.on_hash_invalidated(src_block)
             self._tierwise_eviction.on_label_changed(dst_block)
 
+    def observe_vpc_request_prefix(
+        self, request: Request, block_size: int, kv_cache_group_id: int = 0,
+    ) -> None:
+        """Pass a first-lookup observation to the optional read-only sampler."""
+        if self._vpc_diagnostics is not None:
+            self._vpc_diagnostics.observe_request_prefix(
+                request, block_size, kv_cache_group_id)
+
+    def maybe_sample_vpc_diagnostics(self, force: bool = False) -> None:
+        """Collect an opt-in occupancy/prefix snapshot on the scheduler thread."""
+        if self._vpc_diagnostics is not None:
+            self._vpc_diagnostics.maybe_sample(force=force)
+
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
 
@@ -780,11 +800,15 @@ class BlockPool:
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
             for block in ret:
+                label = self.kv_importance_by_block_id.get(block.block_id)
+                if self._vpc_diagnostics is not None:
+                    self._vpc_diagnostics.before_reclaim(block, label)
                 self.vpc_stats.record_reclaim(
-                    self.kv_importance_by_block_id.get(block.block_id),
-                    cached=block.block_hash is not None,
+                    label, cached=block.block_hash is not None,
                 )
                 self._maybe_evict_cached_block(block)
+                if self._vpc_diagnostics is not None:
+                    self._vpc_diagnostics.after_reclaim()
                 # [SC] The old object's label was needed for victim selection, but the
                 # physical block is now being allocated to new content.
                 # [SC] New content must not inherit a previous object's label.
@@ -801,6 +825,7 @@ class BlockPool:
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
+        self.maybe_sample_vpc_diagnostics()
         return ret
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
@@ -891,6 +916,7 @@ class BlockPool:
             self._tierwise_eviction.on_free(
                 blocks_to_evict_first, blocks_to_evict_last
             )
+        self.maybe_sample_vpc_diagnostics()
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
@@ -938,6 +964,9 @@ class BlockPool:
         for block in self.blocks:
             block.reset_hash()
         self.kv_importance_by_block_id.clear()
+        if self._vpc_diagnostics is not None:
+            self._vpc_diagnostics.reset()
+            self._vpc_diagnostics.maybe_sample(force=True)
         if self._tierwise_eviction is not None:
             self._tierwise_eviction = TierwiseEviction(self)
             self._pop_policy_victim = self._tierwise_eviction.pop

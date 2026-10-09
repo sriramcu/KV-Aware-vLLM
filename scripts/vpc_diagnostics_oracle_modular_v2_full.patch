@@ -1,0 +1,1129 @@
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -33,6 +33,7 @@
+ )
+ from vllm.v1.request import Request
+ from vllm.v1.core.vpc_policies.stats import VPCStats
++from vllm.v1.core.vpc_policies.runtime_diagnostics import VPCDiagnostics
+ from vllm.v1.core.vpc_policies.window import WindowEviction
+ from vllm.v1.core.vpc_policies.tierwise import TierwiseEviction
+ from vllm.v1.core.vpc_policies.selective import admit_for_reuse
+@@ -229,6 +230,12 @@
+             self.gnn_aware_vpc_window if self.vpc_policy_name == "window" else None,
+         )
+         self.vpc_stats.free_blocks_provider = self.get_num_free_blocks
++        self.vpc_diagnostics_enabled = os.environ.get("VLLM_VPC_DIAGNOSTICS", "0") == "1"
++        self._vpc_diagnostics = (
++            VPCDiagnostics(self, interval_s=float(os.environ.get(
++                "VLLM_VPC_DIAG_INTERVAL_S", "5")))
++            if self.vpc_diagnostics_enabled else None
++        )
+         self._window_eviction = (
+             WindowEviction(self, self.gnn_aware_vpc_window)
+             if self.vpc_policy_name == "window" else None
+@@ -749,6 +756,19 @@
+             self._tierwise_eviction.on_hash_invalidated(src_block)
+             self._tierwise_eviction.on_label_changed(dst_block)
+ 
++    def observe_vpc_request_prefix(
++        self, request: Request, block_size: int, kv_cache_group_id: int = 0,
++    ) -> None:
++        """Pass a first-lookup observation to the optional read-only sampler."""
++        if self._vpc_diagnostics is not None:
++            self._vpc_diagnostics.observe_request_prefix(
++                request, block_size, kv_cache_group_id)
++
++    def maybe_sample_vpc_diagnostics(self, force: bool = False) -> None:
++        """Collect an opt-in occupancy/prefix snapshot on the scheduler thread."""
++        if self._vpc_diagnostics is not None:
++            self._vpc_diagnostics.maybe_sample(force=force)
++
+     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
+         """Get new blocks from the free block pool.
+ 
+@@ -780,11 +800,15 @@
+         # In order to only iterate the list once, we duplicated code a bit
+         if self.enable_caching:
+             for block in ret:
++                label = self.kv_importance_by_block_id.get(block.block_id)
++                if self._vpc_diagnostics is not None:
++                    self._vpc_diagnostics.before_reclaim(block, label)
+                 self.vpc_stats.record_reclaim(
+-                    self.kv_importance_by_block_id.get(block.block_id),
+-                    cached=block.block_hash is not None,
++                    label, cached=block.block_hash is not None,
+                 )
+                 self._maybe_evict_cached_block(block)
++                if self._vpc_diagnostics is not None:
++                    self._vpc_diagnostics.after_reclaim()
+                 # [SC] The old object's label was needed for victim selection, but the
+                 # physical block is now being allocated to new content.
+                 # [SC] New content must not inherit a previous object's label.
+@@ -801,6 +825,7 @@
+                 block.ref_cnt += 1
+                 if self.metrics_collector:
+                     self.metrics_collector.on_block_allocated(block)
++        self.maybe_sample_vpc_diagnostics()
+         return ret
+ 
+     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
+@@ -891,6 +916,7 @@
+             self._tierwise_eviction.on_free(
+                 blocks_to_evict_first, blocks_to_evict_last
+             )
++        self.maybe_sample_vpc_diagnostics()
+ 
+     def evict_blocks(self, block_ids: set[int]) -> None:
+         """evict blocks from the prefix cache by their block IDs.
+@@ -938,6 +964,9 @@
+         for block in self.blocks:
+             block.reset_hash()
+         self.kv_importance_by_block_id.clear()
++        if self._vpc_diagnostics is not None:
++            self._vpc_diagnostics.reset()
++            self._vpc_diagnostics.maybe_sample(force=True)
+         if self._tierwise_eviction is not None:
+             self._tierwise_eviction = TierwiseEviction(self)
+             self._pop_policy_victim = self._tierwise_eviction.pop
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -265,6 +265,11 @@
+         # disabled or the request is marked as skipping kv cache read
+         # (which happens when the request requires prompt logprobs
+         # or calls a pooling model with all pooling).
++        if getattr(self.block_pool, "vpc_diagnostics_enabled", False):
++            group = self.kv_cache_config.kv_cache_groups[0]
++            self.block_pool.observe_vpc_request_prefix(
++                request, group.kv_cache_spec.block_size, 0,
++            )
+         if not self.prefix_cache_lookup_enabled(request):
+             return self.empty_kv_cache_blocks, 0, 0
+ 
+--- a/vllm/v1/core/vpc_policies/stats.py
++++ b/vllm/v1/core/vpc_policies/stats.py
+@@ -63,6 +63,12 @@
+         self.uncached_allocations = 0
+         self.explicit_hash_invalidations = 0
+         self.free_blocks_provider: Callable[[], int] | None = None
++        self.diagnostic_sample: dict[str, Any] | None = None
++        self.first_gpu_reclaim: dict[str, Any] | None = None
++        self.gpu_chunk_reclaims: Counter[bytes] = Counter()
++        self.gpu_chunk_reclaim_physical_events = 0
++        self.gpu_chunk_complete_idle_breaks = 0
++        self.gpu_chunk_complete_any_breaks = 0
+         self.select_calls = 0
+         self.scanned = 0
+         self.bypassed_lru = 0
+@@ -108,6 +114,7 @@
+ 
+     def snapshot(self, free_blocks: int | None = None) -> dict[str, Any]:
+         n = sum(self.cached_reclaims.values())
++        chunk_reclaims = sorted(self.gpu_chunk_reclaims.values())
+         histogram = sorted(self.latency_hist.items())
+         cutoff = max(1, int(self.select_calls * 0.95 + 0.9999))
+         passed = 0
+@@ -141,6 +148,25 @@
+                 100 * self.bypassed_lru / self.select_calls, 3
+             ) if self.select_calls else 0.0,
+             "admission_reject_counts": dict(self.admission_rejects),
++            "vpc_diagnostics": self.diagnostic_sample,
++            "first_gpu_reclaim": self.first_gpu_reclaim,
++            "gpu_chunk_reclaim_diagnostics": {
++                "physical_reclaim_events_touching_observed_gpu_chunks":
++                    self.gpu_chunk_reclaim_physical_events,
++                "distinct_observed_gpu_chunks_affected": len(chunk_reclaims),
++                "chunk_affects_total": sum(chunk_reclaims),
++                "affects_per_chunk_p50": chunk_reclaims[len(chunk_reclaims) // 2]
++                    if chunk_reclaims else 0,
++                "affects_per_chunk_p95": chunk_reclaims[
++                    min(len(chunk_reclaims) - 1, int(0.95 * len(chunk_reclaims)))]
++                    if chunk_reclaims else 0,
++                "affects_per_chunk_max": chunk_reclaims[-1]
++                    if chunk_reclaims else 0,
++                "complete_idle_to_incomplete_transitions":
++                    self.gpu_chunk_complete_idle_breaks,
++                "complete_any_to_incomplete_transitions":
++                    self.gpu_chunk_complete_any_breaks,
++            },
+         }
+ 
+     def _periodic_writer(self, interval: float) -> None:
+--- /dev/null
++++ b/vllm/v1/core/vpc_policies/diagnostics.py
+@@ -0,0 +1,101 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Read-only VPC occupancy and logical-prefix diagnostic functions.
++
++Never touch LRU links, call a mutating cache lookup, or modify refcounts.
++A hash may map to multiple physical blocks: inspect *all* duplicates when
++classifying idle/active residency. Totals for request paths are observations,
++not a global count of independent cache objects.
++"""
++from __future__ import annotations
++
++from collections import Counter
++from typing import Any
++
++LABELS = ("gpu", "cpu", "disk", "unlabeled")
++
++
++def occupancy(blocks: list[Any], importance: dict[int, str], extra_hashes: dict) -> dict:
++    active = 0
++    active_labels = Counter()
++    idle = Counter()
++    uncached_available = 0
++    special = 0
++    for block in blocks:
++        if block.is_null:
++            special += 1
++        elif block.ref_cnt > 0:
++            active += 1
++            label = importance.get(block.block_id, "unlabeled")
++            active_labels[label if label in LABELS else "unlabeled"] += 1
++        elif block.block_hash is not None or extra_hashes.get(block.block_id):
++            label = importance.get(block.block_id, "unlabeled")
++            idle[label if label in LABELS else "unlabeled"] += 1
++        else:
++            uncached_available += 1
++    return {
++        "total": len(blocks), "active": active,
++        "active_by_label": {label: active_labels[label] for label in LABELS},
++        "idle_cached": {label: idle[label] for label in LABELS},
++        "idle_cached_total": sum(idle.values()),
++        "uncached_available": uncached_available, "reserved_special": special,
++        "accounted_total": active + sum(idle.values()) + uncached_available + special,
++    }
++
++
++def hash_presence(cache_map: Any, key: Any) -> tuple[bool, bool]:
++    """(resident_any, resident_idle); includes all physical hash duplicates."""
++    entry = cache_map._cache.get(key)  # direct read, NOT get_cached_block/touch
++    if entry is None:
++        return False, False
++    blocks = entry.values() if isinstance(entry, dict) else (entry,)
++    present = False
++    idle = False
++    for block in blocks:
++        present = True
++        idle |= block.ref_cnt == 0
++    return present, idle
++
++
++def prefix_shape(bits: list[bool] | tuple[bool, ...]) -> dict[str, int | bool]:
++    first_gap = next((idx for idx, present in enumerate(bits) if not present), len(bits))
++    retained = sum(bits)
++    return {
++        "positions": len(bits), "retained": retained,
++        "prefix_blocks": first_gap,
++        "first_gap_block": first_gap if first_gap < len(bits) else -1,
++        "stranded_after_gap": sum(bits[first_gap + 1:]) if first_gap < len(bits) else 0,
++        "complete": retained == len(bits),
++    }
++
++
++def chunk_summary(cache_map: Any, chunks: dict[tuple, str]) -> dict:
++    """Snapshot distinct observed full chunks, each with 32 native block keys.
++
++    Counts are for the *observed hash universe*, not an exhaustive census of
++    all cache objects ever encountered. Each chunk is deduplicated by its full
++    group-specific hash path, not by physical block ID or pointer adjacency.
++    """
++    labels = ("gpu", "cpu", "disk", "drop", "unlabeled")
++    result = {label: {"observed": 0, "complete_any": 0,
++                      "complete_idle": 0, "partial_any": 0,
++                      "partial_idle": 0, "absent_any": 0,
++                      "resident_any_blocks": 0, "resident_idle_blocks": 0,
++                      "stranded_any_blocks": 0, "stranded_idle_blocks": 0}
++              for label in labels}
++    for path, raw_label in chunks.items():
++        label = raw_label if raw_label in result else "unlabeled"
++        counters = result[label]
++        counters["observed"] += 1
++        presences = [hash_presence(cache_map, k) for k in path]
++        for kind, offset in (("any", 0), ("idle", 1)):
++            bits = [x[offset] for x in presences]
++            shape = prefix_shape(bits)
++            counters[f"resident_{kind}_blocks"] += shape["retained"]
++            counters[f"stranded_{kind}_blocks"] += shape["stranded_after_gap"]
++            if shape["complete"]:
++                counters[f"complete_{kind}"] += 1
++            elif shape["retained"]:
++                counters[f"partial_{kind}"] += 1
++            elif kind == "any":
++                counters["absent_any"] += 1
++    return result
+--- /dev/null
++++ b/vllm/v1/core/vpc_policies/runtime_diagnostics.py
+@@ -0,0 +1,184 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Opt-in VPC diagnostic lifecycle, separated from production block allocation.
++
++The BlockPool owns physical blocks, hashes, LRU and victim selection; this
++module only observes them. All hash reads bypass recency/touch operations.
++Invoked synchronously on the scheduler thread at existing allocator hooks;
++periodic writer only serializes completed sample dictionaries.
++"""
++from __future__ import annotations
++
++from collections import Counter
++import time
++from typing import TYPE_CHECKING, Any
++
++from vllm.v1.core.kv_cache_utils import (
++    make_block_hash_with_group_id, resolve_block_hashes,
++)
++from vllm.v1.core.vpc_policies.diagnostics import (
++    occupancy, chunk_summary, hash_presence, prefix_shape,
++)
++
++if TYPE_CHECKING:
++    from vllm.v1.core.block_pool import BlockPool
++    from vllm.v1.core.kv_cache_utils import KVCacheBlock
++    from vllm.v1.request import Request
++
++
++class VPCDiagnostics:
++    """Scheduler-owned observations for one BlockPool; no cache mutation."""
++
++    def __init__(self, pool: BlockPool, interval_s: float = 5):
++        if interval_s <= 0:
++            raise ValueError("VLLM_VPC_DIAG_INTERVAL_S must be > 0")
++        self.pool = pool
++        self.interval_s = interval_s
++        self._last_sample_s = 0.0
++        self._pending_reclaim: tuple[set[tuple], dict, dict] | None = None
++        self.reset()
++
++    def reset(self) -> None:
++        self.seen_requests: set[str] = set()
++        self.request_count = 0
++        self.request_counts_by_phase = {"cold": 0, "warm": 0, "other": 0}
++        self.prefix_totals: dict[str, int] = {
++            "lookup_samples": 0, "total_blocks": 0,
++            "reachable_any_blocks": 0, "stranded_any_blocks": 0,
++            "reachable_idle_blocks": 0, "stranded_idle_blocks": 0,
++        }
++        # Index complete paths of 32 logical block hashes, not physical IDs.
++        self.observed_chunks: dict[tuple, str] = {}
++        self.gpu_chunks_by_hash: dict[Any, set[tuple]] = {}
++        self._pending_reclaim = None
++
++    def observe_request_prefix(
++        self, request: Request, block_size: int, kv_cache_group_id: int = 0,
++    ) -> None:
++        """Record the prefix shape once per request at first cache lookup.
++
++        This Q650-specific observation supports one 16-token block group.
++        Unlike normal cache lookups it does not touch/allocate physical blocks.
++        """
++        pool = self.pool
++        if kv_cache_group_id != 0:
++            return
++        request_id = request.request_id
++        if request_id in self.seen_requests:
++            return
++        self.seen_requests.add(request_id)
++        self.request_count += 1
++        phase = ("cold" if request_id.startswith("kvaware-cold-") else
++                 "warm" if request_id.startswith("kvaware-warm-") else "other")
++        self.request_counts_by_phase[phase] += 1
++        if block_size != 16 or pool.hash_block_size != 16:
++            return
++        hashes = resolve_block_hashes(
++            request.block_hashes, pool.hash_block_size, block_size)
++        n = min(len(hashes), request.num_tokens // block_size)
++        keys = [make_block_hash_with_group_id(h, kv_cache_group_id)
++                for h in hashes[:n]]
++        bits = [hash_presence(pool.cached_block_hash_to_block, k) for k in keys]
++        counters = self.prefix_totals
++        counters["lookup_samples"] += 1
++        counters["total_blocks"] += n
++        for kind, offset in (("any", 0), ("idle", 1)):
++            shape = prefix_shape([b[offset] for b in bits])
++            counters[f"reachable_{kind}_blocks"] += shape["prefix_blocks"]
++            counters[f"stranded_{kind}_blocks"] += shape["stranded_after_gap"]
++        labels = getattr(request, "kv_importance_placements", None) or {}
++        for start in range(0, n - n % 32, 32):
++            chunk = tuple(keys[start:start + 32])
++            label = labels.get(start, "unlabeled")
++            previous = self.observed_chunks.get(chunk)
++            if previous is None:
++                self.observed_chunks[chunk] = label
++                if label == "gpu":
++                    for key in chunk:
++                        self.gpu_chunks_by_hash.setdefault(key, set()).add(chunk)
++            elif previous != label:
++                counters["chunk_label_conflicts"] = (
++                    counters.get("chunk_label_conflicts", 0) + 1)
++        self.maybe_sample()
++
++    def before_reclaim(self, block: KVCacheBlock, label: str | None) -> None:
++        """Capture the first GPU victim and pre-invalidation chunk presence."""
++        pool = self.pool
++        stats = pool.vpc_stats
++        if block.block_hash is not None and label == "gpu" and stats.first_gpu_reclaim is None:
++            stats.first_gpu_reclaim = {
++                "engine_elapsed_s": round((time.monotonic_ns() - stats.start_ns) / 1e9, 3),
++                "requests_first_seen": self.request_count,
++                "requests_first_seen_by_phase": dict(self.request_counts_by_phase),
++                "physical_blocks_before_reclaim": occupancy(
++                    pool.blocks, pool.kv_importance_by_block_id,
++                    pool.cached_block_hashes_by_block),
++            }
++        self._pending_reclaim = None
++        keys = set(pool.cached_block_hashes_by_block.get(block.block_id, ()))
++        if block.block_hash is not None:
++            keys.add(block.block_hash)
++        chunks: set[tuple] = set()
++        for key in keys:
++            chunks.update(self.gpu_chunks_by_hash.get(key, ()))
++        if not chunks:
++            return
++        cache_map = pool.cached_block_hash_to_block
++        before_idle = {
++            path: all(hash_presence(cache_map, key)[1] for key in path)
++            for path in chunks
++        }
++        before_any = {
++            path: all(hash_presence(cache_map, key)[0] for key in path)
++            for path in chunks
++        }
++        self._pending_reclaim = (chunks, before_idle, before_any)
++
++    def after_reclaim(self) -> None:
++        pending = self._pending_reclaim
++        self._pending_reclaim = None
++        if not pending:
++            return
++        chunks, before_idle, before_any = pending
++        cache_map = self.pool.cached_block_hash_to_block
++        stats = self.pool.vpc_stats
++        stats.gpu_chunk_reclaim_physical_events += 1
++        for path in chunks:
++            stats.gpu_chunk_reclaims[path[-1]] += 1
++            if before_idle[path] and not all(
++                hash_presence(cache_map, key)[1] for key in path
++            ):
++                stats.gpu_chunk_complete_idle_breaks += 1
++            if before_any[path] and not all(
++                hash_presence(cache_map, key)[0] for key in path
++            ):
++                stats.gpu_chunk_complete_any_breaks += 1
++
++    def maybe_sample(self, force: bool = False) -> None:
++        now = time.monotonic()
++        if not force and now - self._last_sample_s < self.interval_s:
++            return
++        self._last_sample_s = now
++        sample_t0 = time.perf_counter_ns()
++        pool = self.pool
++        stats = pool.vpc_stats
++        blocks = occupancy(
++            pool.blocks, pool.kv_importance_by_block_id,
++            pool.cached_block_hashes_by_block,
++        )
++        stats.diagnostic_sample = {
++            "sample_engine_elapsed_s": round(
++                (time.monotonic_ns() - stats.start_ns) / 1e9, 3),
++            "sample_request_count": self.request_count,
++            "sample_requests_by_phase": dict(self.request_counts_by_phase),
++            "group_id": 0,
++            "native_block_tokens": pool.hash_block_size,
++            "logical_chunk_blocks": 32,
++            "physical_blocks": blocks,
++            "observed_chunk_universe": chunk_summary(
++                pool.cached_block_hash_to_block, self.observed_chunks),
++            "request_first_lookup_cumulative": dict(self.prefix_totals),
++            "free_queue_count": pool.get_num_free_blocks(),
++            "accounting_ok": blocks["accounted_total"] == pool.num_gpu_blocks,
++            "diagnostic_scan_cpu_ms": round(
++                (time.perf_counter_ns() - sample_t0) / 1e6, 3),
++        }
+--- a/experiments/precompute_shortq_placements.py
++++ b/experiments/precompute_shortq_placements.py
+@@ -52,6 +52,9 @@
+ from Hierarchical_KV.shortq_placement.prediction_cache import (  # noqa: E402
+     lookup_prediction,
+     store_prediction,
++)
++from Hierarchical_KV.shortq_placement.hindsight_oracle import (
++    oracle_mode_from_environment, apply_oracle_placements,
+ )
+ from Hierarchical_KV.shortq_placement.runtime_metadata import write_runtime_metadata  # noqa: E402
+ from Hierarchical_KV.shortq_placement.placement_mapping import (  # noqa: E402
+@@ -337,6 +340,8 @@
+     if args.chunk_size % 16 != 0:
+         raise ValueError("LMCache chunk size must be a multiple of the 16-token Short-Q block size")
+     blocks_per_chunk = args.chunk_size // 16
++    # Fail early before loading heavyweight models if oracle flags are invalid.
++    placement_mode = oracle_mode_from_environment()
+     device = torch.device(args.device)
+     started = time.monotonic()
+ 
+@@ -705,6 +710,19 @@
+             flush=True,
+         )
+ 
++    # A modular, opt-in hindsight label swap. The helper mutates only the
++    # metadata rows/runtime map; it never preloads KV or changes VPC policy.
++    oracle_config, oracle_occurrences, oracle_by_hash = apply_oracle_placements(
++        runtime, occurrences, hash_prediction_rows,
++        smoke_force_min_unique_per_placement=args.smoke_force_min_unique_per_placement,
++    )
++    if oracle_config is not None:
++        occurrence_placements = oracle_occurrences
++        candidate_by_hash = oracle_by_hash
++        conflict_occurrences = 0
++        print("[SHORTQ_HINDSIGHT_ORACLE] " + json.dumps(
++            oracle_config, sort_keys=True), flush=True)
++
+     smoke_overrides = _force_smoke_placement_coverage(
+         runtime, args.smoke_force_min_unique_per_placement
+     )
+@@ -793,6 +811,8 @@
+             "config": vote_config.__dict__,
+         },
+         "random_chunk_placement": random_placement_summary,
++        "chunk_placement_mode": placement_mode,
++        "oracle_chunk_placement": oracle_config,
+         "duplicate_resolution": "first_seen_wins",
+         "block_class_counts": {CLASS_NAMES[i]: int(class_occurrences[i]) for i in range(4)},
+         "chunk_occurrences": len(occurrences),
+--- /dev/null
++++ b/Hierarchical_KV/shortq_placement/hindsight_oracle.py
+@@ -0,0 +1,131 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Hindsight static 512-token hash ranking, no preloading/pinning/extra eviction.
++
++The ranking is deliberately independent of budget. Only assign labels to
++existing hashes seen in the *current trace* and never create KV contents.
++A retrospective ranking is NOT a causal inference-time model.
++"""
++from __future__ import annotations
++
++from collections import Counter, defaultdict
++import os
++from typing import Any, Mapping
++import json
++from pathlib import Path
++
++TIERS = ("gpu", "cpu", "disk")
++
++
++def load_ranking(path: str | Path) -> list[str]:
++    obj = json.loads(Path(path).read_text(encoding="utf-8"))
++    entries = obj["ranking"] if isinstance(obj, dict) else obj
++    if not isinstance(entries, list) or not entries:
++        raise ValueError("oracle ranking must be a nonempty list")
++    hashes = [entry["chunk_hash"] if isinstance(entry, dict) else entry
++              for entry in entries]
++    if any(not isinstance(h, str) or not h for h in hashes):
++        raise ValueError("oracle ranking entries must have nonempty chunk_hash")
++    if len(hashes) != len(set(hashes)):
++        raise ValueError("duplicate chunk hashes in oracle ranking")
++    return hashes
++
++
++def assign_oracle(runtime_hashes: set[str] | list[str], ranking: list[str],
++                  gpu: int, cpu: int, disk: int, *, strict: bool = True) -> dict[str, str]:
++    """Population-bounded static oracle; unselected hashes are DROP.
++
++    Counts are class-label budgets, not resident chunks or admission quotas.
++    Explicit budget cutoffs never preallocate or pin physical VPC blocks.
++    """
++    if min(gpu, cpu, disk) < 0:
++        raise ValueError("oracle class budgets must be nonnegative")
++    unique = set(runtime_hashes)
++    if strict and unique != set(ranking):
++        missing = unique - set(ranking)
++        extra = set(ranking) - unique
++        raise ValueError(f"oracle ranking/trace mismatch: missing={len(missing)} extra={len(extra)}")
++    if gpu + cpu + disk > len(unique):
++        raise ValueError("oracle budgets exceed unique chunk population")
++    ordered = [h for h in ranking if h in unique]
++    if not strict:
++        ordered.extend(sorted(unique - set(ordered)))
++    out = {}
++    for index, h in enumerate(ordered):
++        out[h] = ("gpu" if index < gpu else
++                  "cpu" if index < gpu + cpu else
++                  "disk" if index < gpu + cpu + disk else "drop")
++    return out
++
++
++def rank_from_occurrences(rows: list[dict]) -> dict:
++    freq = Counter(row["chunk_hash"] for row in rows)
++    return {
++        "format": "kvaware-hindsight-ranking-v1",
++        "source": "retrospective chunk-hash occurrence counts; not causal",
++        "unique_chunks": len(freq), "chunk_occurrences": sum(freq.values()),
++        "ranking": [{"chunk_hash": h, "occurrences": count}
++                    for h, count in sorted(freq.items(), key=lambda pair: (-pair[1], pair[0]))],
++    }
++
++
++def oracle_mode_from_environment(environ: Mapping[str, str] | None = None) -> str:
++    """Validate opt-in mode before the expensive GNN preprocessing starts."""
++    env = os.environ if environ is None else environ
++    mode = env.get("KV_CHUNK_PLACEMENT_MODE", "gnn").strip().lower()
++    if mode not in ("gnn", "oracle"):
++        raise ValueError(f"unknown KV_CHUNK_PLACEMENT_MODE={mode!r}")
++    if mode == "oracle":
++        if env.get("VLLM_VPC_POLICY") != "selective":
++            raise ValueError("hindsight oracle currently requires VLLM_VPC_POLICY=selective")
++        if not env.get("KV_ORACLE_RANKING_FILE"):
++            raise ValueError("KV_ORACLE_RANKING_FILE is required for oracle")
++    return mode
++
++
++def apply_oracle_placements(
++    runtime: dict[str, str],
++    occurrences: list[dict[str, Any]],
++    hash_prediction_rows: list[dict[str, Any]],
++    *,
++    smoke_force_min_unique_per_placement: int = 0,
++    environ: Mapping[str, str] | None = None,
++) -> tuple[dict[str, Any] | None, list[str] | None, dict | None]:
++    """Replace GNN labels with hindsight labels, updating existing sidecars.
++
++    No mutation in normal GNN mode. The return values are the optional oracle
++    run metadata, occurrence label vector, and per-hash label counts.
++    """
++    env = os.environ if environ is None else environ
++    if oracle_mode_from_environment(env) != "oracle":
++        return None, None, None
++    if smoke_force_min_unique_per_placement:
++        raise ValueError("oracle is incompatible with smoke forcing")
++    ranking_file = env["KV_ORACLE_RANKING_FILE"]
++    budgets = {
++        tier: int(env.get(f"KV_ORACLE_{tier.upper()}_CHUNKS", default))
++        for tier, default in (("gpu", 258), ("cpu", 767), ("disk", 1012))
++    }
++    assigned = assign_oracle(
++        set(runtime), load_ranking(ranking_file),
++        budgets["gpu"], budgets["cpu"], budgets["disk"],
++    )
++    # Compute/validate all assignments before modifying the live mappings.
++    runtime.clear()
++    runtime.update(assigned)
++    occurrence_placements: list[str] = []
++    candidate_by_hash: dict[str, Counter[str]] = defaultdict(Counter)
++    for row in occurrences:
++        chosen = runtime[row["chunk_hash"]]
++        row.update(candidate_placement=chosen, runtime_placement=chosen,
++                   duplicate_conflict=False)
++        occurrence_placements.append(chosen)
++        candidate_by_hash[row["chunk_hash"]][chosen] += 1
++    for row in hash_prediction_rows:
++        chosen = runtime[row["chunk_hash"]]
++        row.update(prediction=chosen, runtime_placement=chosen,
++                   duplicate_conflict=False)
++    meta = {
++        "ranking_file": ranking_file, "budgets": budgets,
++        "mode": "hindsight_static_chunk_hash", "unique_hashes": len(runtime),
++    }
++    return meta, occurrence_placements, candidate_by_hash
+--- a/scripts/run_h100_vpc_q650_sweep.sbatch
++++ b/scripts/run_h100_vpc_q650_sweep.sbatch
+@@ -11,7 +11,8 @@
+ 
+ # Four-mode, actual H100 TP2 Q650 policy sweep. Uses the existing project
+ # GNN + LMCache MP runner, but validates explicit VPC policy selection.
+-# Never deletes shared /scratch2/sriramc2 contents.
++# The inherited CLEAN_OLD_LMCACHE setting may delete shared scratch data;
++# confirm that /scratch2/sriramc2 is safe to clean before setting it to 1.
+ set -Eeuo pipefail
+ 
+ REPO=/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
+@@ -63,12 +64,27 @@
+ export KV_FS_RETRIEVE_WORKERS=2
+ export KV_FS_STORE_WORKERS=0
+ export KV_FS_DELETE_WORKERS=0
++# Preserve the existing GNN reference path by default. Explicit hindsight
++# mode uses the same precompute outputs with oracle labels (not GPU pinning).
++if [[ "${KV_CHUNK_PLACEMENT_MODE:-gnn}" == "oracle" ]]; then
++  [[ "$VLLM_VPC_POLICY" == "selective" ]] || {
++    echo "Oracle requires VLLM_VPC_POLICY=selective" >&2; exit 2;
++  }
++  [[ -n "${KV_ORACLE_RANKING_FILE:-}" ]] || {
++    echo "Oracle requires KV_ORACLE_RANKING_FILE" >&2; exit 2;
++  }
++fi
+ export GNN_CHUNK_VOTE_POLICY=threshold_with_drop_plurality
+ export GNN_RANDOM_CHUNK_SEED=0
+ unset GNN_RANDOM_MATCH_DISTRIBUTION || true
+ 
+ export CLEAN_OLD_LMCACHE="${CLEAN_OLD_LMCACHE:-1}"
+ export VLLM_VPC_STATS_INTERVAL_S=5
++export VLLM_VPC_DIAGNOSTICS="${VLLM_VPC_DIAGNOSTICS:-0}"
++[[ "$VLLM_VPC_DIAGNOSTICS" == "0" || "$VLLM_VPC_DIAGNOSTICS" == "1" ]] || {
++  echo "VLLM_VPC_DIAGNOSTICS must be 0 or 1" >&2; exit 2;
++}
++export VLLM_VPC_DIAG_INTERVAL_S="${VLLM_VPC_DIAG_INTERVAL_S:-5}"
+ 
+ EXPERIMENT_LABEL="${EXPERIMENT_LABEL:-vpc4_gnn_drop_u025_${VLLM_VPC_POLICY}_${SLURM_JOB_ID}}"
+ [[ "$EXPERIMENT_LABEL" =~ ^[A-Za-z0-9_.-]+$ ]] || {
+@@ -121,7 +137,9 @@
+ replace_once(
+     '  "vpc": true,\n',
+     '  "vpc": true,\n'
+-    '  "vpc_policy": "$VLLM_VPC_POLICY",\n',
++    '  "vpc_policy": "$VLLM_VPC_POLICY",\n'
++    '  "vpc_diagnostics": "$VLLM_VPC_DIAGNOSTICS",\n'
++    '  "chunk_placement_mode": "${KV_CHUNK_PLACEMENT_MODE:-gnn}",\n',
+     'run configuration policy field',
+ )
+ replace_once(
+--- /dev/null
++++ b/scripts/build_hindsight_rank.py
+@@ -0,0 +1,23 @@
++#!/usr/bin/env python3
++"""Generate budget-independent hindsight ranking from Q650 occurrence JSONL.
++
++Use a historical trace covering the exact intended prompt population. This is
++not appropriate as a causal production predictor. No runtime cache preloading.
++"""
++import argparse
++import json
++from pathlib import Path
++import sys
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from Hierarchical_KV.shortq_placement.hindsight_oracle import rank_from_occurrences
++
++p = argparse.ArgumentParser()
++p.add_argument("--placement-trace", required=True)
++p.add_argument("--output", required=True)
++args = p.parse_args()
++rows = [json.loads(line) for line in Path(args.placement_trace).read_text().splitlines() if line.strip()]
++result = rank_from_occurrences(rows)
++Path(args.output).parent.mkdir(parents=True, exist_ok=True)
++Path(args.output).write_text(json.dumps(result, indent=2) + "\n")
++print("oracle_unique_chunks", result["unique_chunks"],
++      "occurrences", result["chunk_occurrences"])
+--- /dev/null
++++ b/tests/v1/core/test_sc_vpc_diagnostics.py
+@@ -0,0 +1,53 @@
++# SPDX-License-Identifier: Apache-2.0
++"""CPU-only behavior tests for opt-in cache census and first-reclaim tags."""
++from vllm.v1.core.block_pool import BlockPool
++from vllm.v1.core.vpc_policies.diagnostics import prefix_shape, chunk_summary
++
++
++def test_prefix_hole_measurement():
++    assert prefix_shape([True] * 32)["stranded_after_gap"] == 0
++    p = prefix_shape([True, True, False, False, True, True])
++    assert (p["prefix_blocks"], p["retained"], p["stranded_after_gap"]) == (2, 4, 2)
++
++
++def test_opt_in_occupancy_and_selective_rejection(monkeypatch):
++    monkeypatch.setenv("VLLM_VPC_POLICY", "selective")
++    monkeypatch.setenv("VLLM_VPC_DIAGNOSTICS", "1")
++    monkeypatch.setenv("VLLM_VPC_DIAG_INTERVAL_S", "0.001")
++    monkeypatch.delenv("VLLM_VPC_STATS_JSONL", raising=False)
++    pool = BlockPool(7, True, 16)
++    assert pool._vpc_diagnostics is not None
++    # State and sampling live in a standalone module, not the allocator.
++    assert not hasattr(pool, "_vpc_diag_chunks")
++    blocks = pool.get_new_blocks(6)
++    pool._insert_block_hash(b"gpu-key-1234567890", blocks[0], num_tokens=16)
++    pool._insert_block_hash(b"cpu-key-1234567890", blocks[1], num_tokens=16)
++    pool.set_block_importance(blocks[0].block_id, "gpu")
++    pool.set_block_importance(blocks[1].block_id, "cpu")
++    pool.free_blocks(blocks)
++    pool.maybe_sample_vpc_diagnostics(force=True)
++    sample = pool.get_vpc_stats_snapshot()["vpc_diagnostics"]
++    physical = sample["physical_blocks"]
++    assert physical["active"] == 0
++    assert physical["idle_cached"]["gpu"] == 1
++    assert physical["idle_cached"]["cpu"] == 0
++    assert physical["uncached_available"] == 5
++    assert physical["reserved_special"] == 1
++    assert physical["accounted_total"] == 7
++    assert pool.vpc_stats.admission_rejects["cpu"] == 1
++
++
++def test_first_gpu_reclaim_records_request_count(monkeypatch):
++    monkeypatch.setenv("VLLM_VPC_POLICY", "selective")
++    monkeypatch.setenv("VLLM_VPC_DIAGNOSTICS", "1")
++    monkeypatch.delenv("VLLM_VPC_STATS_JSONL", raising=False)
++    pool = BlockPool(3, True, 16)
++    b0, b1 = pool.get_new_blocks(2)
++    pool._insert_block_hash(b"first-gpu-block", b0, num_tokens=16)
++    pool.set_block_importance(b0.block_id, "gpu")
++    pool.free_blocks([b1, b0])
++    assert pool.get_new_blocks(1)[0] is b1  # uncached-first LRU
++    assert pool.vpc_stats.first_gpu_reclaim is None
++    assert pool.get_new_blocks(1)[0] is b0
++    assert pool.vpc_stats.first_gpu_reclaim is not None
++    assert pool.vpc_stats.first_gpu_reclaim["requests_first_seen"] == 0
+--- /dev/null
++++ b/tests/test_sc_hindsight_oracle.py
+@@ -0,0 +1,69 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Static hindsight ranking controls, no Torch / vLLM dependency."""
++import json
++import pytest
++from Hierarchical_KV.shortq_placement.hindsight_oracle import (
++    rank_from_occurrences, load_ranking, assign_oracle,
++    oracle_mode_from_environment, apply_oracle_placements,
++)
++
++
++def test_oracle_rank_budget_and_drop(tmp_path):
++    rows = [{"chunk_hash": x} for x in ("b", "a", "a", "c", "a", "b", "d")]
++    ranking = rank_from_occurrences(rows)
++    assert [x["chunk_hash"] for x in ranking["ranking"]] == ["a", "b", "c", "d"]
++    p = tmp_path / "rank.json"
++    p.write_text(json.dumps(ranking))
++    hashes = load_ranking(p)
++    assigned = assign_oracle({"a", "b", "c", "d"}, hashes, gpu=1, cpu=1, disk=1)
++    assert assigned == {"a": "gpu", "b": "cpu", "c": "disk", "d": "drop"}
++    assert assign_oracle(set(assigned), hashes, gpu=2, cpu=0, disk=0)["b"] == "gpu"
++
++
++def test_oracle_mismatch_and_overallocation_fail(tmp_path):
++    path = tmp_path / "rank.json"
++    path.write_text('["a", "b", "c"]')
++    with pytest.raises(ValueError, match="mismatch"):
++        assign_oracle({"a", "b", "unexpected"}, load_ranking(path), 1, 1, 1)
++    with pytest.raises(ValueError, match="exceed"):
++        assign_oracle({"a", "b", "c"}, load_ranking(path), 2, 2, 0)
++    path.write_text('["a", "a"]')
++    with pytest.raises(ValueError, match="duplicate"):
++        load_ranking(path)
++
++
++def test_oracle_metadata_rewrite_and_opt_in(tmp_path):
++    path = tmp_path / "rank.json"
++    path.write_text('["a", "b", "c", "d"]')
++    runtime = {h: "cpu" for h in "abcd"}
++    occurrences = [{"chunk_hash": h, "candidate_placement": "cpu"}
++                   for h in "aabc"]
++    predictions = [{"chunk_hash": h, "prediction": "cpu"}
++                   for h in "abcd"]
++    # GNN default must have no side effects.
++    before = (dict(runtime), [dict(row) for row in occurrences])
++    assert apply_oracle_placements(runtime, occurrences, predictions,
++                                   environ={}) == (None, None, None)
++    assert (runtime, occurrences) == before
++    env = {
++        "KV_CHUNK_PLACEMENT_MODE": "oracle",
++        "VLLM_VPC_POLICY": "selective",
++        "KV_ORACLE_RANKING_FILE": str(path),
++        "KV_ORACLE_GPU_CHUNKS": "1", "KV_ORACLE_CPU_CHUNKS": "1",
++        "KV_ORACLE_DISK_CHUNKS": "1",
++    }
++    assert oracle_mode_from_environment(env) == "oracle"
++    meta, labels, by_hash = apply_oracle_placements(
++        runtime, occurrences, predictions, environ=env)
++    assert meta["budgets"] == {"gpu": 1, "cpu": 1, "disk": 1}
++    assert runtime == {"a": "gpu", "b": "cpu", "c": "disk", "d": "drop"}
++    assert labels == ["gpu", "gpu", "cpu", "disk"]
++    assert by_hash["a"]["gpu"] == 2
++    assert occurrences[0]["runtime_placement"] == "gpu"
++    assert predictions[-1]["prediction"] == "drop"
++    with pytest.raises(ValueError, match="smoke forcing"):
++        apply_oracle_placements(runtime, occurrences, predictions,
++                                smoke_force_min_unique_per_placement=1,
++                                environ=env)
++    with pytest.raises(ValueError, match="selective"):
++        oracle_mode_from_environment({**env, "VLLM_VPC_POLICY": "window"})
+--- /dev/null
++++ b/tests/test_sc_vpc_diagnostics_pure.py
+@@ -0,0 +1,47 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Standalone geometry/counting regression checks without vLLM compiled deps."""
++import importlib.util
++from pathlib import Path
++from types import SimpleNamespace
++
++HERE = Path(__file__).resolve().parents[1]
++spec = importlib.util.spec_from_file_location(
++    "vpc_diag_pure", HERE / "vllm/v1/core/vpc_policies/diagnostics.py")
++assert spec is not None and spec.loader is not None
++module = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(module)
++
++
++def test_physical_accounting_and_classification():
++    b = [SimpleNamespace(is_null=i == 0, block_id=i, ref_cnt=0,
++                         block_hash=None) for i in range(5)]
++    b[1].ref_cnt = 2
++    b[2].block_hash = b"k2"
++    b[3].block_hash = b"k3"
++    o = module.occupancy(b, {1: "cpu", 2: "gpu", 3: "disk"}, {})
++    assert o["total"] == 5
++    assert o["reserved_special"] == 1
++    assert o["active"] == 1 and o["active_by_label"]["cpu"] == 1
++    assert o["idle_cached"]["gpu"] == 1
++    assert o["idle_cached"]["disk"] == 1
++    assert o["uncached_available"] == 1
++    assert o["accounted_total"] == 5
++
++
++def test_prefix_gap_and_chunk_universe_are_read_only():
++    paths = [tuple(f"c{j}-block-{i}" for i in range(32)) for j in range(2)]
++    cache = SimpleNamespace(_cache={})
++    for index, k in enumerate(paths[0]):
++        if index not in (3, 4):
++            cache._cache[k] = SimpleNamespace(ref_cnt=0)
++    for k in paths[1]:
++        cache._cache[k] = SimpleNamespace(ref_cnt=1)
++    state_before = dict(cache._cache)
++    result = module.chunk_summary(cache, {paths[0]: "gpu", paths[1]: "cpu"})
++    assert result["gpu"]["partial_any"] == 1
++    assert result["gpu"]["resident_any_blocks"] == 30
++    assert result["gpu"]["stranded_any_blocks"] == 27
++    assert result["gpu"]["complete_idle"] == 0
++    assert result["cpu"]["complete_any"] == 1
++    assert result["cpu"]["complete_idle"] == 0
++    assert cache._cache == state_before
+--- /dev/null
++++ b/tests/test_sc_vpc_runtime_diagnostics_pure.py
+@@ -0,0 +1,69 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Standalone lifecycle regression without importing GPU-compiled vLLM."""
++import importlib.util
++import sys
++import time
++from collections import Counter
++from pathlib import Path
++from types import ModuleType, SimpleNamespace
++
++
++def _module(path, name):
++    spec = importlib.util.spec_from_file_location(name, path)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++def test_runtime_diagnostics_sample_first_victim_and_hole(monkeypatch):
++    repo = Path(__file__).resolve().parents[1]
++    diag_dir = repo / "vllm/v1/core/vpc_policies"
++    pure = _module(diag_dir / "diagnostics.py", "sc_test_pure_helpers")
++    # Stub only imports used in the diagnostic module; actual production
++    # vLLM core policy integration is covered by test_sc_vpc_diagnostics.py.
++    for package in ("vllm", "vllm.v1", "vllm.v1.core",
++                    "vllm.v1.core.vpc_policies"):
++        monkeypatch.setitem(sys.modules, package, ModuleType(package))
++    util = ModuleType("vllm.v1.core.kv_cache_utils")
++    util.resolve_block_hashes = lambda hashes, *unused: hashes
++    util.make_block_hash_with_group_id = lambda key, group: key
++    monkeypatch.setitem(sys.modules, util.__name__, util)
++    monkeypatch.setitem(sys.modules,
++        "vllm.v1.core.vpc_policies.diagnostics", pure)
++    runtime = _module(diag_dir / "runtime_diagnostics.py", "sc_runtime_pure")
++    b0 = SimpleNamespace(block_id=0, ref_cnt=0, is_null=True, block_hash=None)
++    b1 = SimpleNamespace(block_id=1, ref_cnt=0, is_null=False, block_hash="k0")
++    b2 = SimpleNamespace(block_id=2, ref_cnt=0, is_null=False, block_hash=None)
++    keys = tuple(f"k{i}" for i in range(32))
++    cache = SimpleNamespace(_cache={key: b1 for key in keys})
++    stats = SimpleNamespace(
++        start_ns=time.monotonic_ns(), diagnostic_sample=None, first_gpu_reclaim=None,
++        gpu_chunk_reclaims=Counter(), gpu_chunk_reclaim_physical_events=0,
++        gpu_chunk_complete_idle_breaks=0, gpu_chunk_complete_any_breaks=0,
++    )
++    pool = SimpleNamespace(
++        blocks=[b0, b1, b2], kv_importance_by_block_id={1: "gpu"},
++        cached_block_hashes_by_block={1: set(keys)},
++        cached_block_hash_to_block=cache,
++        hash_block_size=16, num_gpu_blocks=3, vpc_stats=stats,
++        get_num_free_blocks=lambda: 2,
++    )
++    d = runtime.VPCDiagnostics(pool, interval_s=5)
++    d.observe_request_prefix(SimpleNamespace(
++        request_id="kvaware-cold-0", block_hashes=list(keys),
++        num_tokens=512, kv_importance_placements={0: "gpu"}), 16)
++    assert d.request_count == 1
++    assert len(d.observed_chunks) == 1
++    d.maybe_sample(force=True)
++    assert stats.diagnostic_sample["accounting_ok"]
++    assert stats.diagnostic_sample["physical_blocks"]["idle_cached"]["gpu"] == 1
++    assert stats.diagnostic_sample["observed_chunk_universe"]["gpu"]["complete_idle"] == 1
++    d.before_reclaim(b1, "gpu")
++    assert stats.first_gpu_reclaim["requests_first_seen"] == 1
++    cache._cache.clear()  # mimic the allocator's hash invalidation
++    d.after_reclaim()
++    assert stats.gpu_chunk_reclaim_physical_events == 1
++    assert stats.gpu_chunk_complete_idle_breaks == 1
++    assert stats.gpu_chunk_complete_any_breaks == 1
++    d.reset()
++    assert d.request_count == 0 and not d.observed_chunks
+--- /dev/null
++++ b/docs/SC_VPC_DIAGNOSTICS_HINDSIGHT_ORACLE.md
+@@ -0,0 +1,174 @@
++# VPC occupancy, prefix-hole diagnostics, and hindsight placement
++
++## Scope and safety
++
++This is an additive patch against the **latest uploaded repository**. Existing
++`vanilla`, `window`, `tierwise`, `selective` eviction semantics remain unchanged.
++All diagnostics are disabled by default, and hindsight oracle placement is
++**disabled** by default (`KV_CHUNK_PLACEMENT_MODE=gnn`). The oracle is a static
++**per-512-token chunk-hash label policy**, not a pinned cache, not precomputed KV,
++and not an online predictor. It reuses the existing LMCache runtime placement
++map and vLLM per-request importance sidecar. Selective is the existing
++**last-reference GPU-only admission + upstream LRU** policy.
++
++### Module boundaries (v2)
++
++`vllm/v1/core/vpc_policies/diagnostics.py` contains the pure read-only
++occupancy/hash-presence/chunk-shape functions.
++`vllm/v1/core/vpc_policies/runtime_diagnostics.py` owns request-path indexes,
++first GPU-reclaim capture, pre/post-reclaim comparisons, throttled sampling,
++and the per-pool diagnostics lifecycle. `block_pool.py` only constructs this
++optional object and calls it at existing allocator/lookup/reset hooks.
++`vpc_policies/stats.py` still owns and serializes the existing stable counters
++and JSONL schema. None of the four eviction policies is replaced.
++
++`Hierarchical_KV/shortq_placement/hindsight_oracle.py` owns the ranking,
++budget parsing and sidecar label rewriting. The precompute script simply
++calls the helper after normal GNN chunk discovery and records its summary.
++
++### Enable VPC diagnostics for a future run
++
++```bash
++VLLM_VPC_DIAGNOSTICS=1
++VLLM_VPC_DIAG_INTERVAL_S=5
++VLLM_VPC_STATS_JSONL="$RUN_DIR/logs/vpc_periodic.jsonl"
++VLLM_VPC_STATS_INTERVAL_S=5
++```
++
++The H100 sweep wrapper passes these environment variables through (set them
++in the `sbatch --export` list). Inspect `vpc_periodic.pid*.jsonl` under
++`vpc_diagnostics`. The sampler scans on the **scheduler thread** no more often
++than its throttle; the async JSONL thread only writes an immutable snapshot.
++Check `diagnostic_scan_cpu_ms` because this opt-in scan costs scheduler CPU time.
++`sample_engine_elapsed_s` tells you how old the latest diagnostic observation
++is compared with the surrounding periodic JSONL `elapsed_s`.
++
++### Definitions / interpretation
++
++`physical_blocks` is a partition of the actual block objects: `active`
++(`ref_cnt>0`), `idle_cached` (`ref_cnt==0` with primary or extra indexed hash),
++`uncached_available` (unreferenced with no searchable hash), and
++`reserved_special` (null block). Both active and idle are split by carried
++importance label. **None** is interpreted as unlabelled. A physical block can
++only occupy one state. `accounting_ok` validates their sum.
++
++`observed_chunk_universe` is a deduplicated set of *full* 32×16-token logical
++paths seen at first `get_computed_blocks` call for a request, using the
++request's 16-token block hashes and cache-group 0 (H100 Q650 TP2 one-group
++setting). It reports the number of observed paths and how many are fully,
++partly, or not resident **at snapshot time**. `complete_any` counts cached
++hashes even if actively referenced; `complete_idle` requires all 32 positions
++to be searchable in unreferenced blocks. `resident_*_blocks` is a
++request-path sum and may double-count a physical hash shared by several paths.
++`stranded_*_blocks` within each observed logical chunk counts positions after
++its first missing block; gaps *before* its chunk are handled separately.
++A chunk can be complete but still unreachable from the beginning of a request.
++
++`request_first_lookup_cumulative` counts the contiguous GPU hash prefix and
++physical hashes beyond the first gap, over **one observation per distinct
++request ID**. It is not actual scheduler GPU-hit tokens, does not perform LRU
++touches, and includes both physically hashed active+idle and idle-only
++viewpoints. The observation is made at the first manager lookup/skip, so the
++sample can be earlier than later L2 offload/reload decisions. Check original
++CHTHM for useful, scheduler-consumed contributions. In mixed/multigroup
++architectures the probe is explicitly group 0 only.
++
++`gpu_chunk_reclaim_diagnostics` counts which **previously observed GPU-labelled
++logical chunk hashes** are affected by later cached-block reclaims, and the
++number of complete->incomplete transitions (idle-only and active-or-idle).
++These counts can exceed the physical victim count because one hashed block
++may belong to multiple observed prefix paths, and exclude content never
++observed as part of a full chunk. A reclaim does **not** prove that a chunk
++became incomplete if another duplicate physical block retains the same hash.
++
++`first_gpu_reclaim` records the earliest allocation-time cached GPU-labelled
++victim, the engine monotonic elapsed time, active/idle census, and number of
++first-seen cold/warm request IDs. Cold/warm classification uses the runner's
++`kvaware-cold-` and `kvaware-warm-` IDs and otherwise falls back to `other`.
++A reclaim indicates **pressure against a cached victim**, not a fixed
++persistent-memory reservation becoming full. Request counts refer to first
++manager observations and not completed questions.
++
++Sidecar labels map `DROP` to low-priority `disk` at 16-token VPC level; this
++is the existing behavior. For group-0 `observed_chunk_universe`, `disk`
++therefore includes DROP unless the sidecar format is later extended. The
++LMCache `runtime_hash_to_placement.json` still retains explicit `drop`.
++
++### Hindsight oracle: build a reusable ranking
++
++Generate a budget-independent rank JSON from the **original Q650 occurrence
++trace** (e.g., 29265's `placement/gnn_chunk_placements.jsonl`):
++
++```bash
++python scripts/build_hindsight_rank.py \
++  --placement-trace /path/to/gnn_chunk_placements.jsonl \
++  --output /path/to/q650_hindsight_rank.json
++```
++
++Ranking uses descending full-chunk occurrence count with deterministic hash
++lexical tie-break. It is a **retrospective frequency heuristic** and does not
++promise optimal dynamic E2E, discount first touches, or prefill cache contents.
++It does not encode budgets. The precompute step currently **still runs the GNN
++inference pipeline** to produce the same exact prompt population, then replaces
++final placements from the oracle ranking. This wastes offline precompute time,
++but guarantees compatibility with existing hashing, runtime metadata,
++per-request sidecars, and analysis. It does not change serving-time KV logic.
++
++### Where to store the supplied Q650 ranking JSON
++
++Keep the ranking on persistent GPFS storage rather than `/scratch2/sriramc2`
++(the runner can delete scratch when `CLEAN_OLD_LMCACHE=1`). A suggested path is:
++
++```bash
++mkdir -p /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM/experiments/oracle_rankings
++cp q650_hindsight_frequency_rank_29358.json \
++  /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM/experiments/oracle_rankings/
++```
++
++The ZIP also contains this file under the same `experiments/oracle_rankings/`
++relative path. Set `KV_ORACLE_RANKING_FILE` to its **absolute** path in the
++sbatch environment. Do not use `/mnt/data/...` on the cluster. The provenance
++is window run 29358; the same ranking is reusable for different GPU/CPU/DISK
++label budgets but remains tied to the Q650 hash population. `assign_oracle`
++checks that the ranking hashes match the current workload exactly.
++
++### Invoke a later oracle experiment (not now)
++
++The existing H100 wrapper accepts the following additional exports (same
++H100 true-DROP runner defaults; explicit oracle **overrides final labels**):
++
++```bash
++KV_CHUNK_PLACEMENT_MODE=oracle
++KV_ORACLE_RANKING_FILE=/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM/experiments/oracle_rankings/q650_hindsight_frequency_rank_29358.json
++KV_ORACLE_GPU_CHUNKS=258
++KV_ORACLE_CPU_CHUNKS=767
++KV_ORACLE_DISK_CHUNKS=1012
++VLLM_VPC_POLICY=selective
++VLLM_VPC_DIAGNOSTICS=1
++```
++
++Use unique Slurm experiment labels, independent L2 storage, and ensure failed
++stores are zero. For alternative oracle class budgets (e.g. GPU=50, 100, 150),
++change only the cutoff values, **not** the ranking file. Classes are assigned:
++first `GPU`, next `CPU`, next `DISK`, remainder `DROP`. The ranks must exactly
++cover all unique hashes in the run; a mismatch aborts rather than silently
++mislabels missing hashes. The precompute summary records the budgets and file.
++
++With `VLLM_VPC_POLICY=selective`, only GPU-labelled idle blocks retain cached
++hashes, and they remain evictable by vanilla LRU when new allocations need
++capacity. Active blocks are never evicted by admission filtering. CPU/DISK/DROP
++placements use the unchanged LMCache backend and existing store cap. This is a
++**different treatment** from comparing GNN W256 with oracle selective; use
++matched VPC policies to isolate predictor/classification quality.
++
++### Validations and limitations
++
++Python compilation and standalone oracle/census tests can run on login nodes.
++The repository-wide vLLM pytest suite requires a correctly provisioned vLLM
++environment and GPU platform (the portable container may lack `tblib`,
++`msgspec`, CUDA and compiled `vllm._C`). Run the vLLM core policy and new
++diagnostic tests on a compute node before an H100 sweep. Recommended: run a
++short cold/warm Q24 smoke with `VLLM_VPC_DIAGNOSTICS=1`, compare outputs and
++E2E with diagnostics off, and verify every `accounting_ok`. The periodic
++sample introduces measurable scheduler overhead; scientific comparisons must
++either apply it to all arms or disable it for all arms.

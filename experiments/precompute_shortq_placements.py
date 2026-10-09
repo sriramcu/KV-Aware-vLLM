@@ -53,6 +53,9 @@ from Hierarchical_KV.shortq_placement.prediction_cache import (  # noqa: E402
     lookup_prediction,
     store_prediction,
 )
+from Hierarchical_KV.shortq_placement.hindsight_oracle import (
+    oracle_mode_from_environment, apply_oracle_placements,
+)
 from Hierarchical_KV.shortq_placement.runtime_metadata import write_runtime_metadata  # noqa: E402
 from Hierarchical_KV.shortq_placement.placement_mapping import (  # noqa: E402
     CLASS_NAMES,
@@ -337,6 +340,8 @@ def main() -> None:
     if args.chunk_size % 16 != 0:
         raise ValueError("LMCache chunk size must be a multiple of the 16-token Short-Q block size")
     blocks_per_chunk = args.chunk_size // 16
+    # Fail early before loading heavyweight models if oracle flags are invalid.
+    placement_mode = oracle_mode_from_environment()
     device = torch.device(args.device)
     started = time.monotonic()
 
@@ -705,6 +710,19 @@ def main() -> None:
             flush=True,
         )
 
+    # A modular, opt-in hindsight label swap. The helper mutates only the
+    # metadata rows/runtime map; it never preloads KV or changes VPC policy.
+    oracle_config, oracle_occurrences, oracle_by_hash = apply_oracle_placements(
+        runtime, occurrences, hash_prediction_rows,
+        smoke_force_min_unique_per_placement=args.smoke_force_min_unique_per_placement,
+    )
+    if oracle_config is not None:
+        occurrence_placements = oracle_occurrences
+        candidate_by_hash = oracle_by_hash
+        conflict_occurrences = 0
+        print("[SHORTQ_HINDSIGHT_ORACLE] " + json.dumps(
+            oracle_config, sort_keys=True), flush=True)
+
     smoke_overrides = _force_smoke_placement_coverage(
         runtime, args.smoke_force_min_unique_per_placement
     )
@@ -793,6 +811,8 @@ def main() -> None:
             "config": vote_config.__dict__,
         },
         "random_chunk_placement": random_placement_summary,
+        "chunk_placement_mode": placement_mode,
+        "oracle_chunk_placement": oracle_config,
         "duplicate_resolution": "first_seen_wins",
         "block_class_counts": {CLASS_NAMES[i]: int(class_occurrences[i]) for i in range(4)},
         "chunk_occurrences": len(occurrences),
