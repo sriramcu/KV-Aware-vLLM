@@ -473,8 +473,13 @@ curl -sf http://127.0.0.1:8080/metrics > "${RUN_DIR}/lmcache_metrics_after.txt" 
 
 python scripts/analyze_mp_congestion_chthm.py \
   --lmcache-log "${LOG_DIR}/lmcache.log" --vllm-log "${LOG_DIR}/vllm.log" \
-  --results-dir "$RESULT_DIR" --output "${RUN_DIR}/mp_diag_summary.json" \
-  > "${RUN_DIR}/mp_diag_summary.txt" 2>&1 || true
+  --results-dir "$RESULT_DIR" --strict-phase \
+  --output "${RUN_DIR}/mp_diag_summary.json" \
+  > "${RUN_DIR}/mp_diag_summary.txt" 2>&1 || {
+    cat "${RUN_DIR}/mp_diag_summary.txt" >&2
+    echo "Raw CHTHM analysis failed; refusing to mark run as validated" >&2
+    exit 51
+  }
 python scripts/analyze_vllm_phase_metrics.py \
   --before "${RUN_DIR}/metrics_before.txt" --after-cold "${RUN_DIR}/metrics_after_cold.txt" \
   --after-warm "${RUN_DIR}/metrics_after.txt" --output "${RUN_DIR}/vllm_phase_metrics.json" \

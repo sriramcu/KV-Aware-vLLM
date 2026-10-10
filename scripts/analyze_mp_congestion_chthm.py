@@ -26,7 +26,7 @@ RAW_RE = re.compile(
     r"\[MP_CHTHM_RAW\] request=(\S+) chunk_size=(\d+) "
     r"requested_chunks=(\d+) reachable_prefix_chunks=(\d+) "
     r"l1_hit_chunks=(\d+) l2_hit_chunks=(\d+) miss_chunks=(\d+) "
-    r"source_map=([CDM]*)"
+    r"source_map=([A-Za-z]*)"
 )
 ADMIT_RE = re.compile(
     r"\[MP_CHTHM_ADMIT\] request=(\S+) decision=(\S+) prompt_tokens=(\d+) "
@@ -58,8 +58,9 @@ LIFETIME_RE = re.compile(
 
 def lines(path: Path | None) -> Iterable[str]:
     if path is None or not path.exists():
-        return []
-    return path.open("r", errors="replace")
+        return
+    with path.open("r", errors="replace") as stream:
+        yield from stream
 
 
 def pctile(values: list[float], p: float) -> float | None:
@@ -85,11 +86,15 @@ def dist(values: list[float]) -> dict[str, float | int | None]:
     }
 
 
+# The workload driver writes cmpl-kvaware-cold-000000, while vLLM/LMCache
+# append a per-attempt suffix such as -0-ba3f55a1 to the same request.
+# Do not truncate it to cmpl-kvaware (which destroys the phase and identity).
+_ATTEMPT_SUFFIX_RE = re.compile(r"-\d+-[A-Za-z0-9]{6,}$")
+_PHASE_ID_RE = re.compile(r"(?:^|-)kvaware-(cold|warm)-\d+(?:-|$)")
+
+
 def base_request_id(request_id: str) -> str:
-    parts = request_id.split("-")
-    if len(parts) >= 4 and parts[0] == "cmpl":
-        return "-".join(parts[:2])
-    return request_id
+    return _ATTEMPT_SUFFIX_RE.sub("", request_id)
 
 
 def phase_map(results: Path | None) -> dict[str, str]:
@@ -97,14 +102,52 @@ def phase_map(results: Path | None) -> dict[str, str]:
     if not results or not results.exists():
         return out
     for p in results.glob("*results*.jsonl"):
-        for line in p.open(errors="replace"):
+        for line in lines(p):
             try:
                 row = json.loads(line)
-            except Exception:
+            except (ValueError, TypeError):
                 continue
-            if row.get("request_id") and row.get("phase"):
-                out[str(row["request_id"])] = str(row["phase"])
+            rid, phase = row.get("request_id"), row.get("phase")
+            if rid and phase:
+                rid, phase = str(rid), str(phase)
+                if rid in out and out[rid] != phase:
+                    raise ValueError(f"Conflicting phase for {rid}: {out[rid]} vs {phase}")
+                out[rid] = phase
     return out
+
+
+def request_phase(request_id: str, phases: dict[str, str]) -> str:
+    canonical = base_request_id(request_id)
+    for candidate in (request_id, canonical):
+        if candidate in phases:
+            return phases[candidate]
+    # Request IDs are deterministic in this workload and explicitly encode
+    # their phase. Use this only when the results JSONL is unavailable.
+    match = _PHASE_ID_RE.search(canonical)
+    return match.group(1) if match else "unknown"
+
+
+def validate_raw_geometry(request_id: str, rec: dict) -> None:
+    source_map = rec["source_map"]
+    count = rec["requested_chunks"]
+    if rec["chunk_size"] <= 0:
+        raise ValueError(f"Invalid chunk size for {request_id}")
+    if len(source_map) != count or set(source_map) - {"C", "D", "M"}:
+        raise ValueError(f"Invalid source_map geometry for {request_id}: "
+                         f"{len(source_map)} vs requested={count}, map={source_map}")
+    if (source_map.count("C") != rec["l1_hit_chunks"] or
+        source_map.count("D") != rec["l2_hit_chunks"] or
+        source_map.count("M") != rec["miss_chunks"]):
+        raise ValueError(f"Source-map counts disagree for {request_id}")
+    if not 0 <= rec["reachable_prefix_chunks"] <= count:
+        raise ValueError(f"Invalid reachable prefix for {request_id}")
+    # Prefix reachability ends at the first miss, not at the last present chunk.
+    first_miss = source_map.find("M")
+    expected_prefix = count if first_miss < 0 else first_miss
+    if rec["reachable_prefix_chunks"] != expected_prefix:
+        raise ValueError(f"Reachable prefix disagrees with physical source map "
+                         f"for {request_id}: {rec['reachable_prefix_chunks']} vs "
+                         f"{expected_prefix}")
 
 
 def overlap(a0: int, a1: int, b0: int, b1: int) -> int:
@@ -135,6 +178,8 @@ def main() -> None:
     ap.add_argument("--vllm-log", type=Path, required=True)
     ap.add_argument("--results-dir", type=Path)
     ap.add_argument("--output", type=Path)
+    ap.add_argument("--strict-phase", action="store_true",
+                    help="Reject any unknown phase or missing expected result ID")
     args = ap.parse_args()
 
     lookups: dict[str, dict] = {}
@@ -148,9 +193,18 @@ def main() -> None:
     pending = {k: [] for k in ("store", "lookup", "load", "total")}
     lifetimes: list[float] = []
 
+    raw_geometry_warning_count = 0
+    duplicate_raw_records = 0
+    duplicate_admit_records = 0
+    changed_admit_request_ids: set[str] = set()
     for line in lines(args.lmcache_log):
+        if "Raw CHTHM geometry mismatch request=" in line:
+            raw_geometry_warning_count += 1
         if m := RAW_RE.search(line):
             source_map = m.group(8)
+            if m.group(1) in raw_lookups:
+                duplicate_raw_records += 1
+                continue  # First physical snapshot, before any subsequent work.
             raw_lookups[m.group(1)] = {
                 "chunk_size": int(m.group(2)),
                 "requested_chunks": int(m.group(3)),
@@ -195,6 +249,19 @@ def main() -> None:
     for line in lines(args.vllm_log):
         if m := ADMIT_RE.search(line):
             rid, decision, prompt, vpc, lmhit, ext, age = m.groups()
+            parsed_admit = {
+                "decision": decision,
+                "prompt": int(prompt),
+                "vpc": int(vpc),
+                "lmhit": int(lmhit),
+                "ext": int(ext),
+                "age": float(age),
+            }
+            if rid in admits:
+                duplicate_admit_records += 1
+                if any(admits[rid][key] != parsed_admit[key]
+                       for key in ("decision", "prompt", "vpc", "lmhit", "ext")):
+                    changed_admit_request_ids.add(rid)
             admits.setdefault(
                 rid,
                 {
@@ -225,6 +292,7 @@ def main() -> None:
     raw: dict[str, dict] = {}
     chunk_size = 512
     for rid, rec in raw_lookups.items():
+        validate_raw_geometry(rid, rec)
         cs = rec["chunk_size"]
         tiers = {"C": "L1", "D": "L2", "M": "MISS"}
         source_tiers = [tiers[ch] for ch in rec["source_map"]]
@@ -239,6 +307,7 @@ def main() -> None:
             "source_tiers": source_tiers,
             "start_token": mutual_lookup_starts.get(rid, 0),
             "source": "MP_CHTHM_RAW",
+            "exact_physical_map": True,
         }
 
     for rid, rec in lookups.items():
@@ -256,21 +325,34 @@ def main() -> None:
             "l2_hit_chunks": l2_chunks,
             "miss_chunks": miss_chunks,
             "reachable_prefix_chunks": l1_chunks + l2_chunks,
-            "source_tiers": (
-                ["L1"] * l1_chunks
-                + ["L2"] * l2_chunks
-                + ["MISS"] * miss_chunks
-            ),
+            # Legacy LOOKUP knows only the reachable, post-lookup prefix.
+            # Do NOT invent physical misses outside that prefix: later CPU/L2
+            # chunks might exist behind a gap but were never observed.
+            "source_tiers": ["L1"] * l1_chunks + ["L2"] * l2_chunks,
             "start_token": mutual_lookup_starts.get(rid, 0),
             "source": "MP_CHTHM_LOOKUP_LEGACY",
+            "exact_physical_map": False,
         }
 
+    if args.strict_phase and raw_geometry_warning_count:
+        raise ValueError(f"Found {raw_geometry_warning_count} runtime CHTHM geometry warnings")
     phases = phase_map(args.results_dir)
+    if args.strict_phase and not phases:
+        raise ValueError("--strict-phase requires result JSONLs with request IDs and phases")
     raw_b: dict[str, dict] = {}
     useful_b: dict[str, dict] = {}
+    unknown_request_ids: list[str] = []
+    phase_admit_counts: dict[str, int] = {}
 
     for rid, admit in admits.items():
-        phase = phases.get(rid, phases.get(base_request_id(rid), "unknown"))
+        phase = request_phase(rid, phases)
+        phase_admit_counts[phase] = phase_admit_counts.get(phase, 0) + 1
+        if phase == "unknown":
+            unknown_request_ids.append(rid)
+        if args.strict_phase and (phase == "unknown" or
+                                  (phases and base_request_id(rid) not in phases
+                                   and rid not in phases)):
+            raise ValueError(f"Unmatched results phase/request for {rid}")
         prompt = admit["prompt"]
         vpc = min(prompt, admit["vpc"])
         rr = raw.get(rid)
@@ -291,6 +373,10 @@ def main() -> None:
                 "raw_external_opportunity_tokens": 0,
                 "observed_external_opportunity_tokens": 0,
                 "unobserved_external_opportunity_tokens": 0,
+                "physical_raw_requests": 0,
+                "legacy_lookup_requests": 0,
+                "no_raw_lookup_requests": 0,
+                "partial_raw_observation_requests": 0,
             },
         )
         ub = useful_b.setdefault(
@@ -316,7 +402,17 @@ def main() -> None:
         ub["vpc_tokens"] += vpc
 
         if rr is not None:
-            rb["observed_external_opportunity_tokens"] += external_opportunity
+            physical = rr["exact_physical_map"]
+            rb["physical_raw_requests" if physical else "legacy_lookup_requests"] += 1
+            # A logged source map is authoritative only over its actual token
+            # range. Missing leading/suffix coverage is censored, not a miss.
+            raw_start = rr["start_token"]
+            raw_end = raw_start + len(rr["source_tiers"]) * rr["chunk_size"]
+            observed = overlap(vpc, chunk_addressable, raw_start, raw_end)
+            rb["observed_external_opportunity_tokens"] += observed
+            rb["unobserved_external_opportunity_tokens"] += (external_opportunity - observed)
+            if observed < external_opportunity:
+                rb["partial_raw_observation_requests"] += 1
             src = source_token_counts(rr, vpc, chunk_addressable)
             rb["l1_hit_tokens"] += src["L1"]
             rb["l2_hit_tokens"] += src["L2"]
@@ -325,6 +421,7 @@ def main() -> None:
                 rr, vpc, chunk_addressable
             )
         else:
+            rb["no_raw_lookup_requests"] += 1
             rb["unobserved_external_opportunity_tokens"] += external_opportunity
 
         # Non-chunk-aligned tail tokens can never be served by LMCache and are
@@ -345,6 +442,15 @@ def main() -> None:
             ub["external_unknown_tokens"] += ext
         if admit["decision"] == "freshness_miss":
             ub["freshness_misses"] += 1
+
+    if args.strict_phase:
+        expected_by_phase: dict[str, int] = {}
+        for ph in phases.values():
+            expected_by_phase[ph] = expected_by_phase.get(ph, 0) + 1
+        if phase_admit_counts != expected_by_phase:
+            raise ValueError("Phase admit counts do not match result request IDs: "
+                             f"observed={phase_admit_counts}, "
+                             f"expected={expected_by_phase}")
 
     for bucket in raw_b.values():
         total = bucket["prompt_tokens"]
@@ -392,14 +498,20 @@ def main() -> None:
     starve_by: dict[str, set[str]] = {}
     fresh_by: dict[str, set[str]] = {}
     for rid in starvation_requests:
-        phase = phases.get(rid, phases.get(base_request_id(rid), "unknown"))
+        phase = request_phase(rid, phases)
         starve_by.setdefault(phase, set()).add(rid)
     for rid, _ in freshness:
-        phase = phases.get(rid, phases.get(base_request_id(rid), "unknown"))
+        phase = request_phase(rid, phases)
         fresh_by.setdefault(phase, set()).add(rid)
 
     result = {
         "raw_chthm": raw_b,
+        "phase_attribution": {
+            "result_request_ids": len(phases),
+            "scheduler_admit_by_phase": phase_admit_counts,
+            "unknown_scheduler_admit_ids": unknown_request_ids[:20],
+            "unknown_scheduler_admit_count": len(unknown_request_ids),
+        },
         "useful_contribution": useful_b,
         "chthm_definition": (
             "GPU/VPC hit is over all prompt tokens; CPU/L1 hit is conditional on GPU miss; "
@@ -408,7 +520,10 @@ def main() -> None:
         "observation_note": (
             "MP_CHTHM_RAW is pre-load physical per-chunk hierarchy availability; "
             "reachable_external_prefix is a separate contiguous-prefix metric. "
-            "Raw tier rates remain lower bounds when raw_external_observation_coverage_pct < 100. "
+            "Physical raw rates are exact only where pre-load MP_CHTHM_RAW covers "
+            "the lookup; legacy post-lookup prefix counters never establish "
+            "a physical miss beyond that prefix. Any unobserved coverage "
+            "makes raw tier rates lower bounds. "
             "Useful contribution is scheduler-consumed KV and remains separate."
         ),
         "freshness_guard": {
@@ -443,9 +558,20 @@ def main() -> None:
             "native_pending_total": dist(pending["total"]),
         },
         "raw_lookup_records": len(raw_lookups),
+        "raw_geometry_warning_count": raw_geometry_warning_count,
         "legacy_lookup_records": len(lookups),
         "lookup_records_used": len(raw),
         "scheduler_admit_records": len(admits),
+        "duplicate_raw_records": duplicate_raw_records,
+        "duplicate_scheduler_admit_records": duplicate_admit_records,
+        "changed_scheduler_admit_requests": len(changed_admit_request_ids),
+        "changed_scheduler_admit_request_examples": sorted(changed_admit_request_ids)[:20],
+        "scheduler_admit_observation_note": (
+            "First admission record per request is used for raw and contribution "
+            "summary compatibility. Repeated admission logs can change VPC/LOAD "
+            "fields; changed_scheduler_admit_requests identifies such cases. "
+            "Do not treat repeated records as independent requests."
+        ),
     }
 
     rendered = json.dumps(result, indent=2, sort_keys=True)
