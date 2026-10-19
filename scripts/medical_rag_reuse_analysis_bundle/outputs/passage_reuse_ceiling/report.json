@@ -1,0 +1,76 @@
+{
+  "assumptions": [
+    "Hashes complete passage text, ignores tokenizer and 512-token fragmentation",
+    "Prefix matches require identical leading ordered passage IDs",
+    "Simulates an unlimited, instant-persistence, passage-aligned cache",
+    "Does not model padding compute/storage overhead or answer quality",
+    "Per-request greedy optimal is not a globally joint sequence optimum",
+    "Weights whole-passage content by UTF-8 decoded character counts, not model tokens"
+  ],
+  "independent_passage_upper_bound": {
+    "description": "Unconstrained earlier-seen PASSAGE TEXTS; does not respect attention/prefix dependence",
+    "requests": 650,
+    "distinct_passages": 195,
+    "total_passage_occurrences": 3250,
+    "previously_seen_occurrences": 3055,
+    "fraction_seen_occurrences": 0.94,
+    "fraction_seen_passage_characters": 0.9398118035961742,
+    "requests_all_passages_previously_seen": 0.8384615384615385
+  },
+  "prefix_aligned_scenarios": [
+    {
+      "strategy": "original",
+      "requests": 650,
+      "total_passage_occurrences": 3250,
+      "mean_matched_leading_passages": 1.5061538461538462,
+      "requests_with_at_least_one_reused_passage": 0.8015384615384615,
+      "requests_with_all_passages_reused": 0.04,
+      "fraction_passage_occurrences_reused": 0.30123076923076925,
+      "fraction_passage_characters_reused": 0.3016162844979931,
+      "requests_reordered": 0.0,
+      "candidate_orders_checked": 650
+    },
+    {
+      "strategy": "canonical",
+      "requests": 650,
+      "total_passage_occurrences": 3250,
+      "mean_matched_leading_passages": 2.293846153846154,
+      "requests_with_at_least_one_reused_passage": 0.8876923076923077,
+      "requests_with_all_passages_reused": 0.21846153846153846,
+      "fraction_passage_occurrences_reused": 0.45876923076923076,
+      "fraction_passage_characters_reused": 0.4584692241271509,
+      "requests_reordered": 0.9953846153846154,
+      "candidate_orders_checked": 650
+    },
+    {
+      "strategy": "optimal_keep_top1",
+      "requests": 650,
+      "total_passage_occurrences": 3250,
+      "mean_matched_leading_passages": 2.2169230769230768,
+      "requests_with_at_least_one_reused_passage": 0.8015384615384615,
+      "requests_with_all_passages_reused": 0.14923076923076922,
+      "fraction_passage_occurrences_reused": 0.4433846153846154,
+      "fraction_passage_characters_reused": 0.44349850504787564,
+      "requests_reordered": 0.4307692307692308,
+      "candidate_orders_checked": 15600
+    },
+    {
+      "strategy": "optimal",
+      "requests": 650,
+      "total_passage_occurrences": 3250,
+      "mean_matched_leading_passages": 2.855384615384615,
+      "requests_with_at_least_one_reused_passage": 0.92,
+      "requests_with_all_passages_reused": 0.21846153846153846,
+      "fraction_passage_occurrences_reused": 0.571076923076923,
+      "fraction_passage_characters_reused": 0.5715119377066269,
+      "requests_reordered": 0.803076923076923,
+      "candidate_orders_checked": 78000
+    }
+  ],
+  "input": {
+    "requests": 650,
+    "topk": 5,
+    "request_order": "source",
+    "seed": 1
+  }
+}

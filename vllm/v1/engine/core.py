@@ -87,6 +87,7 @@ from vllm.v1.fault_tolerance.engine_core_sentinel import (
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig, get_kv_cache_spec_kind
 from vllm.v1.metrics.stats import SchedulerIterationDetails, SchedulerStats
+from vllm.v1.metrics import phase_trace as sc_phase_trace
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
@@ -605,8 +606,11 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        sc_t0 = sc_phase_trace.now_ns() if sc_phase_trace.enabled() else 0
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        sc_t1 = sc_phase_trace.now_ns() if sc_phase_trace.enabled() else 0
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        sc_t2 = sc_phase_trace.now_ns() if sc_phase_trace.enabled() else 0
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
@@ -616,12 +620,17 @@ class EngineCore:
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
 
+        sc_t3 = sc_phase_trace.now_ns() if sc_phase_trace.enabled() else 0
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        if sc_phase_trace.enabled():
+            sc_phase_trace.record_engine_step(
+                scheduler_output, sc_t0, sc_t1, sc_t2, sc_t3,
+                sc_phase_trace.now_ns())
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
@@ -654,6 +663,11 @@ class EngineCore:
 
         batch_queue = self.batch_queue
         assert batch_queue is not None
+        # Store per-output dispatch timestamps across asynchronous queueing.
+        sc_timing = getattr(self, "_sc_phase_async_timing", None)
+        if sc_phase_trace.enabled() and sc_timing is None:
+            sc_timing = self._sc_phase_async_timing = {}
+
 
         # Try to schedule a new batch if the batch queue is not full, but
         # the scheduler may return an empty batch if all requests are scheduled.
@@ -663,11 +677,16 @@ class EngineCore:
         model_executed = False
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
+            sc_t0 = sc_phase_trace.now_ns() if sc_phase_trace.enabled() else 0
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            sc_t1 = sc_phase_trace.now_ns() if sc_phase_trace.enabled() else 0
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
                 )
+            if sc_timing is not None:
+                sc_timing[id(scheduler_output)] = (
+                    sc_t0, sc_t1, sc_phase_trace.now_ns())
             if self.is_ec_consumer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
@@ -718,12 +737,18 @@ class EngineCore:
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
 
+        sc_t3 = sc_phase_trace.now_ns() if sc_phase_trace.enabled() else 0
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        if sc_timing is not None:
+            sc_times = sc_timing.pop(id(scheduler_output), None)
+            if sc_times is not None:
+                sc_phase_trace.record_engine_step(
+                    scheduler_output, *sc_times, sc_t3, sc_phase_trace.now_ns())
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 
         # NOTE(nick): We can either handle the deferred tasks here or save

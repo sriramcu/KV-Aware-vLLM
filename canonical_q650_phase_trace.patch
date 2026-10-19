@@ -1,0 +1,1193 @@
+diff --git a/docs/CANONICAL_PHASE_TRACE_Q650.md b/docs/CANONICAL_PHASE_TRACE_Q650.md
+new file mode 100644
+index 0000000..66d4e79
+--- /dev/null
++++ b/docs/CANONICAL_PHASE_TRACE_Q650.md
+@@ -0,0 +1,166 @@
++# Canonical Q650 H100 — Python-only patch and phase-trace guide
++
++This patch targets the uploaded **KV-Aware-vLLM-lmcache-mp-l0-vllm029**
++repository snapshot. It changes no C/C++/CUDA files and requires no
++vLLM/CUDA rebuild **when Python imports resolve to the modified checkout**.
++It has not been validated on H100 and does not automatically request a GPU.
++
++## 1. Apply
++
++On the login node, copy the downloaded `canonical_q650_phase_trace.patch` into
++`/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM/` (for example with `scp`).
++
++```bash
++export REPO=/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
++cd "$REPO"
++git apply --check canonical_q650_phase_trace.patch
++git apply canonical_q650_phase_trace.patch
++```
++
++If `git apply --check` fails, **do not force the patch**. It was generated
++against the uploaded ZIP, which may differ from your current working tree.
++Back up any local modifications and inspect the reject/diff before proceeding.
++
++Verify source import location without using a GPU:
++
++```bash
++source /mnt/shared/gpfs/home/sriramc2/venvs/kvaware-vllm029/bin/activate
++python -c 'import vllm; print(vllm.__file__)'
++python -m unittest discover -s tests -p test_canonical_phase_cpu.py -v
++bash -n scripts/run_shortq_gnn_dynamic_vpc_common.sh \
++        scripts/run_h100_canonical_q650_phase_trace.sbatch
++python -m compileall -q experiments/passage_order_policies \
++  vllm/v1/metrics/phase_trace.py vllm/v1/metrics/phase_device_trace.py \
++  scripts/analyze_phase_trace.py scripts/plot_phase_gantt.py
++```
++
++The Python `vllm.__file__` should point to the checkout or editable install
++that will be imported by the launcher. Python source changes take effect after
++server restart; no extension compilation is needed.
++
++## 2. Submit the canonical experiment (when H100 queue clears)
++
++The new sbatch wrapper matches the **main true-DROP GNN job 29265** settings:
++Q650 / TP2 / H100 / FP8 / BF16 KV / MNS16 / B200 / fixed output 128 /
++C225 / U0.25 / L2 LOAD2 / LOOKUP16 / VPC W256 / L1 backing on /
++L2 backing off / store barrier on / GNN 8-2 true-DROP vote.
++
++The **cold request order** is seeded-shuffle 0, and the **independent warm
++request order** is random seed 1, matching the headline methodology. Both
++original and canonical reruns must use these same *respective phase seeds*.
++
++```bash
++export REPO=/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
++cd "$REPO"
++# Do NOT run until ready to submit a real H100 job:
++sbatch scripts/run_h100_canonical_q650_phase_trace.sbatch
++```
++
++The existing common launcher has `CLEAN_OLD_LMCACHE=1` **by default** and
++its cleanup removes **everything immediately under `/scratch2/sriramc2`**.
++Read that function and ensure this is acceptable before submitting. Set
++`CLEAN_OLD_LMCACHE=0` to skip deleting scratch, but only if you can ensure an
++otherwise clean and isolated run. The new wrapper has not modified that
++existing behavior.
++
++To run canonical ordering without phase traces later:
++
++```bash
++sbatch --export=ALL,VLLM_PHASE_TRACE=0 \
++  scripts/run_h100_canonical_q650_phase_trace.sbatch
++```
++
++To enable **experimental** worker CUDA-event timing later (not validated on
++H100; off by default):
++
++```bash
++sbatch --export=ALL,VLLM_PHASE_TRACE_DEVICE_TIMING=1 \
++  scripts/run_h100_canonical_q650_phase_trace.sbatch
++```
++
++## 3. Results
++
++The Slurm job writes the run directory to its output as `run_dir=...`.
++Inside it, inspect:
++
++- `run_config.json`: canonical policy, phase seeds, tier config, trace flags.
++- `results/manifest.json`: per-run driver metadata.
++- `results/prompt_records.jsonl`: final canonical order, raw passage ranks,
++  exact constructed prompt, and scores carried along with their passages.
++- `results/summary.json`: cold/warm E2E, TTFT and existing driver measurements.
++- `vllm_phase_metrics.json`: **unchanged** historical Prometheus definitions.
++- `logs/phase_trace/phase_engine.pid*.jsonl`: scheduled prompt and decode
++  positions (snapshotted before the scheduler advances computed-token counts),
++  per-batch scheduling/submission/result/update CPU timestamps and remote KV
++  waiting-state transitions.
++- `phase_trace_summary.json`: per-phase scheduled token totals, batch type
++  counters, descriptive decode interstep gaps and KV wait intervals.
++- `logs/phase_trace/phase_device.pid*.jsonl`: optional per-worker CUDA-forward
++  timings only when `VLLM_PHASE_TRACE_DEVICE_TIMING=1`.
++
++Analyze a trace again after the job exits (CPU-only):
++
++```bash
++export RUN_DIR=/path/from/slurm/run_dir
++python scripts/analyze_phase_trace.py \
++  --trace-dir "$RUN_DIR/logs/phase_trace" \
++  --output "$RUN_DIR/phase_trace_summary.json"
++```
++
++Plot a representative request's **participating batch wall intervals**:
++
++```bash
++python scripts/plot_phase_gantt.py \
++  --trace-dir "$RUN_DIR/logs/phase_trace" \
++  --request-id kvaware-warm-000123 \
++  --output "$RUN_DIR/analysis/warm_000123.png"
++```
++
++## 4. Measurement boundaries / limitations
++
++- **Prompt compute tokens** = actual prompt positions scheduled for model
++  execution, not all prompt tokens or all cache lookups. Cached-prefix tokens
++  are omitted. For speculative/multimodal execution or aborted in-flight
++  steps, treat counts as *issued* work, not strictly completed kernel work.
++- **Decode-position tokens** = scheduled generated-token positions (the first
++  sampled token is produced by final prefill, so a 128-token completion
++  typically needs approximately 127 decode-position computations).
++- **Engine submit-to-result wall** is **not** exclusive GPU model-forward time:
++  it can contain queueing, worker communication, KV handling, and other work.
++- **Decode interstep gaps** are descriptive; they do not prove that another
++  request's prefill *caused* the gap. Mixed batches also cannot be assigned
++  exclusive per-request GPU time.
++- `kv_wait_enter/exit` times the Stage-2 `WAITING_FOR_REMOTE_KVS` scheduler
++  state, not the entire asynchronous Stage-1 L2 GET or overlapping L1 staging.
++- Optional PyTorch CUDA events cover the forward region on a worker/rank and
++  **do not** distinguish prefill kernels from decode kernels inside mixed
++  batches. CUDA-event behavior under graph capture needs GPU validation first.
++- High-granularity CPU tracing is intentionally opt-in and introduces overhead.
++  Rerun an `original` policy run with the **same tracing flags** before making
++  rigorous E2E comparisons. Historical headline numbers remain references only.
++- Passage ordering uses a stable SHA-256 digest of passage **text** and does
++  **not pad passages**. The initial ordering policy registry offers `original`
++  and `canonical`; cache-aware policies can be added later without changing
++  the driver and precomputer separately.
++- When using `KV_REQUEST_ORDER=legacy_prefix_hash`, changing passage order
++  can also change *question* order. The new canonical wrapper explicitly
++  chooses `seeded_shuffle` so request order stays paired across strategies.
++
++## 5. Run a matched original-order trace later
++
++For an instrumented original-order counterpart, change only the new wrapper's
++`KV_PASSAGE_ORDER_POLICY=canonical` line to `original`, or submit the original
++Q650 sbatch with the headline flag set and tracing enabled, while retaining
++*identical configuration values and cold/warm seeds*. The canonical wrapper defaults to `canonical` but permits an override:
++
++```bash
++sbatch --export=ALL,KV_PASSAGE_ORDER_POLICY=original,EXPERIMENT_LABEL=original_trace_q650_b200_seed0_seed1 \
++  scripts/run_h100_canonical_q650_phase_trace.sbatch
++```
++
++For a no-GNN canonical control, the existing
++`scripts/run_h100_mp_nognn_q650_current_cleanall.sbatch` now also accepts
++`KV_PASSAGE_ORDER_POLICY=canonical`. Its other configuration flags must be
++matched separately to the no-GNN headline run (job 29219); **do not assume
++its script defaults match that historical run**. It uses its own destructive
++scratch cleanup and needs the same cold/warm shuffle seeds.
+diff --git a/experiments/mp_nognn_project.py b/experiments/mp_nognn_project.py
+index 6f3944b..6af5c69 100644
+--- a/experiments/mp_nognn_project.py
++++ b/experiments/mp_nognn_project.py
+@@ -47,6 +47,11 @@ import pandas as pd
+ import requests
+ from transformers import AutoTokenizer
+ 
++# Running `python experiments/mp_nognn_project.py` must also find the
++# repository-root experiments package (not just sys.path[0]=experiments/).
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from experiments.passage_order_policies import POLICIES, apply_passage_order
++
+ 
+ REPO_ROOT = Path(__file__).resolve().parents[1]
+ HKV_ROOT = REPO_ROOT / "Hierarchical_KV"
+@@ -334,6 +339,9 @@ def build_vllm_prompts_from_retrieval_results(
+                 "sorted_passage_scores": retrieval_result.get(
+                     "sorted_passage_scores", []
+                 ),
++                "retrieval_rank_after_order": retrieval_result.get(
++                    "retrieval_rank_after_order", list(range(len(sorted_passage)))
++                ),
+                 "gold_answer": retrieval_result.get("gold_answer", ""),
+                 "retrieval_mode": retrieval_result.get("retrieval_mode"),
+                 "llm_prompt": llm_prompt,
+@@ -992,6 +1000,7 @@ def parse_arguments():
+ 
+     parser.add_argument("--dataset_name", default="hotpotqa")
+     parser.add_argument("--retrieval_top_k", type=int, default=5)
++    parser.add_argument("--passage_order_policy", choices=POLICIES, default="original")
+ 
+     parser.add_argument("--question")
+     parser.add_argument("--questions_json")
+@@ -1140,6 +1149,7 @@ def main():
+                 "max_questions": args.max_questions,
+                 "llm_model": args.llm_model,
+                 "retrieval_top_k": args.retrieval_top_k,
++                "passage_order_policy": args.passage_order_policy,
+                 "request_order": args.request_order,
+                 "prefix_sort_depth": args.prefix_sort_depth,
+                 "request_order_seed": args.request_order_seed,
+@@ -1183,6 +1193,8 @@ def main():
+     )
+     retrieval_elapsed = time.monotonic() - retrieval_start
+ 
++    retrieval_results = apply_passage_order(retrieval_results, args.passage_order_policy)
++
+     llm_inputs, prompt_records = (
+         build_vllm_prompts_from_retrieval_results(
+             retrieval_results,
+@@ -1239,6 +1251,7 @@ def main():
+         "dataset_name": args.dataset_name,
+         "num_requests": num_requests,
+         "retrieval_top_k": args.retrieval_top_k,
++        "passage_order_policy": args.passage_order_policy,
+         "retrieval_elapsed_seconds": retrieval_elapsed,
+         "llm_model": args.llm_model,
+         "request_order": args.request_order,
+diff --git a/experiments/passage_order_policies/__init__.py b/experiments/passage_order_policies/__init__.py
+new file mode 100644
+index 0000000..ca6a193
+--- /dev/null
++++ b/experiments/passage_order_policies/__init__.py
+@@ -0,0 +1,54 @@
++"""Deterministic post-retrieval ordering policies for RAG prompt construction.
++
++The input is the *retriever-ranked* list. The original policy returns the
++same list; canonical uses SHA-256 of the exact passage text (not Python hash).
++All related per-passage fields are permuted together. No tokenizer or KV
++operations occur here.
++"""
++from __future__ import annotations
++
++import hashlib
++from collections.abc import Sequence
++from typing import Any
++
++POLICIES = ("original", "canonical")
++
++
++def passage_order_indices(passages: Sequence[str], policy: str) -> list[int]:
++    if policy == "original":
++        return list(range(len(passages)))
++    if policy != "canonical":
++        raise ValueError(f"Unknown passage ordering policy {policy!r}; choose {POLICIES}")
++    # Explicit tie-breaker avoids relying on sort implementation details.
++    return sorted(
++        range(len(passages)),
++        key=lambda i: (
++            hashlib.sha256(str(passages[i]).encode("utf-8")).hexdigest(),
++            str(passages[i]),
++            i,
++        ),
++    )
++
++
++def apply_passage_order(
++    retrieval_results: list[dict[str, Any]], policy: str
++) -> list[dict[str, Any]]:
++    if policy not in POLICIES:
++        raise ValueError(f"Unknown passage ordering policy {policy!r}")
++    if policy == "original":
++        return retrieval_results  # Preserve the baseline exactly.
++    out = []
++    for record in retrieval_results:
++        passages = record["sorted_passage"]
++        indices = passage_order_indices(passages, policy)
++        updated = dict(record)
++        updated["sorted_passage"] = [passages[i] for i in indices]
++        for name in ("sorted_passage_scores", "sorted_passage_ids"):
++            data = record.get(name)
++            if data is not None:
++                if len(data) != len(passages):
++                    raise ValueError(f"{name} length disagrees with sorted_passage")
++                updated[name] = [data[i] for i in indices]
++        updated["retrieval_rank_after_order"] = indices
++        out.append(updated)
++    return out
+diff --git a/experiments/precompute_shortq_placements.py b/experiments/precompute_shortq_placements.py
+index 1621c60..1999d42 100644
+--- a/experiments/precompute_shortq_placements.py
++++ b/experiments/precompute_shortq_placements.py
+@@ -27,6 +27,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
+ sys.path.insert(0, str(REPO_ROOT))
+ sys.path.insert(0, str(REPO_ROOT / "third_party" / "LMCache"))
+ 
++from experiments.passage_order_policies import POLICIES, apply_passage_order  # noqa: E402
+ from experiments.mp_nognn_project import (  # noqa: E402
+     build_vllm_prompts_from_retrieval_results,
+     dense_retrieve_from_import,
+@@ -75,6 +76,7 @@ def parse_args() -> argparse.Namespace:
+     p.add_argument("--questions_json", default="")
+     p.add_argument("--max_questions", type=int, default=650)
+     p.add_argument("--retrieval_top_k", type=int, default=5)
++    p.add_argument("--passage_order_policy", choices=POLICIES, default="original")
+     p.add_argument("--request_order", default="legacy_prefix_hash")
+     p.add_argument("--prefix_sort_depth", type=int, default=2)
+     p.add_argument("--request_order_seed", type=int, default=0)
+@@ -365,6 +367,7 @@ def main() -> None:
+         embedding_model=embedding_model,
+         retrieval_top_k=args.retrieval_top_k,
+     )
++    retrieval = apply_passage_order(retrieval, args.passage_order_policy)
+     prompts, records = build_vllm_prompts_from_retrieval_results(retrieval, serving_tok)
+     prompts, records = reorder_requests(
+         prompts,
+diff --git a/scripts/analyze_phase_trace.py b/scripts/analyze_phase_trace.py
+new file mode 100644
+index 0000000..e019de0
+--- /dev/null
++++ b/scripts/analyze_phase_trace.py
+@@ -0,0 +1,164 @@
++#!/usr/bin/env python3
++"""CPU-only offline analysis of opt-in phase_engine.pid*.jsonl traces.
++
++The results distinguish scheduled prompt/decode-position token counts, KV
++remote-wait transitions, and wall-clock engine durations. The executor-result
++interval is NOT exclusive GPU time. 'decode interstep gap' is an estimate of
++time between batch completions and is not a causal scheduler-wait attribution.
++"""
++from __future__ import annotations
++
++import argparse
++from collections import Counter, defaultdict
++import json
++from pathlib import Path
++from statistics import mean, median
++
++
++def summary(values):
++    if not values:
++        return {"count": 0}
++    values = sorted(values)
++    return {
++        "count": len(values), "sum": sum(values),
++        "mean": mean(values), "median": median(values),
++        "p95": values[min(len(values)-1, int(0.95 * len(values)))],
++        "max": values[-1],
++    }
++
++
++def phase_of(req_id):
++    if 'kvaware-cold-' in req_id:
++        return 'cold'
++    if 'kvaware-warm-' in req_id:
++        return 'warm'
++    return 'unknown'
++
++
++def run(trace_dir: Path):
++    events = []
++    files = sorted(trace_dir.glob('phase_engine.pid*.jsonl'))
++    for f in files:
++        for num, line in enumerate(f.read_text().splitlines(), 1):
++            try:
++                event = json.loads(line)
++            except json.JSONDecodeError:
++                # End-of-job flush and killing a process can truncate last line.
++                continue
++            event['_pid'] = f.stem.split('pid')[-1]
++            events.append(event)
++    events.sort(key=lambda e: e.get('ts_ns', 0))
++    periods = defaultdict(lambda: defaultdict(list))
++    request_steps = defaultdict(list)
++    remote_pending = {}
++    remote_complete = defaultdict(list)
++    totals = Counter()
++    for e in events:
++        kind = e.get('kind')
++        if kind in ('kv_wait_enter', 'kv_wait_exit'):
++            rid = str(e['request_id'])
++            key = (e['_pid'], rid)
++            if kind == 'kv_wait_enter':
++                remote_pending[key] = e['ts_ns']
++            elif key in remote_pending:
++                remote_complete[key].append((e['ts_ns'] - remote_pending.pop(key))/1e6)
++            continue
++        if kind != 'engine_step':
++            continue
++        totals['steps'] += 1
++        pre = e.get('prompt_compute_tokens', 0)
++        dec = e.get('decode_position_tokens', 0)
++        batch_kind = 'mixed' if pre and dec else 'prefill' if pre else 'decode' if dec else 'idle'
++        totals[f'{batch_kind}_steps'] += 1
++        for k, a, b in (
++            ('schedule_wall_ms', 'schedule_start_ns', 'schedule_end_ns'),
++            ('dispatch_wall_ms', 'schedule_end_ns', 'submit_end_ns'),
++            ('executor_result_wall_ms', 'submit_end_ns', 'result_end_ns'),
++            ('output_update_wall_ms', 'result_end_ns', 'update_end_ns'),
++        ):
++            periods['all'][k].append((e[b]-e[a])/1e6)
++            periods['all'][f'{batch_kind}_{k}'].append((e[b]-e[a])/1e6)
++        periods['all']['waiting_remote_snapshot'].append(e.get('waiting_remote_requests',0))
++        for row in e.get('requests', []):
++            rid = row['request_id']
++            p = phase_of(rid)
++            for key in ('scheduled','prompt_compute','decode_position'):
++                periods[p][key].append(row.get(key,0))
++            request_steps[(e['_pid'], rid)].append({
++                'schedule_ns':e['schedule_start_ns'],
++                'result_ns':e['result_end_ns'],
++                'prompt':row.get('prompt_compute',0),
++                'decode':row.get('decode_position',0),
++                'batch_kind':batch_kind,
++                'batch_result_ms': (e['result_end_ns']-e['submit_end_ns'])/1e6,
++            })
++    request_aggregate = {}
++    for key, steps in request_steps.items():
++        _, rid = key
++        steps.sort(key=lambda e:e['schedule_ns'])
++        p=phase_of(rid)
++        a=request_aggregate.setdefault(rid, {"phase":p,"prompt_compute":0,
++            "decode_position":0,"prefill_steps":0,"decode_steps":0,
++            "decode_gap_ms":0.,"decode_batch_result_exposure_ms":0.})
++        last_decode_result = None
++        for step in steps:
++            a['prompt_compute'] += step['prompt']
++            a['decode_position'] += step['decode']
++            a['prefill_steps'] += bool(step['prompt'])
++            a['decode_steps'] += bool(step['decode'])
++            if step['decode']:
++                a['decode_batch_result_exposure_ms'] += step['batch_result_ms']
++                if last_decode_result is not None:
++                    # A proxy, not an exclusive wait attribution. Async steps
++                    # can overlap, so negative gaps are truncated.
++                    a['decode_gap_ms'] += max(0,(step['schedule_ns']-last_decode_result)/1e6)
++                last_decode_result = step['result_ns']
++    by_phase = {}
++    for phase in ('cold','warm','unknown'):
++        group=[a for a in request_aggregate.values() if a['phase']==phase]
++        if not group and phase == 'unknown': continue
++        by_phase[phase] = {
++            'requests':len(group),
++            **{k:summary([a[k] for a in group])
++                for k in ('prompt_compute','decode_position','prefill_steps',
++                           'decode_steps','decode_gap_ms',
++                           'decode_batch_result_exposure_ms')},
++            'kv_remote_wait_ms':summary([
++                x for (_,rid), durations in remote_complete.items()
++                if phase_of(rid)==phase for x in durations]),
++        }
++    device_files=sorted(trace_dir.glob('phase_device.pid*.jsonl'))
++    device={}
++    for f in device_files:
++        duration=[]
++        for line in f.read_text().splitlines():
++            try: ev=json.loads(line)
++            except json.JSONDecodeError: continue
++            if ev.get('kind')=='device_forward':
++                duration.append(ev['duration_ms'])
++        device[f.stem]=summary(duration)
++    return {
++        'note': 'Measured executor wait is NOT GPU compute. Device timings are per worker, not per-request. Decode gaps are descriptive, not causal.',
++        'trace_files':[str(p) for p in files],
++        'steps':dict(totals),
++        'engine_step_wall_ms': {k:summary(v) for k,v in periods['all'].items()},
++        'by_phase':by_phase,
++        'device_forward_per_worker_ms':device,
++        'request_traces_count':len(request_aggregate),
++        'unclosed_remote_wait_intervals':len(remote_pending),
++    }
++
++
++def main():
++    parser=argparse.ArgumentParser()
++    parser.add_argument('--trace-dir',type=Path,required=True)
++    parser.add_argument('--output',type=Path,required=True)
++    args=parser.parse_args()
++    result=run(args.trace_dir)
++    args.output.parent.mkdir(parents=True,exist_ok=True)
++    args.output.write_text(json.dumps(result,indent=2)+'\n')
++    print(json.dumps({'steps':result['steps'], 'by_phase':result['by_phase'],
++                      'trace_files':result['trace_files']},indent=2))
++
++
++if __name__=='__main__': main()
+diff --git a/scripts/plot_phase_gantt.py b/scripts/plot_phase_gantt.py
+new file mode 100644
+index 0000000..a088f0f
+--- /dev/null
++++ b/scripts/plot_phase_gantt.py
+@@ -0,0 +1,64 @@
++#!/usr/bin/env python3
++"""Plot request participation in scheduler batches (CPU engine timings).
++
++Orange = scheduled prompt positions; teal = scheduled decode positions;
++gray = intervals between that request's participating batches. A single
++GPU batch can contain both types; drawing separate bars is NOT per-request
++exclusive GPU kernel timing. No GPU is needed to generate this plot.
++"""
++import argparse
++import json
++from pathlib import Path
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument('--trace-dir', required=True, type=Path)
++    ap.add_argument('--request-id', required=True)
++    ap.add_argument('--output', required=True, type=Path)
++    args = ap.parse_args()
++    import matplotlib.pyplot as plt
++    matches = []
++    for filename in sorted(args.trace_dir.glob('phase_engine.pid*.jsonl')):
++        for line in filename.open():
++            try:
++                row = json.loads(line)
++            except json.JSONDecodeError:
++                continue
++            if row.get('kind') != 'engine_step':
++                continue
++            for req in row.get('requests', []):
++                if req['request_id'] == args.request_id:
++                    matches.append((row, req))
++    if not matches:
++        raise SystemExit(f'No batch steps found for request {args.request_id!r}')
++    matches.sort(key=lambda x: x[0]['schedule_start_ns'])
++    t0 = matches[0][0]['schedule_start_ns']
++    fig, ax = plt.subplots(figsize=(13, 2.4))
++    last_end = None
++    for row, req in matches:
++        begin = (row['submit_end_ns'] - t0) / 1e9
++        end = (row['result_end_ns'] - t0) / 1e9
++        if last_end is not None and begin > last_end:
++            ax.broken_barh([(last_end, begin-last_end)], (0, 0.9), facecolors='#b9bec7')
++        kind = ('mixed' if req.get('prompt_compute') and req.get('decode_position')
++                else 'prompt' if req.get('prompt_compute') else 'decode')
++        color = {'prompt':'#e7a437', 'decode':'#1a9da8', 'mixed':'#7559bb'}[kind]
++        ax.broken_barh([(begin, max(0,end-begin))], (0, 0.9), facecolors=color)
++        last_end = max(last_end or end, end)
++    ax.set_ylim(-0.15, 1.15)
++    ax.set_yticks([])
++    ax.set_xlabel('Elapsed engine time (s), from first scheduled step')
++    ax.set_title(f'{args.request_id} — participating batch wall intervals (NOT exclusive GPU time)')
++    from matplotlib.patches import Patch
++    ax.legend(handles=[Patch(color=c, label=k) for k,c in [
++        ('Prompt scheduled','#e7a437'),('Decode position scheduled','#1a9da8'),
++        ('Mixed','#7559bb'),('Between observed steps','#b9bec7')]],
++        ncol=4,loc='upper center', bbox_to_anchor=(.5,-.35), fontsize=8)
++    fig.tight_layout()
++    args.output.parent.mkdir(parents=True,exist_ok=True)
++    fig.savefig(args.output,dpi=160,bbox_inches='tight')
++    print(args.output)
++
++
++if __name__ == '__main__': main()
+diff --git a/scripts/run_h100_canonical_q650_phase_trace.sbatch b/scripts/run_h100_canonical_q650_phase_trace.sbatch
+new file mode 100644
+index 0000000..d35396e
+--- /dev/null
++++ b/scripts/run_h100_canonical_q650_phase_trace.sbatch
+@@ -0,0 +1,40 @@
++#!/usr/bin/env bash
++#SBATCH --job-name=kvaware-canon-gnn-q650
++#SBATCH --partition=gpu-h100-dchen
++#SBATCH --nodes=1
++#SBATCH --ntasks=1
++#SBATCH --cpus-per-task=16
++#SBATCH --gres=gpu:2
++#SBATCH --time=06:00:00
++#SBATCH --output=/mnt/shared/gpfs/home/sriramc2/runs/kvaware/%x_%j.out
++#SBATCH --error=/mnt/shared/gpfs/home/sriramc2/runs/kvaware/%x_%j.err
++
++set -Eeuo pipefail
++# Reproduce main job 29265 settings EXCEPT canonical passage order + trace.
++# The two independent request shuffle seeds are intentionally different.
++export KV_GNN_DYNAMIC_PROFILE=h100_q650
++export KV_PASSAGE_ORDER_POLICY="${KV_PASSAGE_ORDER_POLICY:-canonical}"
++export KV_REQUEST_ORDER=seeded_shuffle
++export KV_REQUEST_ORDER_SEED=0
++export WARM_ORDER=random
++export WARM_ORDER_SEED=1
++export SUBMISSION_BATCH_SIZE=200
++export MIN_TOKENS=128 MAX_TOKENS=128
++export MAX_NUM_SEQS=16
++export LMCACHE_L1_SIZE_GB=225
++export LMCACHE_MP_MAX_INFLIGHT_STORE_GB=0.25
++export LMCACHE_L2_LOAD_MAX_IN_FLIGHT=2
++export LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT=16
++export KV_MUTUAL_PREFIX=1
++export KV_VPC_SUFFICIENT_BYPASS=1
++export KV_COLD_WARM_STORE_BARRIER=1
++export LMCACHE_MP_PREFIX_DIAGNOSTICS=1
++export VLLM_GNN_AWARE_VPC_WINDOW=256
++export KV_GNN_AWARE_VPC=1 KV_GNN_L1_BACKING=1 KV_GNN_L2_BACKING=0
++export GNN_CHUNK_VOTE_POLICY=threshold_with_drop_plurality
++export GNN_CHUNK_GPU_MIN=8 GNN_CHUNK_CPU_MIN=2
++export EXPERIMENT_LABEL="${EXPERIMENT_LABEL:-canonical_trace_q650_b200_seed0_seed1}"
++export VLLM_PHASE_TRACE="${VLLM_PHASE_TRACE:-1}"
++# Optional GPU event timing is UNVALIDATED on H100 capture streams; off by default.
++export VLLM_PHASE_TRACE_DEVICE_TIMING="${VLLM_PHASE_TRACE_DEVICE_TIMING:-0}"
++exec bash /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM/scripts/run_shortq_gnn_dynamic_vpc_common.sh
+diff --git a/scripts/run_h100_mp_nognn_q650_current_cleanall.sbatch b/scripts/run_h100_mp_nognn_q650_current_cleanall.sbatch
+index a4829bf..2bc9ca7 100644
+--- a/scripts/run_h100_mp_nognn_q650_current_cleanall.sbatch
++++ b/scripts/run_h100_mp_nognn_q650_current_cleanall.sbatch
+@@ -53,6 +53,9 @@ reserve_unique_run_dir() {
+ RUN_DIR="$(reserve_unique_run_dir "${RUN_ROOT}/h100_nognn_q650_${GRID_LABEL}_${SLURM_JOB_ID}")"
+ LOG_DIR="${RUN_DIR}/logs"
+ RESULT_DIR="${RUN_DIR}/results"
++export VLLM_PHASE_TRACE="${VLLM_PHASE_TRACE:-0}"
++export VLLM_PHASE_TRACE_DEVICE_TIMING="${VLLM_PHASE_TRACE_DEVICE_TIMING:-0}"
++export VLLM_PHASE_TRACE_DIR="${RUN_DIR}/logs/phase_trace"
+ 
+ # Each grid cell starts from a fully clean user scratch tree.  These jobs are
+ # intentionally run serially, so it is safe and desirable to remove every
+@@ -94,6 +97,7 @@ RETRIEVAL_TOP_K="${RETRIEVAL_TOP_K:-5}"
+ REQUEST_ORDER="${REQUEST_ORDER:-legacy_prefix_hash}"
+ PREFIX_SORT_DEPTH="${PREFIX_SORT_DEPTH:-2}"
+ REQUEST_ORDER_SEED="${REQUEST_ORDER_SEED:-0}"
++PASSAGE_ORDER_POLICY="${KV_PASSAGE_ORDER_POLICY:-original}"
+ WARM_ORDER="${WARM_ORDER:-reverse}"
+ WARM_ORDER_SEED="${WARM_ORDER_SEED:-$REQUEST_ORDER_SEED}"
+ 
+@@ -720,6 +724,8 @@ cat > "${RUN_DIR}/run_config.json" <<EOF
+   "question_file": "${QUESTION_FILE}",
+   "request_order": "${REQUEST_ORDER}",
+   "request_order_seed": ${REQUEST_ORDER_SEED},
++  "passage_order_policy": "${PASSAGE_ORDER_POLICY}",
++  "phase_trace": ${VLLM_PHASE_TRACE},
+   "warm_order": "${WARM_ORDER}",
+   "warm_order_seed": ${WARM_ORDER_SEED},
+   "min_tokens": ${MIN_TOKENS},
+@@ -933,6 +939,7 @@ DRIVER_ARGS=(
+     --retrieval_top_k "$RETRIEVAL_TOP_K"
+     --llm_model "$MODEL"
+     --request_order "$REQUEST_ORDER"
++    --passage_order_policy "$PASSAGE_ORDER_POLICY"
+     --prefix_sort_depth "$PREFIX_SORT_DEPTH"
+     --request_order_seed "$REQUEST_ORDER_SEED"
+     --warm_order "$WARM_ORDER"
+@@ -975,6 +982,13 @@ then
+     exit 50
+ fi
+ 
++if [[ "$VLLM_PHASE_TRACE" == "1" ]]; then
++    python scripts/analyze_phase_trace.py \
++        --trace-dir "$VLLM_PHASE_TRACE_DIR" \
++        --output "${RUN_DIR}/phase_trace_summary.json" \
++        > "${RUN_DIR}/phase_trace_summary.txt" 2>&1 || true
++fi
++
+ if [[ "$KV_COLD_WARM_STORE_BARRIER" == "1" ]]; then
+     python - "${RESULT_DIR}/summary.json" "${RUN_DIR}/store_barrier.json" <<'PY'
+ import json, pathlib, sys
+diff --git a/scripts/run_shortq_gnn_dynamic_vpc_common.sh b/scripts/run_shortq_gnn_dynamic_vpc_common.sh
+index a95bd26..75ba16a 100644
+--- a/scripts/run_shortq_gnn_dynamic_vpc_common.sh
++++ b/scripts/run_shortq_gnn_dynamic_vpc_common.sh
+@@ -120,6 +120,11 @@ esac
+ # launch behavior.  WARM_ORDER already has its historical env override.
+ REQUEST_ORDER="${KV_REQUEST_ORDER:-$REQUEST_ORDER}"
+ REQUEST_ORDER_SEED="${KV_REQUEST_ORDER_SEED:-$REQUEST_ORDER_SEED}"
++PASSAGE_ORDER_POLICY="${KV_PASSAGE_ORDER_POLICY:-original}"
++case "$PASSAGE_ORDER_POLICY" in
++  original|canonical) ;;
++  *) echo "ERROR: KV_PASSAGE_ORDER_POLICY must be original or canonical" >&2; exit 2 ;;
++esac
+ WARM_ORDER_SEED="${WARM_ORDER_SEED:-$REQUEST_ORDER_SEED}"
+ 
+ EXPERIMENT_LABEL="${EXPERIMENT_LABEL:-}"
+@@ -155,6 +160,13 @@ RUN_DIR="$(reserve_unique_run_dir "${RUN_ROOT}/${RUN_LABEL}${RUN_LABEL_SUFFIX}_$
+ LOG_DIR="${RUN_DIR}/logs"
+ RESULT_DIR="${RUN_DIR}/results"
+ PLACEMENT_DIR="${RUN_DIR}/placement"
++# Both flags are opt-in; tracing does not change upstream Prometheus definitions.
++export VLLM_PHASE_TRACE="${VLLM_PHASE_TRACE:-0}"
++export VLLM_PHASE_TRACE_DEVICE_TIMING="${VLLM_PHASE_TRACE_DEVICE_TIMING:-0}"
++export VLLM_PHASE_TRACE_DIR="${RUN_DIR}/logs/phase_trace"
++for trace_switch in VLLM_PHASE_TRACE VLLM_PHASE_TRACE_DEVICE_TIMING; do
++  case "${!trace_switch}" in 0|1) ;; *) echo "bad $trace_switch" >&2; exit 2 ;; esac
++done
+ RUNTIME_METADATA="${PLACEMENT_DIR}/runtime_hash_to_placement.json"
+ VPC_IMPORTANCE_SIDECAR="${PLACEMENT_DIR}/vpc_importance_by_request.json"
+ PLACEMENT_TRACE="${PLACEMENT_DIR}/gnn_chunk_placements.jsonl"
+@@ -311,6 +323,9 @@ cat > "${RUN_DIR}/run_config.json" <<JSON
+   "vpc_sufficient_bypass": $KV_VPC_SUFFICIENT_BYPASS,
+   "mutual_prefix": $KV_MUTUAL_PREFIX,
+   "request_order": "$REQUEST_ORDER",
++  "passage_order_policy": "$PASSAGE_ORDER_POLICY",
++  "phase_trace": $VLLM_PHASE_TRACE,
++  "phase_trace_device_timing": $VLLM_PHASE_TRACE_DEVICE_TIMING,
+   "request_order_seed": $REQUEST_ORDER_SEED,
+   "warm_order": "$WARM_ORDER",
+   "warm_order_seed": $WARM_ORDER_SEED,
+@@ -344,6 +359,7 @@ echo "===== SHORT-Q PRECOMPUTE ($PROFILE) ====="
+ python experiments/precompute_shortq_placements.py \
+   --dataset_name "$DATASET_NAME" --max_questions "$NUM_QUESTIONS" --retrieval_top_k "$RETRIEVAL_TOP_K" \
+   --request_order "$REQUEST_ORDER" --prefix_sort_depth "$PREFIX_SORT_DEPTH" --request_order_seed "$REQUEST_ORDER_SEED" \
++  --passage_order_policy "$PASSAGE_ORDER_POLICY" \
+   --serving_model "$MODEL" --feature_model "$FEATURE_MODEL" --checkpoint "$CHECKPOINT" \
+   --chunk_size "$LMCACHE_CHUNK_SIZE" --max_seq_len 8000 --device cuda:0 \
+   --inference_batch_size "$GNN_INFERENCE_BATCH_SIZE" \
+@@ -441,7 +457,7 @@ DARGS=(
+   --dataset_name "$DATASET_NAME" --max_questions "$NUM_QUESTIONS"
+   --retrieval_top_k "$RETRIEVAL_TOP_K" --llm_model "$MODEL"
+   --request_order "$REQUEST_ORDER" --prefix_sort_depth "$PREFIX_SORT_DEPTH"
+-  --request_order_seed "$REQUEST_ORDER_SEED" --warm_order "$WARM_ORDER"
++  --request_order_seed "$REQUEST_ORDER_SEED" --passage_order_policy "$PASSAGE_ORDER_POLICY" --warm_order "$WARM_ORDER"
+   --warm_order_seed "$WARM_ORDER_SEED"
+   --submission_batch_size "$SUBMISSION_BATCH_SIZE"
+   --server_url http://127.0.0.1:8000 --request_timeout_s 7200
+@@ -468,6 +484,12 @@ CUDA_VISIBLE_DEVICES="" python experiments/mp_nognn_project.py "${DARGS[@]}" \
+   > "${LOG_DIR}/driver.log" 2>&1 || { tail -300 "${LOG_DIR}/driver.log"; exit 50; }
+ 
+ sleep 5
++if [[ "$VLLM_PHASE_TRACE" == "1" ]]; then
++  python scripts/analyze_phase_trace.py \
++    --trace-dir "$VLLM_PHASE_TRACE_DIR" \
++    --output "${RUN_DIR}/phase_trace_summary.json" \
++    > "${RUN_DIR}/phase_trace_summary.txt" 2>&1 || true
++fi
+ curl -sf http://127.0.0.1:8000/metrics > "${RUN_DIR}/metrics_after.txt" || true
+ curl -sf http://127.0.0.1:8080/metrics > "${RUN_DIR}/lmcache_metrics_after.txt" || true
+ 
+diff --git a/tests/test_canonical_phase_cpu.py b/tests/test_canonical_phase_cpu.py
+new file mode 100644
+index 0000000..d0cb655
+--- /dev/null
++++ b/tests/test_canonical_phase_cpu.py
+@@ -0,0 +1,103 @@
++"""No CUDA, no PyTorch, no tokenizer or vLLM import required."""
++import importlib.util
++import os
++from pathlib import Path
++import tempfile
++import unittest
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++def from_path(label, rel):
++    spec = importlib.util.spec_from_file_location(label, ROOT / rel)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++ordering = from_path('sc_ordering', 'experiments/passage_order_policies/__init__.py')
++analysis = from_path('sc_analysis', 'scripts/analyze_phase_trace.py')
++
++
++class TestPolicies(unittest.TestCase):
++    def setUp(self):
++        self.rows = [
++            {'question': 'q1', 'sorted_passage': ['B', 'A', 'C'],
++             'sorted_passage_scores': [.99, .88, .77]},
++            {'question': 'q2', 'sorted_passage': ['C', 'A', 'B'],
++             'sorted_passage_scores': [.5, .4, .3]},
++        ]
++
++    def test_original_is_identity(self):
++        self.assertIs(ordering.apply_passage_order(self.rows, 'original'), self.rows)
++
++    def test_canonical_is_stable_and_keeps_scores_attached(self):
++        a = ordering.apply_passage_order(self.rows, 'canonical')
++        b = ordering.apply_passage_order(self.rows, 'canonical')
++        self.assertEqual(a, b)
++        self.assertEqual(a[0]['sorted_passage'], a[1]['sorted_passage'])
++        for original, result in zip(self.rows,a):
++            for new_pos, rank in enumerate(result['retrieval_rank_after_order']):
++                self.assertEqual(result['sorted_passage'][new_pos], original['sorted_passage'][rank])
++                self.assertEqual(result['sorted_passage_scores'][new_pos], original['sorted_passage_scores'][rank])
++        self.assertEqual(self.rows[0]['sorted_passage'], ['B','A','C'])
++
++    def test_duplicates_and_bad_shape(self):
++        a = ordering.apply_passage_order([{'sorted_passage':['X','X'],
++             'sorted_passage_scores':[.9,.2]}], 'canonical')[0]
++        self.assertEqual(a['retrieval_rank_after_order'],[0,1])
++        with self.assertRaises(ValueError):
++            ordering.apply_passage_order([{'sorted_passage':['A'],
++                'sorted_passage_scores':[]}], 'canonical')
++
++    def test_scheduler_snapshot_before_position_advance(self):
++        from types import SimpleNamespace
++        with tempfile.TemporaryDirectory() as d:
++            old=os.environ.get('VLLM_PHASE_TRACE')
++            old_dir=os.environ.get('VLLM_PHASE_TRACE_DIR')
++            try:
++                os.environ['VLLM_PHASE_TRACE']='1'
++                os.environ['VLLM_PHASE_TRACE_DIR']=d
++                trace=from_path('sc_trace_test','vllm/v1/metrics/phase_trace.py')
++                req_a=SimpleNamespace(num_prompt_tokens=512,
++                   num_computed_tokens=256,num_preemptions=0,
++                   status=SimpleNamespace(name='RUNNING'))
++                req_b=SimpleNamespace(num_prompt_tokens=512,
++                   num_computed_tokens=512,num_preemptions=0,
++                   status=SimpleNamespace(name='RUNNING'))
++                scheduler=SimpleNamespace(requests={'a':req_a,'b':req_b},
++                    running=[req_a,req_b])
++                output=SimpleNamespace(num_scheduled_tokens={'a':256,'b':1},
++                    total_num_scheduled_tokens=257)
++                trace.capture_schedule(scheduler,output)
++                self.assertEqual(output._sc_phase_totals,(256,1))
++                req_a.num_computed_tokens += 256
++                self.assertEqual(output._sc_phase_rows[0]['before'],256)
++                trace.close()
++            finally:
++                if old is None: os.environ.pop('VLLM_PHASE_TRACE',None)
++                else: os.environ['VLLM_PHASE_TRACE']=old
++                if old_dir is None: os.environ.pop('VLLM_PHASE_TRACE_DIR',None)
++                else: os.environ['VLLM_PHASE_TRACE_DIR']=old_dir
++
++    def test_trace_summary_synthetic(self):
++        with tempfile.TemporaryDirectory() as d:
++            d=Path(d)
++            record={'kind':'engine_step','ts_ns':100_000_000,
++                'schedule_start_ns':0,'schedule_end_ns':1000,
++                'submit_end_ns':2000,'result_end_ns':12_000_000,
++                'update_end_ns':13_000_000,'prompt_compute_tokens':512,
++                'decode_position_tokens':1,'waiting_remote_requests':1,
++                'requests':[{'request_id':'kvaware-cold-000000',
++                             'prompt_compute':512,'decode_position':0,'scheduled':512},
++                            {'request_id':'kvaware-warm-000000',
++                             'prompt_compute':0,'decode_position':1,'scheduled':1}]}
++            import json
++            (d/'phase_engine.pid1.jsonl').write_text(json.dumps(record)+'\n')
++            result=analysis.run(d)
++            self.assertEqual(result['steps']['mixed_steps'],1)
++            self.assertEqual(result['by_phase']['cold']['prompt_compute']['sum'],512)
++            self.assertEqual(result['by_phase']['warm']['decode_position']['sum'],1)
++
++
++if __name__=='__main__': unittest.main()
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index c2a094c..cc5d286 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -4,6 +4,7 @@
+ # see repo-root docs/SC_MODIFICATIONS.md for rationale and provenance.
+ 
+ import itertools
++from vllm.v1.metrics import phase_trace as sc_phase_trace
+ # [SC] Debug gate for validated KV-load rewind recovery.
+ import os
+ import time
+@@ -1220,6 +1221,8 @@ class Scheduler(SchedulerInterface):
+                 if load_kv_async:
+                     # If loading async, allocate memory and put request
+                     # into the WAITING_FOR_REMOTE_KV state.
++                    if sc_phase_trace.enabled():
++                        sc_phase_trace.emit("kv_wait_enter", request_id=request.request_id)
+                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                     step_skipped_waiting.prepend_request(request)
+                     # Set num_computed_tokens even though KVs are not yet loaded.
+@@ -1502,6 +1505,8 @@ class Scheduler(SchedulerInterface):
+         if self.defer_block_free and total_num_scheduled_tokens > 0:
+             self.sched_step_seq += 1
+ 
++        if sc_phase_trace.enabled():
++            sc_phase_trace.capture_schedule(self, scheduler_output)
+         with record_function_or_nullcontext("schedule: update_after_schedule"):
+             self._update_after_schedule(scheduler_output)
+         return scheduler_output
+@@ -2609,6 +2614,10 @@ class Scheduler(SchedulerInterface):
+                 self.finished_recving_kv_req_ids.discard(request.request_id)
+                 self.failed_recving_kv_req_ids.discard(request.request_id)
+ 
++            if (sc_phase_trace.enabled()
++                and request.status == RequestStatus.WAITING_FOR_REMOTE_KVS):
++                sc_phase_trace.emit("kv_wait_exit", request_id=request.request_id,
++                                    aborted=True)
+             request.status = finished_status
+             self._free_request(request, delay_free_blocks=delay_free_blocks)
+ 
+@@ -3006,6 +3015,8 @@ class Scheduler(SchedulerInterface):
+             if request.request_id not in self.finished_recving_kv_req_ids:
+                 return False
+             self._update_waiting_for_remote_kv(request)
++            if sc_phase_trace.enabled():
++                sc_phase_trace.emit("kv_wait_exit", request_id=request.request_id)
+             if request.num_preemptions:
+                 request.status = RequestStatus.PREEMPTED
+             else:
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index c734e67..460e588 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -87,6 +87,7 @@ from vllm.v1.fault_tolerance.engine_core_sentinel import (
+ )
+ from vllm.v1.kv_cache_interface import KVCacheConfig, get_kv_cache_spec_kind
+ from vllm.v1.metrics.stats import SchedulerIterationDetails, SchedulerStats
++from vllm.v1.metrics import phase_trace as sc_phase_trace
+ from vllm.v1.outputs import ModelRunnerOutput
+ from vllm.v1.request import Request, RequestStatus
+ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
+@@ -605,8 +606,11 @@ class EngineCore:
+         # or finished and not yet removed from the batch.
+         if not self.scheduler.has_requests():
+             return {}, False
++        sc_t0 = sc_phase_trace.now_ns() if sc_phase_trace.enabled() else 0
+         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
++        sc_t1 = sc_phase_trace.now_ns() if sc_phase_trace.enabled() else 0
+         future = self.model_executor.execute_model(scheduler_output, non_block=True)
++        sc_t2 = sc_phase_trace.now_ns() if sc_phase_trace.enabled() else 0
+         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+         with (
+             self.capture_iteration_details(scheduler_output) as iteration_details,
+@@ -616,12 +620,17 @@ class EngineCore:
+             if model_output is None:
+                 model_output = self.model_executor.sample_tokens(grammar_output)
+ 
++        sc_t3 = sc_phase_trace.now_ns() if sc_phase_trace.enabled() else 0
+         # Before processing the model output, process any aborts that happened
+         # during the model execution.
+         self._process_aborts_queue()
+         engine_core_outputs = self.scheduler.update_from_output(
+             scheduler_output, model_output
+         )
++        if sc_phase_trace.enabled():
++            sc_phase_trace.record_engine_step(
++                scheduler_output, sc_t0, sc_t1, sc_t2, sc_t3,
++                sc_phase_trace.now_ns())
+         self._attach_iteration_details(engine_core_outputs, iteration_details)
+ 
+         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
+@@ -654,6 +663,11 @@ class EngineCore:
+ 
+         batch_queue = self.batch_queue
+         assert batch_queue is not None
++        # Store per-output dispatch timestamps across asynchronous queueing.
++        sc_timing = getattr(self, "_sc_phase_async_timing", None)
++        if sc_phase_trace.enabled() and sc_timing is None:
++            sc_timing = self._sc_phase_async_timing = {}
++
+ 
+         # Try to schedule a new batch if the batch queue is not full, but
+         # the scheduler may return an empty batch if all requests are scheduled.
+@@ -663,11 +677,16 @@ class EngineCore:
+         model_executed = False
+         deferred_scheduler_output = None
+         if self.scheduler.has_requests():
++            sc_t0 = sc_phase_trace.now_ns() if sc_phase_trace.enabled() else 0
+             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
++            sc_t1 = sc_phase_trace.now_ns() if sc_phase_trace.enabled() else 0
+             with self.log_error_detail(scheduler_output):
+                 exec_future = self.model_executor.execute_model(
+                     scheduler_output, non_block=True
+                 )
++            if sc_timing is not None:
++                sc_timing[id(scheduler_output)] = (
++                    sc_t0, sc_t1, sc_phase_trace.now_ns())
+             if self.is_ec_consumer:
+                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
+ 
+@@ -718,12 +737,18 @@ class EngineCore:
+                 exec_model_fut.result()
+                 raise RuntimeError("unexpected error")
+ 
++        sc_t3 = sc_phase_trace.now_ns() if sc_phase_trace.enabled() else 0
+         # Before processing the model output, process any aborts that happened
+         # during the model execution.
+         self._process_aborts_queue()
+         engine_core_outputs = self.scheduler.update_from_output(
+             scheduler_output, model_output
+         )
++        if sc_timing is not None:
++            sc_times = sc_timing.pop(id(scheduler_output), None)
++            if sc_times is not None:
++                sc_phase_trace.record_engine_step(
++                    scheduler_output, *sc_times, sc_t3, sc_phase_trace.now_ns())
+         self._attach_iteration_details(engine_core_outputs, iteration_details)
+ 
+         # NOTE(nick): We can either handle the deferred tasks here or save
+diff --git a/vllm/v1/metrics/phase_device_trace.py b/vllm/v1/metrics/phase_device_trace.py
+new file mode 100644
+index 0000000..f338eef
+--- /dev/null
++++ b/vllm/v1/metrics/phase_device_trace.py
+@@ -0,0 +1,64 @@
++"""Optional deferred PyTorch CUDA-event timing for model-forward regions.
++
++Off by default. Timing is per worker/TP rank and per *mixed batch*, never
++exclusive per-request kernel time. No synchronization is introduced; unready
++records are buffered and may be lost if the process exits without draining.
++Use on a small GPU validation run before paper-level timing claims.
++"""
++from __future__ import annotations
++
++import json
++import os
++from collections import deque
++from pathlib import Path
++
++_ENABLED = os.getenv("VLLM_PHASE_TRACE_DEVICE_TIMING", "0") == "1"
++_pending = deque()
++_file = None
++
++
++def begin():
++    if not _ENABLED:
++        return None
++    import torch
++    if not torch.cuda.is_available() or torch.cuda.is_current_stream_capturing():
++        return None
++    # Avoid retaining a backlog of CUDA events when instrumentation is enabled.
++    drain()
++    if len(_pending) >= 4096:
++        return None
++    start = torch.cuda.Event(enable_timing=True)
++    finish = torch.cuda.Event(enable_timing=True)
++    start.record()
++    return start, finish
++
++
++def end(state, scheduler_output):
++    if state is None:
++        return
++    start, finish = state
++    finish.record()
++    _pending.append((start, finish, scheduler_output.total_num_scheduled_tokens,
++                     len(scheduler_output.num_scheduled_tokens)))
++    if len(_pending) % 32 == 0:
++        drain()
++
++
++def drain():
++    global _file
++    if not _ENABLED:
++        return
++    while _pending and _pending[0][1].query():
++        start, finish, tokens, requests = _pending.popleft()
++        try:
++            if _file is None:
++                directory = Path(os.getenv("VLLM_PHASE_TRACE_DIR", "/tmp/vllm-phase-trace"))
++                directory.mkdir(parents=True, exist_ok=True)
++                _file = (directory / f"phase_device.pid{os.getpid()}.jsonl").open(
++                    "a", encoding="utf-8", buffering=256 * 1024)
++            _file.write(json.dumps({"kind": "device_forward", "duration_ms":
++                                    start.elapsed_time(finish),
++                                    "scheduled_tokens": tokens,
++                                    "num_requests": requests}) + "\n")
++        except OSError:
++            pass
+diff --git a/vllm/v1/metrics/phase_trace.py b/vllm/v1/metrics/phase_trace.py
+new file mode 100644
+index 0000000..41585cb
+--- /dev/null
++++ b/vllm/v1/metrics/phase_trace.py
+@@ -0,0 +1,111 @@
++"""Opt-in, JSONL, CPU-side scheduler/engine phase observability.
++
++One buffered file per engine process; timestamps are monotonic nanoseconds.
++Worker-side device event measurements, when enabled, use a separate file.
++Do NOT interpret engine model-executor durations as GPU kernel durations.
++"""
++from __future__ import annotations
++
++import atexit
++import json
++import os
++from pathlib import Path
++import threading
++import time
++from typing import Any
++
++_ENABLED = os.getenv("VLLM_PHASE_TRACE", "0") == "1"
++_lock = threading.Lock()
++_file = None
++_counter = 0
++
++
++def enabled() -> bool:
++    return _ENABLED
++
++
++def now_ns() -> int:
++    return time.monotonic_ns()
++
++
++def emit(kind: str, **values: Any) -> None:
++    global _file, _counter
++    if not _ENABLED:
++        return
++    try:
++        with _lock:
++            if _file is None:
++                target = Path(os.environ.get("VLLM_PHASE_TRACE_DIR", "/tmp/vllm-phase-trace"))
++                target.mkdir(parents=True, exist_ok=True)
++                _file = (target / f"phase_engine.pid{os.getpid()}.jsonl").open(
++                    "a", encoding="utf-8", buffering=1
++                )
++            _file.write(json.dumps({"kind": kind, "ts_ns": now_ns(), **values},
++                                   separators=(",", ":")) + "\n")
++            _counter += 1
++    except OSError:
++        # Observability must never affect scheduling correctness.
++        pass
++
++
++def close() -> None:
++    if _file is not None:
++        with _lock:
++            _file.flush()
++
++
++atexit.register(close)
++
++
++def capture_schedule(scheduler: Any, output: Any) -> None:
++    """Snapshot request positions BEFORE _update_after_schedule advances them.
++
++    Attached attributes are used only in the engine process; they are not
++    dataclass fields and must not become part of worker-serialized payloads.
++    """
++    if not _ENABLED:
++        return
++    rows = []
++    prompt_sum = decode_sum = 0
++    for rid, scheduled in output.num_scheduled_tokens.items():
++        request = scheduler.requests[rid]
++        prompt_total = int(request.num_prompt_tokens)
++        position = int(request.num_computed_tokens)
++        scheduled = int(scheduled)
++        prompt_n = min(scheduled, max(0, prompt_total - position))
++        decode_n = scheduled - prompt_n
++        prompt_sum += prompt_n
++        decode_sum += decode_n
++        rows.append({
++            "request_id": rid, "before": position,
++            "prompt_len": prompt_total, "scheduled": scheduled,
++            "prompt_compute": prompt_n, "decode_position": decode_n,
++            "preemptions": int(request.num_preemptions),
++        })
++    output._sc_phase_rows = rows
++    output._sc_phase_totals = (prompt_sum, decode_sum)
++    # NOTE: Waiting state sampled at each schedule call, not timed wait events.
++    waiting_remote = sum(
++        1 for r in scheduler.requests.values()
++        if getattr(r.status, "name", "") == "WAITING_FOR_REMOTE_KVS"
++    )
++    output._sc_phase_waiting_remote = waiting_remote
++    output._sc_phase_running_count = len(scheduler.running)
++
++
++def record_engine_step(output: Any, schedule_start_ns: int,
++                       schedule_end_ns: int, submit_end_ns: int,
++                       result_end_ns: int, update_end_ns: int) -> None:
++    if not _ENABLED:
++        return
++    prompt_n, decode_n = getattr(output, "_sc_phase_totals", (0, 0))
++    emit(
++        "engine_step", schedule_start_ns=schedule_start_ns,
++        schedule_end_ns=schedule_end_ns, submit_end_ns=submit_end_ns,
++        result_end_ns=result_end_ns, update_end_ns=update_end_ns,
++        prompt_compute_tokens=prompt_n, decode_position_tokens=decode_n,
++        scheduled_total=output.total_num_scheduled_tokens,
++        running_requests=getattr(output, "_sc_phase_running_count", None),
++        waiting_remote_requests=getattr(output, "_sc_phase_waiting_remote", None),
++        requests=getattr(output, "_sc_phase_rows", []),
++    )
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index e6ba7bc..6e106d8 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
+ 
+ import numpy as np
+ import torch
++from vllm.v1.metrics import phase_device_trace as sc_device_trace
+ import torch.distributed
+ import torch.nn as nn
+ from tqdm import tqdm
+@@ -4522,6 +4523,8 @@ class GPUModelRunner(
+                 defer_finalize=defer_kv_connector_finalize,
+             ) as kv_connector_output,
+         ):
++            # Optional deferred CUDA events; do not synchronize the stream.
++            sc_forward_events = sc_device_trace.begin()
+             model_output = self._model_forward(
+                 input_ids=input_ids,
+                 positions=positions,
+@@ -4529,6 +4532,7 @@ class GPUModelRunner(
+                 inputs_embeds=inputs_embeds,
+                 **model_kwargs,
+             )
++            sc_device_trace.end(sc_forward_events, scheduler_output)
+ 
+         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
+             if self.use_aux_hidden_state_outputs:

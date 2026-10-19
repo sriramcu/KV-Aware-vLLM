@@ -53,6 +53,9 @@ reserve_unique_run_dir() {
 RUN_DIR="$(reserve_unique_run_dir "${RUN_ROOT}/h100_nognn_q650_${GRID_LABEL}_${SLURM_JOB_ID}")"
 LOG_DIR="${RUN_DIR}/logs"
 RESULT_DIR="${RUN_DIR}/results"
+export VLLM_PHASE_TRACE="${VLLM_PHASE_TRACE:-0}"
+export VLLM_PHASE_TRACE_DEVICE_TIMING="${VLLM_PHASE_TRACE_DEVICE_TIMING:-0}"
+export VLLM_PHASE_TRACE_DIR="${RUN_DIR}/logs/phase_trace"
 
 # Each grid cell starts from a fully clean user scratch tree.  These jobs are
 # intentionally run serially, so it is safe and desirable to remove every
@@ -94,6 +97,7 @@ RETRIEVAL_TOP_K="${RETRIEVAL_TOP_K:-5}"
 REQUEST_ORDER="${REQUEST_ORDER:-legacy_prefix_hash}"
 PREFIX_SORT_DEPTH="${PREFIX_SORT_DEPTH:-2}"
 REQUEST_ORDER_SEED="${REQUEST_ORDER_SEED:-0}"
+PASSAGE_ORDER_POLICY="${KV_PASSAGE_ORDER_POLICY:-original}"
 WARM_ORDER="${WARM_ORDER:-reverse}"
 WARM_ORDER_SEED="${WARM_ORDER_SEED:-$REQUEST_ORDER_SEED}"
 
@@ -720,6 +724,8 @@ cat > "${RUN_DIR}/run_config.json" <<EOF
   "question_file": "${QUESTION_FILE}",
   "request_order": "${REQUEST_ORDER}",
   "request_order_seed": ${REQUEST_ORDER_SEED},
+  "passage_order_policy": "${PASSAGE_ORDER_POLICY}",
+  "phase_trace": ${VLLM_PHASE_TRACE},
   "warm_order": "${WARM_ORDER}",
   "warm_order_seed": ${WARM_ORDER_SEED},
   "min_tokens": ${MIN_TOKENS},
@@ -933,6 +939,7 @@ DRIVER_ARGS=(
     --retrieval_top_k "$RETRIEVAL_TOP_K"
     --llm_model "$MODEL"
     --request_order "$REQUEST_ORDER"
+    --passage_order_policy "$PASSAGE_ORDER_POLICY"
     --prefix_sort_depth "$PREFIX_SORT_DEPTH"
     --request_order_seed "$REQUEST_ORDER_SEED"
     --warm_order "$WARM_ORDER"
@@ -973,6 +980,13 @@ then
     echo "Project workload failed"
     tail -n 300 "${LOG_DIR}/driver.log" || true
     exit 50
+fi
+
+if [[ "$VLLM_PHASE_TRACE" == "1" ]]; then
+    python scripts/analyze_phase_trace.py \
+        --trace-dir "$VLLM_PHASE_TRACE_DIR" \
+        --output "${RUN_DIR}/phase_trace_summary.json" \
+        > "${RUN_DIR}/phase_trace_summary.txt" 2>&1 || true
 fi
 
 if [[ "$KV_COLD_WARM_STORE_BARRIER" == "1" ]]; then

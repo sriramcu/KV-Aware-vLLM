@@ -27,6 +27,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "third_party" / "LMCache"))
 
+from experiments.passage_order_policies import POLICIES, apply_passage_order  # noqa: E402
 from experiments.mp_nognn_project import (  # noqa: E402
     build_vllm_prompts_from_retrieval_results,
     dense_retrieve_from_import,
@@ -75,6 +76,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--questions_json", default="")
     p.add_argument("--max_questions", type=int, default=650)
     p.add_argument("--retrieval_top_k", type=int, default=5)
+    p.add_argument("--passage_order_policy", choices=POLICIES, default="original")
     p.add_argument("--request_order", default="legacy_prefix_hash")
     p.add_argument("--prefix_sort_depth", type=int, default=2)
     p.add_argument("--request_order_seed", type=int, default=0)
@@ -365,6 +367,7 @@ def main() -> None:
         embedding_model=embedding_model,
         retrieval_top_k=args.retrieval_top_k,
     )
+    retrieval = apply_passage_order(retrieval, args.passage_order_policy)
     prompts, records = build_vllm_prompts_from_retrieval_results(retrieval, serving_tok)
     prompts, records = reorder_requests(
         prompts,

@@ -120,6 +120,11 @@ esac
 # launch behavior.  WARM_ORDER already has its historical env override.
 REQUEST_ORDER="${KV_REQUEST_ORDER:-$REQUEST_ORDER}"
 REQUEST_ORDER_SEED="${KV_REQUEST_ORDER_SEED:-$REQUEST_ORDER_SEED}"
+PASSAGE_ORDER_POLICY="${KV_PASSAGE_ORDER_POLICY:-original}"
+case "$PASSAGE_ORDER_POLICY" in
+  original|canonical) ;;
+  *) echo "ERROR: KV_PASSAGE_ORDER_POLICY must be original or canonical" >&2; exit 2 ;;
+esac
 WARM_ORDER_SEED="${WARM_ORDER_SEED:-$REQUEST_ORDER_SEED}"
 
 EXPERIMENT_LABEL="${EXPERIMENT_LABEL:-}"
@@ -155,6 +160,13 @@ RUN_DIR="$(reserve_unique_run_dir "${RUN_ROOT}/${RUN_LABEL}${RUN_LABEL_SUFFIX}_$
 LOG_DIR="${RUN_DIR}/logs"
 RESULT_DIR="${RUN_DIR}/results"
 PLACEMENT_DIR="${RUN_DIR}/placement"
+# Both flags are opt-in; tracing does not change upstream Prometheus definitions.
+export VLLM_PHASE_TRACE="${VLLM_PHASE_TRACE:-0}"
+export VLLM_PHASE_TRACE_DEVICE_TIMING="${VLLM_PHASE_TRACE_DEVICE_TIMING:-0}"
+export VLLM_PHASE_TRACE_DIR="${RUN_DIR}/logs/phase_trace"
+for trace_switch in VLLM_PHASE_TRACE VLLM_PHASE_TRACE_DEVICE_TIMING; do
+  case "${!trace_switch}" in 0|1) ;; *) echo "bad $trace_switch" >&2; exit 2 ;; esac
+done
 RUNTIME_METADATA="${PLACEMENT_DIR}/runtime_hash_to_placement.json"
 VPC_IMPORTANCE_SIDECAR="${PLACEMENT_DIR}/vpc_importance_by_request.json"
 PLACEMENT_TRACE="${PLACEMENT_DIR}/gnn_chunk_placements.jsonl"
@@ -311,6 +323,9 @@ cat > "${RUN_DIR}/run_config.json" <<JSON
   "vpc_sufficient_bypass": $KV_VPC_SUFFICIENT_BYPASS,
   "mutual_prefix": $KV_MUTUAL_PREFIX,
   "request_order": "$REQUEST_ORDER",
+  "passage_order_policy": "$PASSAGE_ORDER_POLICY",
+  "phase_trace": $VLLM_PHASE_TRACE,
+  "phase_trace_device_timing": $VLLM_PHASE_TRACE_DEVICE_TIMING,
   "request_order_seed": $REQUEST_ORDER_SEED,
   "warm_order": "$WARM_ORDER",
   "warm_order_seed": $WARM_ORDER_SEED,
@@ -344,6 +359,7 @@ echo "===== SHORT-Q PRECOMPUTE ($PROFILE) ====="
 python experiments/precompute_shortq_placements.py \
   --dataset_name "$DATASET_NAME" --max_questions "$NUM_QUESTIONS" --retrieval_top_k "$RETRIEVAL_TOP_K" \
   --request_order "$REQUEST_ORDER" --prefix_sort_depth "$PREFIX_SORT_DEPTH" --request_order_seed "$REQUEST_ORDER_SEED" \
+  --passage_order_policy "$PASSAGE_ORDER_POLICY" \
   --serving_model "$MODEL" --feature_model "$FEATURE_MODEL" --checkpoint "$CHECKPOINT" \
   --chunk_size "$LMCACHE_CHUNK_SIZE" --max_seq_len 8000 --device cuda:0 \
   --inference_batch_size "$GNN_INFERENCE_BATCH_SIZE" \
@@ -441,7 +457,7 @@ DARGS=(
   --dataset_name "$DATASET_NAME" --max_questions "$NUM_QUESTIONS"
   --retrieval_top_k "$RETRIEVAL_TOP_K" --llm_model "$MODEL"
   --request_order "$REQUEST_ORDER" --prefix_sort_depth "$PREFIX_SORT_DEPTH"
-  --request_order_seed "$REQUEST_ORDER_SEED" --warm_order "$WARM_ORDER"
+  --request_order_seed "$REQUEST_ORDER_SEED" --passage_order_policy "$PASSAGE_ORDER_POLICY" --warm_order "$WARM_ORDER"
   --warm_order_seed "$WARM_ORDER_SEED"
   --submission_batch_size "$SUBMISSION_BATCH_SIZE"
   --server_url http://127.0.0.1:8000 --request_timeout_s 7200
@@ -468,6 +484,12 @@ CUDA_VISIBLE_DEVICES="" python experiments/mp_nognn_project.py "${DARGS[@]}" \
   > "${LOG_DIR}/driver.log" 2>&1 || { tail -300 "${LOG_DIR}/driver.log"; exit 50; }
 
 sleep 5
+if [[ "$VLLM_PHASE_TRACE" == "1" ]]; then
+  python scripts/analyze_phase_trace.py \
+    --trace-dir "$VLLM_PHASE_TRACE_DIR" \
+    --output "${RUN_DIR}/phase_trace_summary.json" \
+    > "${RUN_DIR}/phase_trace_summary.txt" 2>&1 || true
+fi
 curl -sf http://127.0.0.1:8000/metrics > "${RUN_DIR}/metrics_after.txt" || true
 curl -sf http://127.0.0.1:8080/metrics > "${RUN_DIR}/lmcache_metrics_after.txt" || true
 

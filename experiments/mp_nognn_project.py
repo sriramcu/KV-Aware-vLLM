@@ -47,6 +47,11 @@ import pandas as pd
 import requests
 from transformers import AutoTokenizer
 
+# Running `python experiments/mp_nognn_project.py` must also find the
+# repository-root experiments package (not just sys.path[0]=experiments/).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from experiments.passage_order_policies import POLICIES, apply_passage_order
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HKV_ROOT = REPO_ROOT / "Hierarchical_KV"
@@ -333,6 +338,9 @@ def build_vllm_prompts_from_retrieval_results(
                 "sorted_passage": sorted_passage,
                 "sorted_passage_scores": retrieval_result.get(
                     "sorted_passage_scores", []
+                ),
+                "retrieval_rank_after_order": retrieval_result.get(
+                    "retrieval_rank_after_order", list(range(len(sorted_passage)))
                 ),
                 "gold_answer": retrieval_result.get("gold_answer", ""),
                 "retrieval_mode": retrieval_result.get("retrieval_mode"),
@@ -992,6 +1000,7 @@ def parse_arguments():
 
     parser.add_argument("--dataset_name", default="hotpotqa")
     parser.add_argument("--retrieval_top_k", type=int, default=5)
+    parser.add_argument("--passage_order_policy", choices=POLICIES, default="original")
 
     parser.add_argument("--question")
     parser.add_argument("--questions_json")
@@ -1140,6 +1149,7 @@ def main():
                 "max_questions": args.max_questions,
                 "llm_model": args.llm_model,
                 "retrieval_top_k": args.retrieval_top_k,
+                "passage_order_policy": args.passage_order_policy,
                 "request_order": args.request_order,
                 "prefix_sort_depth": args.prefix_sort_depth,
                 "request_order_seed": args.request_order_seed,
@@ -1182,6 +1192,8 @@ def main():
         retrieval_top_k=args.retrieval_top_k,
     )
     retrieval_elapsed = time.monotonic() - retrieval_start
+
+    retrieval_results = apply_passage_order(retrieval_results, args.passage_order_policy)
 
     llm_inputs, prompt_records = (
         build_vllm_prompts_from_retrieval_results(
@@ -1239,6 +1251,7 @@ def main():
         "dataset_name": args.dataset_name,
         "num_requests": num_requests,
         "retrieval_top_k": args.retrieval_top_k,
+        "passage_order_policy": args.passage_order_policy,
         "retrieval_elapsed_seconds": retrieval_elapsed,
         "llm_model": args.llm_model,
         "request_order": args.request_order,

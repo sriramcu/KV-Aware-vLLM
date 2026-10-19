@@ -4,6 +4,7 @@
 # see repo-root docs/SC_MODIFICATIONS.md for rationale and provenance.
 
 import itertools
+from vllm.v1.metrics import phase_trace as sc_phase_trace
 # [SC] Debug gate for validated KV-load rewind recovery.
 import os
 import time
@@ -1220,6 +1221,8 @@ class Scheduler(SchedulerInterface):
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
+                    if sc_phase_trace.enabled():
+                        sc_phase_trace.emit("kv_wait_enter", request_id=request.request_id)
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
                     step_skipped_waiting.prepend_request(request)
                     # Set num_computed_tokens even though KVs are not yet loaded.
@@ -1502,6 +1505,8 @@ class Scheduler(SchedulerInterface):
         if self.defer_block_free and total_num_scheduled_tokens > 0:
             self.sched_step_seq += 1
 
+        if sc_phase_trace.enabled():
+            sc_phase_trace.capture_schedule(self, scheduler_output)
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
@@ -2609,6 +2614,10 @@ class Scheduler(SchedulerInterface):
                 self.finished_recving_kv_req_ids.discard(request.request_id)
                 self.failed_recving_kv_req_ids.discard(request.request_id)
 
+            if (sc_phase_trace.enabled()
+                and request.status == RequestStatus.WAITING_FOR_REMOTE_KVS):
+                sc_phase_trace.emit("kv_wait_exit", request_id=request.request_id,
+                                    aborted=True)
             request.status = finished_status
             self._free_request(request, delay_free_blocks=delay_free_blocks)
 
@@ -3006,6 +3015,8 @@ class Scheduler(SchedulerInterface):
             if request.request_id not in self.finished_recving_kv_req_ids:
                 return False
             self._update_waiting_for_remote_kv(request)
+            if sc_phase_trace.enabled():
+                sc_phase_trace.emit("kv_wait_exit", request_id=request.request_id)
             if request.num_preemptions:
                 request.status = RequestStatus.PREEMPTED
             else:

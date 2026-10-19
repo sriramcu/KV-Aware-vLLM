@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
 
 import numpy as np
 import torch
+from vllm.v1.metrics import phase_device_trace as sc_device_trace
 import torch.distributed
 import torch.nn as nn
 from tqdm import tqdm
@@ -4522,6 +4523,8 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            # Optional deferred CUDA events; do not synchronize the stream.
+            sc_forward_events = sc_device_trace.begin()
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -4529,6 +4532,7 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            sc_device_trace.end(sc_forward_events, scheduler_output)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
