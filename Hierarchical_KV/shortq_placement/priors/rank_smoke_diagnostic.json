@@ -1,0 +1,38 @@
+{
+  "comment": "SMOKE TEST ONLY. Quantile-like score bin edges were selected from the previous Q12 run; NOT an independent prior, not suitable for Q650/paper benchmarks. Timing priors remain hypothetical.",
+  "score_format": "mean_32_block_rank_scores",
+  "score_bin_edges": [
+    -0.53,
+    -0.43,
+    -0.41,
+    -0.38,
+    -0.36,
+    -0.335,
+    -0.323,
+    -0.307,
+    -0.288,
+    -0.263,
+    -0.252,
+    -0.225,
+    -0.19
+  ],
+  "score_bin_probabilities": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+  ],
+  "cost_prior_ms": {
+    "cpu": 20,
+    "disk": 500,
+    "recompute": 100
+  }
+}

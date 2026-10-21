@@ -1,0 +1,7 @@
+{
+  "comment": "ILLUSTRATIVE UNCALIBRATED PRIOR for current raw mean block-rank outputs. NOT measured on H100. Replace score histogram and time priors before headline experiments.",
+  "score_format": "mean_32_block_rank_scores",
+  "score_bin_edges": [-20, -10, -5, -3, -2, -1, 0, 1, 2, 3, 5, 10, 20],
+  "score_bin_probabilities": [0.01, 0.03, 0.06, 0.10, 0.14, 0.16, 0.16, 0.14, 0.10, 0.06, 0.03, 0.01],
+  "cost_prior_ms": {"cpu": 20, "disk": 500, "recompute": 100}
+}

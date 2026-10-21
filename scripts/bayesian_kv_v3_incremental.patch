@@ -1,0 +1,1012 @@
+diff --git a/Hierarchical_KV/shortq_placement/bayesian_mapper.py b/Hierarchical_KV/shortq_placement/bayesian_mapper.py
+index 782fe33..6b6f53a 100644
+--- a/Hierarchical_KV/shortq_placement/bayesian_mapper.py
++++ b/Hierarchical_KV/shortq_placement/bayesian_mapper.py
+@@ -51,10 +51,22 @@ def read_score_rows(path: str | Path) -> dict[int, list[tuple[str, float]]]:
+ class WaveBayesianMapper:
+     def __init__(self, prior_file: str | Path, weight: float, gpu_gb: float,
+                  cpu_gb: float, disk_gb: float, score_file: str | Path,
+-                 metadata_file: str | Path, vpc_file: str | Path):
++                 metadata_file: str | Path, vpc_file: str | Path,
++                 *, posterior_mode: str = "fixed", score_prior_count: float = 10.0,
++                 cost_prior_count: float = 5.0, readmission: bool = False,
++                 random_score_seed: int | None = None):
+         if not math.isfinite(weight) or weight < 0:
+             raise ValueError("prior weight must be finite and >= 0")
+         self.weight = float(weight)
++        if posterior_mode not in {"fixed", "pseudo_count"}:
++            raise ValueError("posterior_mode must be fixed or pseudo_count")
++        if any(not math.isfinite(x) or x <= 0 for x in (score_prior_count, cost_prior_count)):
++            raise ValueError("pseudo-count strengths must be finite and > 0")
++        self.posterior_mode = posterior_mode
++        self.score_prior_count = float(score_prior_count)
++        self.cost_prior_count = float(cost_prior_count)
++        self.readmission = bool(readmission)
++        self.random_score_seed = random_score_seed
+         self.prior = json.loads(Path(prior_file).read_text(encoding="utf-8"))
+         self.edges = [float(x) for x in self.prior["score_bin_edges"]]
+         self.prior_hist = [float(x) for x in self.prior["score_bin_probabilities"]]
+@@ -75,6 +87,21 @@ class WaveBayesianMapper:
+         if any(not math.isfinite(v) or v < 0 for v in self.capacities.values()) or sum(self.capacities.values()) <= 0:
+             raise ValueError("capacities must be finite/nonnegative and at least one positive")
+         self.rows = read_score_rows(score_file)
++        if random_score_seed is not None:
++            # Shuffle unique-hash scores; keep the observed score population and
++            # duplicate hashes' score consistency. This is a controlled random
++            # ranking, not random independent tier assignment.
++            import random
++            first = {}
++            for rows in self.rows.values():
++                for h, score in rows:
++                    first.setdefault(h, score)
++            hashes = sorted(first)
++            scores = [first[h] for h in hashes]
++            random.Random(int(random_score_seed)).shuffle(scores)
++            shuffled = dict(zip(hashes, scores, strict=True))
++            self.rows = {source: [(h, shuffled[h]) for h, _ in rows]
++                         for source, rows in self.rows.items()}
+         self.metadata_file = Path(metadata_file)
+         self.vpc_file = Path(vpc_file)
+         self.assigned: dict[str, str] = {}
+@@ -116,6 +143,8 @@ class WaveBayesianMapper:
+         n = self.cost_counts[tier]
+         if n == 0:
+             return self.prior_ms[tier]
++        if self.posterior_mode == "pseudo_count":
++            return ((self.cost_prior_count * self.prior_ms[tier]) + self.cost_sum_ms[tier]) / (self.cost_prior_count + n)
+         return ((self.weight * self.prior_ms[tier]) + self.cost_sum_ms[tier] / n) / (self.weight + 1.0)
+ 
+     def probabilities(self) -> list[float]:
+@@ -123,6 +152,9 @@ class WaveBayesianMapper:
+         if n == 0:
+             return list(self.prior_hist)
+         obs = [v / n for v in self.hist_counts]
++        if self.posterior_mode == "pseudo_count":
++            return [(self.score_prior_count * a + c) / (self.score_prior_count + n)
++                    for a, c in zip(self.prior_hist, self.hist_counts)]
+         return [(self.weight * a + b) / (self.weight + 1.0) for a, b in zip(self.prior_hist, obs)]
+ 
+     def percentile(self, score: float) -> float:
+@@ -205,36 +237,54 @@ class WaveBayesianMapper:
+         return result, best_m, has_feasible
+ 
+     def publish_wave(self, source_indices: list[int], phase: str) -> dict[str, Any]:
+-        # Use only data available from PREVIOUS completed waves to map this wave.
++        # Wave boundaries freeze tier preferences until all requests finish.
++        # Existing *physical* hits are fetched normally regardless of their
++        # current admission preference. A changed preference is used only if
++        # that KV must be computed and newly stored in this wave.
+         self.epoch += 1
+         b = self.bands()
+         new_count = 0
++        preference_changes = 0
++        transitions: Counter[str] = Counter()
+         contradictions = 0
++        previous = dict(self.assigned)
++        wave_fixed: dict[str, str] = {} if self.readmission else dict(self.assigned)
+         for source in source_indices:
+             seq = self.rows[source]
+             hashes = [h for h, _ in seq]
+             ps = [self.percentile(s) for _, s in seq]
+             proposals = [self._tier(p, b) for p in ps]
+-            finalized, cutoff, feasible = self._prefix_closure(proposals, ps, hashes, self.assigned, b)
++            finalized, cutoff, feasible = self._prefix_closure(
++                proposals, ps, hashes, wave_fixed, b)
+             contradictions += int(not feasible)
+             block_labels = {}
+             for i, (h, tier) in enumerate(zip(hashes, finalized)):
+-                if h not in self.assigned:
+-                    self.assigned[h] = tier
+-                    new_count += 1
+-                label = self.assigned[h]
+-                # Native VPC physical block granularity is 16 tokens.
++                if h not in wave_fixed:
++                    old = previous.get(h)
++                    if old is None:
++                        new_count += 1
++                    elif old != tier:
++                        preference_changes += 1
++                        transitions[f"{old}->{tier}"] += 1
++                    wave_fixed[h] = tier
++                label = wave_fixed[h]
+                 for native in range(i * 32, (i + 1) * 32):
+                     block_labels[str(native)] = "disk" if label == "drop" else label
+             self.request_labels[str(source)] = block_labels
+-        # Both files replaced before submitting requests; no requests in flight.
++        self.assigned.update(wave_fixed)
+         atomic_json(self.metadata_file, self.assigned)
+         atomic_json(self.vpc_file, self.request_labels)
+         status = {
+             "epoch": self.epoch, "phase": phase, "requests": len(source_indices),
+             "new_hashes": new_count, "total_hashes": len(self.assigned),
++            "readmission_preferences_changed": preference_changes,
++            "readmission_preference_transitions": dict(transitions),
++            "note": "preference changes are NOT proof of a physical hierarchy miss; runtime store logs report actual admissions",
+             "score_samples": len(self.seen_scores),
+             "score_out_of_prior_range": self.out_of_range_scores,
++            "posterior_mode": self.posterior_mode,
++            "score_prior_count": self.score_prior_count,
++            "cost_prior_count": self.cost_prior_count,
+             "cost_sample_counts": dict(self.cost_counts),
+             "cost_estimate_ms": {t: self.estimated_cost(t) for t in ("cpu", "disk", "recompute")},
+             "thresholds": {k: b[k] for k in TIERS},
+@@ -287,3 +337,53 @@ class LmcacheLogCostReader:
+                 mapper.observe_cost("cpu", float(match[2]) * 1000 / (int(match[1]) / 512), count=chunks)
+                 counts["cpu_proxy"] += 1
+         return counts
++
++
++class LmcacheCompletionCostReader(LmcacheLogCostReader):
++    """Completed-device H2D + finished L2 load stage, no blocking synchronize.
++
++    H2D measures elapsed time until a stream-ordered callback runs. L2 stage
++    measures from load start to completion. Their sum is an approximate serial
++    GET-path cost, not an exclusive service time nor a causal E2E cost. The
++    components are not matched per request; report as a calibrated proxy.
++    """
++    _h2d = re.compile(r"\[BAYES_H2D_COMPLETE\].*?chunks=(\d+).*?elapsed_ms=([0-9.]+)")
++    _disk = re.compile(r"\[BAYES_L2_LOAD_COMPLETE\].*?chunks=(\d+).*?elapsed_ms=([0-9.]+)")
++
++    def collect(self, mapper: WaveBayesianMapper) -> dict[str, int]:
++        counts = {"h2d_completed": 0, "disk_load_completed": 0}
++        if not self.logfile.exists():
++            return counts
++        with self.logfile.open(encoding="utf-8", errors="replace") as f:
++            f.seek(self.offset)
++            data = f.read()
++            # Preserve complete lines only; never double-count partially written logs.
++            if not data.endswith("\n"):
++                cut = data.rfind("\n")
++                if cut < 0:
++                    return counts
++                data = data[:cut + 1]
++                f.seek(self.offset + len(data.encode("utf-8", errors="replace")))
++            self.offset = f.tell()
++        new_disk_sum, new_disk_n = 0.0, 0
++        for line in data.splitlines():
++            m = self._h2d.search(line)
++            if m and int(m[1]) > 0 and float(m[2]) > 0:
++                n = int(m[1])
++                mapper.observe_cost("cpu", float(m[2]) / n, count=n)
++                counts["h2d_completed"] += 1
++            m = self._disk.search(line)
++            if m and int(m[1]) > 0 and float(m[2]) > 0:
++                n = int(m[1])
++                new_disk_sum += float(m[2])
++                new_disk_n += n
++                counts["disk_load_completed"] += 1
++        if new_disk_n:
++            # Disk GET includes loading from disk into host plus H2D. Use the
++            # best observed H2D component. Unlike the old log proxy this H2D
++            # measurement is collected after device-stream completion.
++            h2d_per_chunk = (mapper.cost_sum_ms["cpu"] / mapper.cost_counts["cpu"]
++                             if mapper.cost_counts["cpu"] else mapper.prior_ms["cpu"])
++            mapper.observe_cost("disk", new_disk_sum / new_disk_n + h2d_per_chunk,
++                                count=new_disk_n)
++        return counts
+diff --git a/docs/BAYES_V3_H100_VERIFY_AND_SWEEPS.md b/docs/BAYES_V3_H100_VERIFY_AND_SWEEPS.md
+new file mode 100644
+index 0000000..81dce5e
+--- /dev/null
++++ b/docs/BAYES_V3_H100_VERIFY_AND_SWEEPS.md
+@@ -0,0 +1,141 @@
++# Bayesian KV v3 — calibrated starting costs, completed transfer feedback, renewable admission preferences
++
++This is an **incremental patch on top of bayesian_wave_kv.patch + bayesian_smoke_fix_v2.patch**, themselves on top of canonical_q650_phase_trace.patch. It is opt-in; the original GNN and no-GNN serving paths remain available. Tested **CPU-only**; H100 testing is explicitly required before a sweep.
++
++## Summary of behavioral changes
++
++- `KV_BAYES_POSTERIOR_MODE=fixed` remains the default. `KV_BAYES_PRIOR_WEIGHT=1` continues to average the prior and empirical mean 50/50 even after many observations.
++- Optional `KV_BAYES_POSTERIOR_MODE=pseudo_count` uses `KV_BAYES_SCORE_PRIOR_COUNT` and `KV_BAYES_COST_PRIOR_COUNT` (defaults 10 and 5). The score posterior uses Dirichlet-style bin counts, and CPU/disk cost estimates use pseudo-observation weighted means. Neither mode learns recomputation time; this remains a configured reference.
++- `KV_BAYES_READMISSION=1` (for Bayesian launcher) recalculates admission *preferences* for hashes encountered in later waves. Actual GPU/CPU/disk cache hits are still served normally regardless of preference. A newly computed KV object uses the current preference when host storage reservation succeeds. Store-controller policy decisions use a captured **staged-tier intent**, not the potentially newer live snapshot. No explicit tier migration or new eviction policy.
++- `KV_BAYES_DIRECT_COST_FEEDBACK=1` uses `BAYES_H2D_COMPLETE` stream-completion callbacks (no serving CUDA synchronization), and `BAYES_L2_LOAD_COMPLETE` when L2->L1 load finishes. The disk cost combines an empirical L2 stage mean with the H2D-completion mean. These are **better-timed but still approximate and not exclusive device/E2E costs**. Old `KV_BAYES_USE_COST_PROXIES=1` remains only as legacy fallback; do not enable both.
++- New simple one-time synthetic prior utility independently benchmarks pinned H2D and buffered disk read + H2D for the two GPUs; **recompute prior is NOT calibrated** and remains the original configured value. Score histogram bin edges/probabilities are copied unchanged. OS page caching can affect buffered disk reads.
++- Wave history includes changed hash admission preferences (not the same as actual renewed physical stores). LMCache logs real reservation events `BAYES_NEW_STORE_INTENT` and `BAYES_READMISSION_STORE`. Job root now includes `slurm_and_source.txt` recording CPU allocation, Slurm TRES and git revision/dirty state.
++- CPU/disk/GPU budgets in the mapper are policy budgets, **not automatically enforced physical cache capacity limits**. No workload-size inference or dynamic eviction optimization was added.
++
++## 1. Apply only AFTER Bayesian v2
++
++From the login node, copy `bayesian_kv_v3_incremental.patch` to the cluster repository root. Then:
++
++```bash
++cd /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
++git branch --show-current
++git status --short                  # protect your current work first
++git apply --check bayesian_kv_v3_incremental.patch
++git apply bayesian_kv_v3_incremental.patch
++```
++
++**Stop on any `--check` failure**. No manual `patch -p1 -f`. The patch assumes the earlier Bayesian v2 smoke fix was already applied.
++
++## 2. CPU-only verification on login node
++
++```bash
++cd /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
++source /mnt/shared/gpfs/home/sriramc2/venvs/kvaware-vllm029/bin/activate
++python -m unittest discover -s tests -p test_bayesian_mapper_cpu.py -v
++python -m compileall -q Hierarchical_KV/shortq_placement/bayesian_mapper.py \
++  experiments/mp_nognn_project.py experiments/calibrate_bayesian_tier_costs.py \
++  third_party/LMCache/lmcache/v1/distributed/placement_metadata.py \
++  third_party/LMCache/lmcache/v1/distributed/storage_controllers/prefetch_controller.py \
++  third_party/LMCache/lmcache/v1/distributed/storage_controllers/store_policy.py \
++  third_party/LMCache/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
++for f in scripts/run_shortq_gnn_dynamic_vpc_common.sh \
++  scripts/run_h100_bayes_targeted_smoke.sbatch \
++  scripts/run_h100_bayes_cost_calibrate.sbatch \
++  scripts/run_h100_bayes_sweep_cell.sbatch \
++  scripts/submit_bayes_group_{A,B,C}.sh; do bash -n "$f" || exit 1; done
++```
++
++Expected unit tests: **15 tests, OK** (other project tests remain separate).
++
++## 3. Calibration — one short Slurm job, required before smoke
++
++`mkdir -p /mnt/shared/gpfs/home/sriramc2/runs/kvaware` on the login node first.
++
++```bash
++sbatch scripts/run_h100_bayes_cost_calibrate.sbatch
++```
++
++Wait for completion (job ID printed by sbatch). Output prior:
++
++```
++/mnt/shared/gpfs/home/sriramc2/runs/kvaware/rank_h100_calibrated.json
++```
++
++The score histogram is **the unchanged Q12 diagnostic histogram**. The recompute prior is **unchanged/unmeasured**. Inspect its `cost_calibration` metadata. This is a simple starting point, not a physically exact hardware-cost oracle. Reuse this prior file throughout matched experiments.
++
++## 4. Targeted H100 smoke — do NOT skip
++
++```bash
++sbatch scripts/run_h100_bayes_targeted_smoke.sbatch
++```
++
++This uses Q80/B20, 16 generated tokens, a fixed prior weight of 1, completed-transfer feedback and renewable readmission preferences. Existing LMCache scratch-cleanup still deletes **everything under `/scratch2/sriramc2`**; preserve anything needed beforehand.
++
++Inspect the run directory printed as `run_dir=...`:
++
++```bash
++RUNDIR=/path/printed/by/job
++cat "$RUNDIR/slurm_and_source.txt"
++grep -E '\[BAYES_(WAVE|H2D_COMPLETE|L2_LOAD_COMPLETE|READMISSION_STORE)' "$RUNDIR"/logs/{driver,lmcache}.log | tail -60
++python - "$RUNDIR" <<'PY'
++import json, sys, pathlib
++p=pathlib.Path(sys.argv[1]); h=json.loads((p/'results/bayes_wave_history.json').read_text())
++print('epochs:',len(h))
++print('cost samples:',h[-1]['cost_sample_counts'])
++print('preference changes:',sum(e['readmission_preferences_changed'] for e in h))
++print('final estimates:',h[-1]['cost_estimate_ms'])
++l=(p/'logs/lmcache.log').read_text(errors='replace')
++print('metadata misses:',l.count('[GNN_PLACEMENT_METADATA_MISS]'))
++print('physical changed store intents:',l.count('[BAYES_READMISSION_STORE]'))
++assert len(h)>=2 and '[GNN_PLACEMENT_METADATA_MISS]' not in l
++PY
++```
++
++**Do not assert that Q80 necessarily produces a physical changed-tier readmission**; changes depend on misses and band crossings. Check that H2D observations are plausible (160 MiB logical per TP2 chunk / 80 MiB per rank), that CPU/disk sample counts grow when those paths run, and that no asynchronous errors or TP disagreements occur. If no renewed physical store was observed, the CPU unit test exercises that state transition, but a targeted miss-forcing H100 test would still be needed to claim runtime validation of that case.
++
++## 5. Launch Group A — seven configs
++
++From repo root *after* smoke review:
++
++```bash
++bash scripts/submit_bayes_group_A.sh
++```
++
++Individual arms:
++
++```bash
++sbatch --export=ALL,SWEEP_CELL=bayes_original,SWEEP_ORDER=original scripts/run_h100_bayes_sweep_cell.sbatch
++sbatch --export=ALL,SWEEP_CELL=bayes_canonical,SWEEP_ORDER=canonical scripts/run_h100_bayes_sweep_cell.sbatch
++```
++
++Arms: no-GNN original/canonical, existing GNN original/canonical, Bayesian GNN original/canonical, **one** random-score Bayesian canonical (seed 42). The random control permutes unique-hash scores while preserving the score distribution; it does not sample random tier labels.
++
++## 6. Launch Group B — four budgets x two policies
++
++```bash
++bash scripts/submit_bayes_group_B.sh
++```
++
++Rows: `(GPU policy GB, CPU cache GiB, disk policy GB, disk PUT cap GiB)` = `(10,225,100,.25)`, `(10,100,100,.25)`, `(10,225,300,.25)`, `(5,100,100,0)`.
++
++**Interpretation limitation:** `GPU` and `disk` numbers are percentile-mapper *policy budgets*. With the current code they **do not physically shrink GPU VPC or disk storage**, and no-GNN ignores them. CPU GiB is physically configured and the 0 cap means **unbounded PUT admission**, not zero disk storage. Therefore the rows are policy-budget sensitivity plus CPU-capacity/store-cap stress tests, NOT a clean hardware-capacity elasticity study. Group B no-GNN arms with equal CPU/store-cap may intentionally be duplicates; do not claim that those no-GNN configurations vary physically with a Bayesian-only budget.
++
++## 7. Launch Group C — four weights (pick best arm from A/B first)
++
++Choose the winning policy order/capacity values. For example:
++
++```bash
++GROUP_C_GPU_GB=10 GROUP_C_CPU_GB=225 GROUP_C_DISK_GB=100 \
++GROUP_C_STORE_CAP_GB=0.25 GROUP_C_ORDER=canonical \
++bash scripts/submit_bayes_group_C.sh
++```
++
++Weights: 0, 0.25, 1, 4. `fixed` posterior mode for all. Can omit weight=1 if a fully matched run already exists (edit submit script before launch). The optional `pseudo_count` mode is implemented but deliberately not in this sweep.
++
++## 8. Shared operational rules
++
++- **All jobs:** partition `gpu-h100-dchen`, TP2 H100, `--cpus-per-task=16`, **no `--mem` directive**, B100, Q650, cold seed 0 / warm seed 1, 128 generated tokens, cold/warm store barrier and phase trace, no CUDA device trace. Resource allocation recorded in `slurm_and_source.txt`.
++- Group launcher scripts submit jobs **sequentially with `afterok`** dependencies because each arm cleans the same scratch root. If one arm fails, later ones stay pending; check `squeue -u "$USER"` and `scontrol show job JOBID`.
++- Logs: `/mnt/shared/gpfs/home/sriramc2/runs/kvaware/kvbayes-cell_JOBID.out` and `.err` (`%x` is `kvbayes-cell`). Run artifact paths print on completion.
++- Calibrated prior is a simple transfer measurement; recompute reference is unmeasured, and runtime disk cost combines two nonexclusive stages. **A small performance gap cannot prove Bayesian superiority** without matched repeated trials.
++- Do not compare B100 directly with old B200 headline runs or mix different CPU allocations.
+diff --git a/experiments/calibrate_bayesian_tier_costs.py b/experiments/calibrate_bayesian_tier_costs.py
+new file mode 100644
+index 0000000..5a401de
+--- /dev/null
++++ b/experiments/calibrate_bayesian_tier_costs.py
+@@ -0,0 +1,107 @@
++"""Lightweight ONE-TIME hardware prior generator (no LMCache, no vLLM).
++
++CPU prior: completed H2D transfer of a per-rank 512-token KV-sized buffer.
++Disk prior: buffered file read plus completed H2D transfer, per rank.
++For TP2 use max across individual-rank times; measurements are NOT concurrent
++serving latencies. The recompute reference remains the input JSON value.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import os
++from pathlib import Path
++import statistics
++import tempfile
++import time
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument('--prior-in', type=Path, required=True)
++    ap.add_argument('--prior-out', type=Path, required=True)
++    ap.add_argument('--scratch', type=Path, default=Path('/scratch2/sriramc2'))
++    ap.add_argument('--mib-per-rank', type=int, default=80)
++    ap.add_argument('--repeats', type=int, default=8)
++    args = ap.parse_args()
++    if args.repeats < 3 or args.mib_per_rank <= 0:
++        ap.error('at least 3 repeats and a positive chunk size required')
++
++    import torch
++    if not torch.cuda.is_available():
++        raise RuntimeError('CUDA GPUs required for calibration')
++    if torch.cuda.device_count() != 2:
++        raise RuntimeError('Expected exactly 2 visible GPUs for TP2 hardware calibration')
++    size = args.mib_per_rank * 1024 * 1024
++    args.scratch.mkdir(parents=True, exist_ok=True)
++    prior = json.loads(args.prior_in.read_text())
++    all_cpu, all_disk = [], []
++    with tempfile.TemporaryDirectory(prefix='kvbayes_probe_', dir=args.scratch) as tmp:
++        for device in range(torch.cuda.device_count()):
++            # Byte tensor has the exact transfer size without storing actual KV.
++            host = torch.empty(size, dtype=torch.uint8, pin_memory=True)
++            host.fill_(17)
++            with torch.cuda.device(device):
++                dst = torch.empty(size, device=f'cuda:{device}', dtype=torch.uint8)
++                stream = torch.cuda.Stream(device=device)
++                device_cpu, device_disk = [], []
++                fpath = Path(tmp) / f'rank_{device}.bin'
++                # One file per rank. Cleanup is automatic, no LMCache pollution.
++                with fpath.open('wb') as f:
++                    f.write(bytes([17]) * size)
++                    f.flush()
++                    os.fsync(f.fileno())
++                for trial in range(args.repeats + 2):
++                    with torch.cuda.stream(stream):
++                        stream.synchronize()
++                        start = time.perf_counter()
++                        dst.copy_(host, non_blocking=True)
++                        stream.synchronize()
++                        h2d_ms = (time.perf_counter() - start) * 1000
++                    # This is a buffered filesystem read, not O_DIRECT.
++                    # POSIX fadvise reduces page-cache reuse where available.
++                    with fpath.open('rb', buffering=0) as f:
++                        if hasattr(os, 'posix_fadvise') and hasattr(os, 'POSIX_FADV_DONTNEED'):
++                            try:
++                                os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
++                            except OSError:
++                                pass
++                        start = time.perf_counter()
++                        buf = f.read(size)
++                        disk_read_ms = (time.perf_counter() - start) * 1000
++                    if len(buf) != size:
++                        raise RuntimeError('short synthetic file read')
++                    if trial >= 2:
++                        device_cpu.append(h2d_ms)
++                        device_disk.append(disk_read_ms + h2d_ms)
++                all_cpu.append(statistics.median(device_cpu))
++                all_disk.append(statistics.median(device_disk))
++                print(f'gpu={device} cpu_median_ms={all_cpu[-1]:.3f} '
++                      f'disk+cpu_median_ms={all_disk[-1]:.3f}', flush=True)
++    prior['cost_prior_ms']['cpu'] = round(max(all_cpu), 5)
++    prior['cost_prior_ms']['disk'] = round(max(all_disk), 5)
++    # Deliberately not pretending to calibrate recomputation.
++    prior['comment'] = ('Score histogram is unchanged from the input prior (Q12-derived diagnostic). '
++                        'CPU and disk costs are standalone transfer benchmarks; '
++                        'recompute cost is unchanged and remains a reference assumption.')
++    prior['cost_calibration'] = {
++        'method': 'standalone buffered disk read + completed pinned H2D',
++        'mib_per_tp_rank': args.mib_per_rank,
++        'rank_count': torch.cuda.device_count(),
++        'repeats_per_rank': args.repeats,
++        'cpu_rank_medians_ms': all_cpu,
++        'disk_rank_medians_ms': all_disk,
++        'tp_wall_approximation': 'max of independent per-rank medians, not a simultaneous TP2 benchmark',
++        'recompute_prior_measured': False,
++        'disk_read_cache_note': 'page cache may still affect buffered reads',
++    }
++    args.prior_out.parent.mkdir(parents=True, exist_ok=True)
++    tmp_path = args.prior_out.with_suffix(args.prior_out.suffix + '.tmp')
++    tmp_path.write_text(json.dumps(prior, indent=2, sort_keys=True) + '\n')
++    os.replace(tmp_path, args.prior_out)
++    print('calibrated_prior=' + str(args.prior_out), flush=True)
++    print('recompute_prior_ms=' + str(prior['cost_prior_ms']['recompute']) + ' (UNCHANGED; not calibrated)')
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/experiments/mp_nognn_project.py b/experiments/mp_nognn_project.py
+index f1631bc..1be11a2 100755
+--- a/experiments/mp_nognn_project.py
++++ b/experiments/mp_nognn_project.py
+@@ -1115,6 +1115,12 @@ def parse_arguments():
+                         help="Enable wave-level mapper using precomputed hash scores")
+     parser.add_argument("--bayes_prior_file", default="")
+     parser.add_argument("--bayes_prior_weight", type=float, default=1.0)
++    parser.add_argument("--bayes_posterior_mode", choices=("fixed", "pseudo_count"), default="fixed")
++    parser.add_argument("--bayes_score_prior_count", type=float, default=10.0)
++    parser.add_argument("--bayes_cost_prior_count", type=float, default=5.0)
++    parser.add_argument("--bayes_readmission", action="store_true")
++    parser.add_argument("--bayes_random_score_seed", type=int, default=None)
++    parser.add_argument("--bayes_direct_cost_feedback", action="store_true")
+     parser.add_argument("--bayes_gpu_gb", type=float, default=10.0)
+     parser.add_argument("--bayes_cpu_gb", type=float, default=225.0)
+     parser.add_argument("--bayes_disk_gb", type=float, default=100.0)
+@@ -1320,7 +1326,7 @@ def main():
+     bayes_reader = None
+     if args.bayes_score_file:
+         from Hierarchical_KV.shortq_placement.bayesian_mapper import (
+-            WaveBayesianMapper, LmcacheLogCostReader, atomic_json,
++            WaveBayesianMapper, LmcacheLogCostReader, LmcacheCompletionCostReader, atomic_json,
+         )
+         required = (args.bayes_prior_file, args.bayes_metadata_file, args.bayes_vpc_file)
+         if any(not x for x in required):
+@@ -1329,17 +1335,32 @@ def main():
+             args.bayes_prior_file, args.bayes_prior_weight,
+             args.bayes_gpu_gb, args.bayes_cpu_gb, args.bayes_disk_gb,
+             args.bayes_score_file, args.bayes_metadata_file, args.bayes_vpc_file,
++            posterior_mode=args.bayes_posterior_mode,
++            score_prior_count=args.bayes_score_prior_count,
++            cost_prior_count=args.bayes_cost_prior_count,
++            readmission=args.bayes_readmission,
++            random_score_seed=args.bayes_random_score_seed,
+         )
+         if set(bayes_mapper.rows) != set(range(num_requests)):
+             raise ValueError("score-file request indices differ from serving requests")
+-        if args.bayes_use_cost_proxies:
++        if args.bayes_use_cost_proxies and args.bayes_direct_cost_feedback:
++            raise ValueError("choose direct timing or old log proxies, not both")
++        if args.bayes_use_cost_proxies or args.bayes_direct_cost_feedback:
+             if not args.bayes_lmcache_log:
+-                raise ValueError("--bayes_use_cost_proxies requires --bayes_lmcache_log")
+-            bayes_reader = LmcacheLogCostReader(args.bayes_lmcache_log)
++                raise ValueError("cost feedback requires --bayes_lmcache_log")
++            bayes_reader = (LmcacheCompletionCostReader(args.bayes_lmcache_log)
++                            if args.bayes_direct_cost_feedback else
++                            LmcacheLogCostReader(args.bayes_lmcache_log))
+         print("[BAYES_INIT] " + json.dumps({
+             "score_file": args.bayes_score_file, "prior_file": args.bayes_prior_file,
+             "prior_weight": args.bayes_prior_weight, "capacities_gb": bayes_mapper.capacities,
+-            "cost_observations": "log_proxies" if bayes_reader else "prior_only",
++            "posterior_mode": args.bayes_posterior_mode,
++            "readmission": args.bayes_readmission,
++            "score_prior_count": args.bayes_score_prior_count,
++            "cost_prior_count": args.bayes_cost_prior_count,
++            "random_score_seed": args.bayes_random_score_seed,
++            "cost_observations": ("completed_transfer" if args.bayes_direct_cost_feedback
++                                  else "log_proxies" if bayes_reader else "prior_only"),
+         }, sort_keys=True), flush=True)
+ 
+     def _bayes_before_wave(sources: list[int], phase: str) -> None:
+diff --git a/scripts/run_h100_bayes_cost_calibrate.sbatch b/scripts/run_h100_bayes_cost_calibrate.sbatch
+new file mode 100644
+index 0000000..78d3ac8
+--- /dev/null
++++ b/scripts/run_h100_bayes_cost_calibrate.sbatch
+@@ -0,0 +1,21 @@
++#!/usr/bin/env bash
++#SBATCH --job-name=kvbayes-calibrate
++#SBATCH --partition=gpu-h100-dchen
++#SBATCH --nodes=1
++#SBATCH --ntasks=1
++#SBATCH --cpus-per-task=16
++#SBATCH --gres=gpu:2
++#SBATCH --time=00:30:00
++#SBATCH --output=/mnt/shared/gpfs/home/sriramc2/runs/kvaware/%x_%j.out
++#SBATCH --error=/mnt/shared/gpfs/home/sriramc2/runs/kvaware/%x_%j.err
++set -Eeuo pipefail
++REPO=/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
++source /mnt/shared/gpfs/home/sriramc2/venvs/kvaware-vllm029/bin/activate
++cd "$REPO"
++echo "SLURM_JOB_ID=${SLURM_JOB_ID} CPUs=${SLURM_CPUS_PER_TASK:-unset}"; nproc
++scontrol show job "$SLURM_JOB_ID" | grep -E 'NumCPUs=|ReqTRES=|AllocTRES=' || true
++export CUDA_MPS_PIPE_DIRECTORY="/tmp/kvaware-no-mps-${USER}-${SLURM_JOB_ID}-DO-NOT-CREATE"
++python experiments/calibrate_bayesian_tier_costs.py \
++  --prior-in "$REPO/Hierarchical_KV/shortq_placement/priors/rank_smoke_diagnostic.json" \
++  --prior-out /mnt/shared/gpfs/home/sriramc2/runs/kvaware/rank_h100_calibrated.json \
++  --scratch /scratch2/sriramc2
+diff --git a/scripts/run_h100_bayes_sweep_cell.sbatch b/scripts/run_h100_bayes_sweep_cell.sbatch
+new file mode 100644
+index 0000000..f476dbf
+--- /dev/null
++++ b/scripts/run_h100_bayes_sweep_cell.sbatch
+@@ -0,0 +1,58 @@
++#!/usr/bin/env bash
++#SBATCH --job-name=kvbayes-cell
++#SBATCH --partition=gpu-h100-dchen
++#SBATCH --nodes=1
++#SBATCH --ntasks=1
++#SBATCH --cpus-per-task=16
++#SBATCH --gres=gpu:2
++#SBATCH --time=06:00:00
++#SBATCH --output=/mnt/shared/gpfs/home/sriramc2/runs/kvaware/%x_%j.out
++#SBATCH --error=/mnt/shared/gpfs/home/sriramc2/runs/kvaware/%x_%j.err
++set -Eeuo pipefail
++REPO=/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
++cd "$REPO"
++: "${SWEEP_CELL:?supply SWEEP_CELL}"
++case "$SWEEP_CELL" in
++  nognn_original|nognn_canonical|gnn_original|gnn_canonical|bayes_original|bayes_canonical|bayes_random_canonical) ;;
++  *) [[ "$SWEEP_CELL" == b_* || "$SWEEP_CELL" == c_* ]] || { echo "Invalid cell: $SWEEP_CELL" >&2; exit 2; } ;;
++esac
++export NUM_QUESTIONS=650 SUBMISSION_BATCH_SIZE=100
++export MIN_TOKENS=128 MAX_TOKENS=128 MAX_NUM_SEQS=16
++export LMCACHE_L1_SIZE_GB="${SWEEP_CPU_GB:-225}"
++export LMCACHE_MP_MAX_INFLIGHT_STORE_GB="${SWEEP_STORE_CAP_GB:-0.25}"
++export KV_PASSAGE_ORDER_POLICY="${SWEEP_ORDER:-canonical}"
++export KV_REQUEST_ORDER=seeded_shuffle KV_REQUEST_ORDER_SEED=0
++export REQUEST_ORDER=seeded_shuffle REQUEST_ORDER_SEED=0
++export WARM_ORDER=random WARM_ORDER_SEED=1
++export ENABLE_VPC=1 KV_GNN_AWARE_VPC=1
++export KV_MUTUAL_PREFIX=1 KV_VPC_SUFFICIENT_BYPASS=1
++export KV_COLD_WARM_STORE_BARRIER=1 LMCACHE_MP_PREFIX_DIAGNOSTICS=1
++export VLLM_PHASE_TRACE=1 VLLM_PHASE_TRACE_DEVICE_TIMING=0
++export LMCACHE_L2_LOAD_MAX_IN_FLIGHT=2 LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT=16
++export EXPERIMENT_LABEL="${SWEEP_CELL}"
++export GRID_LABEL="${SWEEP_CELL}_q650_b100"
++export KV_BAYES_ENABLE=0
++if [[ "$SWEEP_CELL" == nognn_* || "${SWEEP_POLICY:-}" == "nognn" ]]; then
++  export KV_GNN_AWARE_VPC=0
++  # This baseline has no Bayesian disk/GPU *policy budgets*. CPU allocation
++  # and disk store cap are real runtime controls; other budgets are not.
++  bash scripts/run_h100_mp_nognn_q650_current_cleanall.sbatch
++  exit
++fi
++export KV_GNN_DYNAMIC_PROFILE=h100_q650
++export KV_GNN_L1_BACKING=1 KV_GNN_L2_BACKING=0
++export GNN_CHUNK_VOTE_POLICY=threshold_with_drop_plurality
++export KV_BAYES_GPU_GB="${SWEEP_GPU_GB:-10}"
++export KV_BAYES_DISK_GB="${SWEEP_DISK_GB:-100}"
++if [[ "$SWEEP_CELL" == bayes_* || "${SWEEP_POLICY:-}" == "bayes" ]]; then
++  export KV_BAYES_ENABLE=1
++  export KV_BAYES_PRIOR_FILE="${SWEEP_PRIOR_FILE:-/mnt/shared/gpfs/home/sriramc2/runs/kvaware/rank_h100_calibrated.json}"
++  [[ -s "$KV_BAYES_PRIOR_FILE" ]] || { echo "Missing calibrated prior: $KV_BAYES_PRIOR_FILE" >&2; exit 2; }
++  export KV_BAYES_PRIOR_WEIGHT="${SWEEP_PRIOR_WEIGHT:-1}"
++  export KV_BAYES_DIRECT_COST_FEEDBACK=1 KV_BAYES_USE_COST_PROXIES=0
++  export KV_BAYES_READMISSION=1 KV_BAYES_POSTERIOR_MODE=fixed
++  if [[ "$SWEEP_CELL" == bayes_random_canonical ]]; then
++    export KV_BAYES_RANDOM_SCORE_SEED=42
++  fi
++fi
++bash scripts/run_shortq_gnn_dynamic_vpc_common.sh
+diff --git a/scripts/run_h100_bayes_targeted_smoke.sbatch b/scripts/run_h100_bayes_targeted_smoke.sbatch
+new file mode 100644
+index 0000000..d26300d
+--- /dev/null
++++ b/scripts/run_h100_bayes_targeted_smoke.sbatch
+@@ -0,0 +1,22 @@
++#!/usr/bin/env bash
++#SBATCH --job-name=kvbayes-smoke3
++#SBATCH --partition=gpu-h100-dchen
++#SBATCH --nodes=1
++#SBATCH --ntasks=1
++#SBATCH --cpus-per-task=16
++#SBATCH --gres=gpu:2
++#SBATCH --time=02:00:00
++#SBATCH --output=/mnt/shared/gpfs/home/sriramc2/runs/kvaware/%x_%j.out
++#SBATCH --error=/mnt/shared/gpfs/home/sriramc2/runs/kvaware/%x_%j.err
++set -Eeuo pipefail
++cd /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
++export KV_BAYES_PRIOR_FILE="${KV_BAYES_PRIOR_FILE:-/mnt/shared/gpfs/home/sriramc2/runs/kvaware/rank_h100_calibrated.json}"
++[[ -s "$KV_BAYES_PRIOR_FILE" ]] || { echo "ERROR: calibrate priors first" >&2; exit 2; }
++export KV_BAYES_DIRECT_COST_FEEDBACK=1 KV_BAYES_USE_COST_PROXIES=0
++export KV_BAYES_READMISSION=1 KV_BAYES_POSTERIOR_MODE=fixed
++export KV_BAYES_PRIOR_WEIGHT=1 KV_BAYES_GPU_GB=10 KV_BAYES_DISK_GB=100
++export NUM_QUESTIONS=80 SUBMISSION_BATCH_SIZE=20
++export MIN_TOKENS=16 MAX_TOKENS=16
++export LMCACHE_L1_SIZE_GB=225 SMOKE_FORCE_MIN_UNIQUE_PER_PLACEMENT=0
++export EXPERIMENT_LABEL=bayes_direct_readmission_q80_b20
++bash scripts/run_h100_bayes_canonical_smoke.sh
+diff --git a/scripts/run_h100_mp_nognn_q650_current_cleanall.sbatch b/scripts/run_h100_mp_nognn_q650_current_cleanall.sbatch
+index 2bc9ca7..79ebec7 100755
+--- a/scripts/run_h100_mp_nognn_q650_current_cleanall.sbatch
++++ b/scripts/run_h100_mp_nognn_q650_current_cleanall.sbatch
+@@ -51,6 +51,14 @@ reserve_unique_run_dir() {
+ }
+ 
+ RUN_DIR="$(reserve_unique_run_dir "${RUN_ROOT}/h100_nognn_q650_${GRID_LABEL}_${SLURM_JOB_ID}")"
++{ echo "job_id=${SLURM_JOB_ID:-unset}";
++  echo "cpus_per_task=${SLURM_CPUS_PER_TASK:-unset}";
++  echo "nproc=$(nproc)";
++  taskset -pc $$ || true;
++  scontrol show job "${SLURM_JOB_ID:-}" 2>/dev/null | grep -E 'NumCPUs=|ReqTRES=|AllocTRES=' || true;
++  git -C /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM rev-parse HEAD 2>/dev/null || true;
++  git -C /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM status --short 2>/dev/null || true;
++} > "${RUN_DIR}/slurm_and_source.txt"
+ LOG_DIR="${RUN_DIR}/logs"
+ RESULT_DIR="${RUN_DIR}/results"
+ export VLLM_PHASE_TRACE="${VLLM_PHASE_TRACE:-0}"
+diff --git a/scripts/run_shortq_gnn_dynamic_vpc_common.sh b/scripts/run_shortq_gnn_dynamic_vpc_common.sh
+index 66bb97e..c35ddc2 100755
+--- a/scripts/run_shortq_gnn_dynamic_vpc_common.sh
++++ b/scripts/run_shortq_gnn_dynamic_vpc_common.sh
+@@ -180,6 +180,16 @@ KV_BAYES_SCORE_FILE="${PLACEMENT_DIR}/gnn_chunk_scores.jsonl"
+ KV_BAYES_GPU_GB="${KV_BAYES_GPU_GB:-10}"
+ KV_BAYES_DISK_GB="${KV_BAYES_DISK_GB:-100}"
+ KV_BAYES_USE_COST_PROXIES="${KV_BAYES_USE_COST_PROXIES:-0}"
++KV_BAYES_DIRECT_COST_FEEDBACK="${KV_BAYES_DIRECT_COST_FEEDBACK:-0}"
++KV_BAYES_POSTERIOR_MODE="${KV_BAYES_POSTERIOR_MODE:-fixed}"
++KV_BAYES_SCORE_PRIOR_COUNT="${KV_BAYES_SCORE_PRIOR_COUNT:-10}"
++KV_BAYES_COST_PRIOR_COUNT="${KV_BAYES_COST_PRIOR_COUNT:-5}"
++KV_BAYES_READMISSION="${KV_BAYES_READMISSION:-1}"
++KV_BAYES_RANDOM_SCORE_SEED="${KV_BAYES_RANDOM_SCORE_SEED:-}"
++if [[ "$KV_BAYES_ENABLE" == "1" ]]; then
++  export LMCACHE_BAYES_TIMING="$KV_BAYES_DIRECT_COST_FEEDBACK"
++  export LMCACHE_BAYES_READMISSION="$KV_BAYES_READMISSION"
++fi
+ if [[ "$KV_BAYES_ENABLE" == "1" ]]; then
+   export LMCACHE_GNN_PLACEMENT_DYNAMIC=1 VLLM_KV_IMPORTANCE_DYNAMIC=1
+   SMOKE_FORCE_MIN_UNIQUE_PER_PLACEMENT=0
+@@ -317,6 +327,15 @@ wait_health() {
+   return 1
+ }
+ 
++{ echo "job_id=${SLURM_JOB_ID:-unset}";
++  echo "cpus_per_task=${SLURM_CPUS_PER_TASK:-unset}";
++  echo "nproc=$(nproc)";
++  taskset -pc $$ || true;
++  scontrol show job "${SLURM_JOB_ID:-}" 2>/dev/null | grep -E 'NumCPUs=|ReqTRES=|AllocTRES=' || true;
++  git rev-parse HEAD 2>/dev/null || true;
++  git status --short 2>/dev/null || true;
++} > "${RUN_DIR}/slurm_and_source.txt"
++
+ cat > "${RUN_DIR}/run_config.json" <<JSON
+ {
+   "profile": "$PROFILE",
+@@ -371,6 +390,12 @@ cat > "${RUN_DIR}/run_config.json" <<JSON
+   "bayes_gpu_gb": $KV_BAYES_GPU_GB,
+   "bayes_disk_gb": $KV_BAYES_DISK_GB,
+   "bayes_cost_observation_proxies": $KV_BAYES_USE_COST_PROXIES,
++  "bayes_direct_timing": $KV_BAYES_DIRECT_COST_FEEDBACK,
++  "bayes_readmission": $KV_BAYES_READMISSION,
++  "bayes_posterior_mode": "$KV_BAYES_POSTERIOR_MODE",
++  "bayes_score_prior_count": $KV_BAYES_SCORE_PRIOR_COUNT,
++  "bayes_cost_prior_count": $KV_BAYES_COST_PRIOR_COUNT,
++  "bayes_random_score_seed": "$KV_BAYES_RANDOM_SCORE_SEED",
+   "gnn_inference_batch_size": $GNN_INFERENCE_BATCH_SIZE,
+   "smoke_force_min_unique_per_placement": $SMOKE_FORCE_MIN_UNIQUE_PER_PLACEMENT
+ }
+@@ -508,6 +533,9 @@ if [[ "$KV_BAYES_ENABLE" == "1" ]]; then
+     --bayes_score_file "$KV_BAYES_SCORE_FILE"
+     --bayes_prior_file "$KV_BAYES_PRIOR_FILE"
+     --bayes_prior_weight "$KV_BAYES_PRIOR_WEIGHT"
++    --bayes_posterior_mode "$KV_BAYES_POSTERIOR_MODE"
++    --bayes_score_prior_count "$KV_BAYES_SCORE_PRIOR_COUNT"
++    --bayes_cost_prior_count "$KV_BAYES_COST_PRIOR_COUNT"
+     --bayes_gpu_gb "$KV_BAYES_GPU_GB"
+     --bayes_cpu_gb "$L1_GB"
+     --bayes_disk_gb "$KV_BAYES_DISK_GB"
+@@ -518,6 +546,15 @@ if [[ "$KV_BAYES_ENABLE" == "1" ]]; then
+   if [[ "$KV_BAYES_USE_COST_PROXIES" == "1" ]]; then
+     DARGS+=(--bayes_use_cost_proxies)
+   fi
++  if [[ "$KV_BAYES_DIRECT_COST_FEEDBACK" == "1" ]]; then
++    DARGS+=(--bayes_direct_cost_feedback)
++  fi
++  if [[ "$KV_BAYES_READMISSION" == "1" ]]; then
++    DARGS+=(--bayes_readmission)
++  fi
++  if [[ -n "$KV_BAYES_RANDOM_SCORE_SEED" ]]; then
++    DARGS+=(--bayes_random_score_seed "$KV_BAYES_RANDOM_SCORE_SEED")
++  fi
+ fi
+ 
+ if [[ "$KV_COLD_WARM_STORE_BARRIER" == "1" ]]; then
+diff --git a/scripts/submit_bayes_group_A.sh b/scripts/submit_bayes_group_A.sh
+new file mode 100644
+index 0000000..cd39f01
+--- /dev/null
++++ b/scripts/submit_bayes_group_A.sh
+@@ -0,0 +1,12 @@
++#!/usr/bin/env bash
++set -Eeuo pipefail
++cd /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
++mkdir -p /mnt/shared/gpfs/home/sriramc2/runs/kvaware
++# Sequential dependency prevents concurrent jobs from clearing the same scratch.
++prev=""
++for cell in nognn_original nognn_canonical gnn_original gnn_canonical bayes_original bayes_canonical bayes_random_canonical; do
++  case "$cell" in *_original) order=original;; *) order=canonical;; esac
++  dep=(); [[ -z "$prev" ]] || dep=("--dependency=afterok:$prev")
++  id=$(sbatch --parsable "${dep[@]}" --export="ALL,SWEEP_CELL=$cell,SWEEP_ORDER=$order" scripts/run_h100_bayes_sweep_cell.sbatch)
++  echo "$cell -> $id"; prev="$id"
++done
+diff --git a/scripts/submit_bayes_group_B.sh b/scripts/submit_bayes_group_B.sh
+new file mode 100644
+index 0000000..8541399
+--- /dev/null
++++ b/scripts/submit_bayes_group_B.sh
+@@ -0,0 +1,21 @@
++#!/usr/bin/env bash
++set -Eeuo pipefail
++cd /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
++mkdir -p /mnt/shared/gpfs/home/sriramc2/runs/kvaware
++# Four hardware-policy budgets x (no-GNN, Bayesian).
++# GPU/disk budgets are mapper parameters, NOT enforced physical capacity limits.
++# No-GNN sees CPU capacity and store cap but ignores the two mapper budgets.
++prev=""
++while read -r label gpu cpu disk cap; do
++  for policy in nognn bayes; do
++    cell="b_${label}_${policy}"
++    dep=(); [[ -z "$prev" ]] || dep=("--dependency=afterok:$prev")
++    id=$(sbatch --parsable "${dep[@]}" --export="ALL,SWEEP_CELL=$cell,SWEEP_POLICY=$policy,SWEEP_ORDER=canonical,SWEEP_GPU_GB=$gpu,SWEEP_CPU_GB=$cpu,SWEEP_DISK_GB=$disk,SWEEP_STORE_CAP_GB=$cap" scripts/run_h100_bayes_sweep_cell.sbatch)
++    echo "$cell -> $id"; prev="$id"
++  done
++done <<'ROWS'
++ref 10 225 100 0.25
++cpu100 10 100 100 0.25
++disk300 10 225 300 0.25
++uncapped 5 100 100 0
++ROWS
+diff --git a/scripts/submit_bayes_group_C.sh b/scripts/submit_bayes_group_C.sh
+new file mode 100644
+index 0000000..bb5aabf
+--- /dev/null
++++ b/scripts/submit_bayes_group_C.sh
+@@ -0,0 +1,16 @@
++#!/usr/bin/env bash
++set -Eeuo pipefail
++cd /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
++mkdir -p /mnt/shared/gpfs/home/sriramc2/runs/kvaware
++# Choose winner AFTER groups A and B. Environment overrides determine winner
++# capacity/order/cap settings. Four fixed-prior weights incl reference 1.
++: "${GROUP_C_GPU_GB:=10}" "${GROUP_C_CPU_GB:=225}"
++: "${GROUP_C_DISK_GB:=100}" "${GROUP_C_STORE_CAP_GB:=0.25}"
++: "${GROUP_C_ORDER:=canonical}"
++prev=""
++for entry in 'w0:0' 'w025:0.25' 'w1:1' 'w4:4'; do
++  label=${entry%%:*}; weight=${entry#*:}
++  dep=(); [[ -z "$prev" ]] || dep=("--dependency=afterok:$prev")
++  id=$(sbatch --parsable "${dep[@]}" --export="ALL,SWEEP_CELL=c_$label,SWEEP_POLICY=bayes,SWEEP_ORDER=$GROUP_C_ORDER,SWEEP_GPU_GB=$GROUP_C_GPU_GB,SWEEP_CPU_GB=$GROUP_C_CPU_GB,SWEEP_DISK_GB=$GROUP_C_DISK_GB,SWEEP_STORE_CAP_GB=$GROUP_C_STORE_CAP_GB,SWEEP_PRIOR_WEIGHT=$weight" scripts/run_h100_bayes_sweep_cell.sbatch)
++  echo "c_$label -> $id"; prev="$id"
++done
+diff --git a/tests/test_bayesian_mapper_cpu.py b/tests/test_bayesian_mapper_cpu.py
+index 2a3e1ae..a014e53 100644
+--- a/tests/test_bayesian_mapper_cpu.py
++++ b/tests/test_bayesian_mapper_cpu.py
+@@ -199,6 +199,88 @@ class BayesianMapperTests(unittest.TestCase):
+         self.assertAlmostEqual(m.estimated_cost('disk'), (500 + 200) / 2)
+         self.assertEqual(reader.collect(m), {'cpu_proxy': 0, 'disk_proxy': 0})
+ 
++    def test_pseudo_count_mode_prior_decays_for_costs_and_scores(self):
++        m = WaveBayesianMapper(
++            self.prior, 1, 10, 100, 100, self.scores, self.metadata, self.vpc,
++            posterior_mode='pseudo_count', score_prior_count=4, cost_prior_count=5)
++        m.observe_cost('cpu', 80, count=15)
++        self.assertAlmostEqual(m.estimated_cost('cpu'), (5*20 + 15*80)/20)
++        m.observe_scores([0])
++        self.assertEqual(sum(m.hist_counts), 4)
++        expected = [(4*.25 + c)/8 for c in m.hist_counts]
++        for got, want in zip(m.probabilities(), expected):
++            self.assertAlmostEqual(got, want)
++        fixed = self.mapper()
++        fixed.observe_cost('cpu', 80, count=15)
++        self.assertAlmostEqual(fixed.estimated_cost('cpu'), 50)
++
++    def test_readmission_renews_preferences_after_band_update(self):
++        m = WaveBayesianMapper(
++            self.prior, 0, 10, 100, 100, self.scores, self.metadata, self.vpc,
++            readmission=True)
++        m.publish_wave([0], 'cold')
++        previous = dict(m.assigned)
++        self.assertEqual(previous['d'*64], 'drop')
++        m.observe_cost('disk', 10, count=15)  # disk now faster than recompute
++        status = m.publish_wave([0], 'warm')
++        self.assertGreater(status['readmission_preferences_changed'], 0)
++        self.assertNotEqual(previous['d'*64], m.assigned['d'*64])
++        self.assertEqual(status['new_hashes'], 0)
++        self.assertIn('note', status)  # does not claim a physical readmission
++
++    def test_random_scores_shuffle_preserves_marginal_population(self):
++        m = WaveBayesianMapper(
++            self.prior, 1, 10, 100, 100, self.scores, self.metadata, self.vpc,
++            random_score_seed=42)
++        old = self.mapper()
++        self.assertEqual(sorted({x for row in m.rows.values() for _, x in row}),
++                         sorted({x for row in old.rows.values() for _, x in row}))
++        self.assertNotEqual(m.rows[0], old.rows[0])
++        self.assertEqual(m.rows[0][0][1], m.rows[1][0][1])
++
++    def test_direct_cost_reader_completed_transfer_and_disk_stage(self):
++        from Hierarchical_KV.shortq_placement.bayesian_mapper import LmcacheCompletionCostReader
++        m = self.mapper()
++        log = self.dir / 'direct.log'
++        log.write_text('noise\n[BAYES_H2D_COMPLETE] request=a chunks=2 elapsed_ms=40.000\n'
++                       '[BAYES_L2_LOAD_COMPLETE] request=7 chunks=4 elapsed_ms=800.000\n')
++        r = LmcacheCompletionCostReader(log)
++        self.assertEqual(r.collect(m), {'h2d_completed': 1, 'disk_load_completed': 1})
++        self.assertEqual(m.cost_counts, {'cpu': 2, 'disk': 4})
++        self.assertAlmostEqual(m.estimated_cost('cpu'), 20)
++        self.assertAlmostEqual(m.estimated_cost('disk'), 360)
++        self.assertEqual(r.collect(m), {'h2d_completed': 0, 'disk_load_completed': 0})
++
++    def test_inflight_store_pin_survives_snapshot_change(self):
++        import importlib.util
++        import logging
++        import os
++        import sys
++        import types
++        from unittest.mock import patch
++        from Hierarchical_KV.shortq_placement.bayesian_mapper import atomic_json
++        path = (Path(__file__).resolve().parents[1] /
++                'third_party/LMCache/lmcache/v1/distributed/placement_metadata.py')
++        stub = types.ModuleType('lmcache')
++        stub_log = types.ModuleType('lmcache.logging')
++        stub_log.init_logger = lambda name: logging.getLogger(name)
++        with patch.dict(sys.modules, {'lmcache': stub, 'lmcache.logging': stub_log}), \
++             patch.dict(os.environ, {'LMCACHE_GNN_PLACEMENT_METADATA': str(self.metadata),
++                                     'LMCACHE_GNN_PLACEMENT_DYNAMIC': '1'}):
++            spec = importlib.util.spec_from_file_location('bayes_pin_test', path)
++            mod = importlib.util.module_from_spec(spec)
++            spec.loader.exec_module(mod)
++            h = bytes.fromhex('aa'*32)
++            atomic_json(self.metadata, {h.hex(): 'disk'})
++            self.assertEqual(mod.get_chunk_placement(h), 'disk')
++            mod.pin_store_intent(h, 'disk')
++            atomic_json(self.metadata, {h.hex(): 'cpu'})
++            mod._load_if_needed(force=True)
++            self.assertEqual(mod.get_store_intent(h), 'disk')
++            self.assertEqual(mod.get_chunk_placement(h), 'cpu')
++            mod.pin_store_intent(h, 'cpu')
++            self.assertEqual(mod.get_store_intent(h), 'cpu')
++
+ 
+ if __name__ == '__main__':
+     unittest.main()
+diff --git a/third_party/LMCache/lmcache/v1/distributed/placement_metadata.py b/third_party/LMCache/lmcache/v1/distributed/placement_metadata.py
+index 57c1351..a93f0d6 100644
+--- a/third_party/LMCache/lmcache/v1/distributed/placement_metadata.py
++++ b/third_party/LMCache/lmcache/v1/distributed/placement_metadata.py
+@@ -28,6 +28,33 @@ _loaded_stamp: tuple[int, int] | None = None
+ _last_stat_at = 0.0
+ _placements: dict[str, str] = {}
+ _missed: set[str] = set()
++# Capture the semantic destination when a newly computed object is staged in
++# host L1. Background L2 writes may complete after a new policy wave begins;
++# they must use this pinned decision, never a newer map snapshot.
++_staged_intents: dict[str, str] = {}
++_pin_lock = Lock()
++
++
++def pin_store_intent(chunk_hash: bytes, placement: str) -> None:
++    if placement not in _VALID_PLACEMENTS:
++        raise ValueError(placement)
++    key = bytes(chunk_hash).hex().lower()
++    with _pin_lock:
++        previous = _staged_intents.get(key)
++        _staged_intents[key] = placement
++    if previous is None:
++        logger.info("[BAYES_NEW_STORE_INTENT] chunk_hash=%s tier=%s", key, placement)
++    elif previous != placement:
++        logger.info("[BAYES_READMISSION_STORE] chunk_hash=%s from=%s to=%s",
++                    key, previous, placement)
++
++
++def get_store_intent(chunk_hash: bytes) -> str:
++    key = bytes(chunk_hash).hex().lower()
++    with _pin_lock:
++        old = _staged_intents.get(key)
++    return old if old is not None else get_chunk_placement(chunk_hash)
++
+ 
+ 
+ def _metadata_path() -> str:
+diff --git a/third_party/LMCache/lmcache/v1/distributed/storage_controllers/prefetch_controller.py b/third_party/LMCache/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
+index 2009b50..fcc1630 100644
+--- a/third_party/LMCache/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
++++ b/third_party/LMCache/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
+@@ -1810,6 +1810,15 @@ class PrefetchController(StorageControllerInterface):
+                 self._status_in_flight_count,
+             )
+ 
++        # [SC] Bayesian feedback: completed L2->L1 load stage, excluding
++        # prefetched L1 hits. This excludes H2D, which the device-completion
++        # callback measures separately. No extra synchronization or transfers.
++        if os.getenv("LMCACHE_BAYES_TIMING", "0") == "1" and loaded_keys and request.load_started_at > 0:
++            elapsed_ms = (time.monotonic() - request.load_started_at) * 1000.0
++            if elapsed_ms > 0:
++                logger.info("[BAYES_L2_LOAD_COMPLETE] request=%d chunks=%d elapsed_ms=%.6f",
++                            request.request_id, len(loaded_keys), elapsed_ms)
++
+         self._complete_request(request.request_id, retained)
+ 
+     # =========================================================================
+diff --git a/third_party/LMCache/lmcache/v1/distributed/storage_controllers/store_policy.py b/third_party/LMCache/lmcache/v1/distributed/storage_controllers/store_policy.py
+index 054aff1..ee07db5 100644
+--- a/third_party/LMCache/lmcache/v1/distributed/storage_controllers/store_policy.py
++++ b/third_party/LMCache/lmcache/v1/distributed/storage_controllers/store_policy.py
+@@ -249,9 +249,9 @@ class GNNDynamicStorePolicy(StorePolicy):
+ 
+     @staticmethod
+     def _placements(keys: list[ObjectKey]) -> dict[ObjectKey, str]:
+-        from lmcache.v1.distributed.placement_metadata import get_chunk_placement
++        from lmcache.v1.distributed.placement_metadata import get_store_intent
+ 
+-        return {key: get_chunk_placement(key.chunk_hash) for key in keys}
++        return {key: get_store_intent(key.chunk_hash) for key in keys}
+ 
+     def select_store_targets(
+         self,
+diff --git a/third_party/LMCache/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py b/third_party/LMCache/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
+index 25b3a23..d0b2086 100644
+--- a/third_party/LMCache/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
++++ b/third_party/LMCache/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
+@@ -208,8 +208,21 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
+             self._ctx.storage_manager.finish_read_prefetched,
+             payload_type=list[ObjectKey],
+         )
++        if _env_flag("LMCACHE_BAYES_TIMING"):
++            self._device_host_func_dispatcher.register(
++                "bayes_h2d_done", self._bayes_h2d_complete,
++                payload_type=tuple[float, int, str],
++            )
+         self._device_host_func_dispatcher.start()
+ 
++    @staticmethod
++    def _bayes_h2d_complete(payload: tuple[float, int, str]) -> None:
++        start, chunks, request = payload
++        elapsed_ms = (time.perf_counter() - start) * 1000.0
++        if chunks > 0 and elapsed_ms > 0:
++            logger.info("[BAYES_H2D_COMPLETE] request=%s chunks=%d elapsed_ms=%.6f",
++                        request, chunks, elapsed_ms)
++
+     def register_host_func(self, kind: str, handler: Any, payload_type: Any) -> None:
+         """Register *handler* for *kind* on the per-process device host-func
+         dispatcher (stream-ordered callbacks without a driver-thread GIL
+@@ -749,6 +762,13 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
+                         keys_to_reserve, layout_desc, "new"
+                     )
+                     all_dict.update(reserved_dict)
++                    if placements is not None and reserved_dict and _env_flag("LMCACHE_BAYES_READMISSION"):
++                        from lmcache.v1.distributed.placement_metadata import pin_store_intent
++                        placements_for_keys = dict(zip(obj_keys, placements, strict=True))
++                        for new_obj in reserved_dict:
++                            intended = placements_for_keys[new_obj]
++                            if intended is not None:
++                                pin_store_intent(new_obj.chunk_hash, intended)
+                     if reserved_dict:
+                         total_bytes += next(
+                             iter(reserved_dict.values())
+@@ -1061,6 +1081,14 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
+                 retrieve_succeeded = False
+             finally:
+                 event_backend.record_event(event, cache_context.stream)
++                if prefetched_keys and _env_flag("LMCACHE_BAYES_TIMING"):
++                    # Callback is ordered AFTER the H2D copy on this GPU
++                    # stream; no global/device synchronize on serving path.
++                    submit_callback_to_stream(
++                        cache_context.cupy_stream,
++                        "bayes_h2d_done",
++                        (st, len(prefetched_keys), str(key.request_id)),
++                    )
+                 if prefetched_keys:
+                     submit_callback_to_stream(
+                         cache_context.cupy_stream,

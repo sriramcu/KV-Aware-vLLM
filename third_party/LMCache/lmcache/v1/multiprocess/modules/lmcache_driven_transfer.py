@@ -208,7 +208,20 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             self._ctx.storage_manager.finish_read_prefetched,
             payload_type=list[ObjectKey],
         )
+        if _env_flag("LMCACHE_BAYES_TIMING"):
+            self._device_host_func_dispatcher.register(
+                "bayes_h2d_done", self._bayes_h2d_complete,
+                payload_type=tuple[float, int, str],
+            )
         self._device_host_func_dispatcher.start()
+
+    @staticmethod
+    def _bayes_h2d_complete(payload: tuple[float, int, str]) -> None:
+        start, chunks, request = payload
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        if chunks > 0 and elapsed_ms > 0:
+            logger.info("[BAYES_H2D_COMPLETE] request=%s chunks=%d elapsed_ms=%.6f",
+                        request, chunks, elapsed_ms)
 
     def register_host_func(self, kind: str, handler: Any, payload_type: Any) -> None:
         """Register *handler* for *kind* on the per-process device host-func
@@ -749,6 +762,13 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         keys_to_reserve, layout_desc, "new"
                     )
                     all_dict.update(reserved_dict)
+                    if placements is not None and reserved_dict and _env_flag("LMCACHE_BAYES_READMISSION"):
+                        from lmcache.v1.distributed.placement_metadata import pin_store_intent
+                        placements_for_keys = dict(zip(obj_keys, placements, strict=True))
+                        for new_obj in reserved_dict:
+                            intended = placements_for_keys[new_obj]
+                            if intended is not None:
+                                pin_store_intent(new_obj, intended)
                     if reserved_dict:
                         total_bytes += next(
                             iter(reserved_dict.values())
@@ -1061,6 +1081,14 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 retrieve_succeeded = False
             finally:
                 event_backend.record_event(event, cache_context.stream)
+                if prefetched_keys and _env_flag("LMCACHE_BAYES_TIMING"):
+                    # Callback is ordered AFTER the H2D copy on this GPU
+                    # stream; no global/device synchronize on serving path.
+                    submit_callback_to_stream(
+                        cache_context.cupy_stream,
+                        "bayes_h2d_done",
+                        (st, len(prefetched_keys), str(key.request_id)),
+                    )
                 if prefetched_keys:
                     submit_callback_to_stream(
                         cache_context.cupy_stream,

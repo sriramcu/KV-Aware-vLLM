@@ -1810,6 +1810,15 @@ class PrefetchController(StorageControllerInterface):
                 self._status_in_flight_count,
             )
 
+        # [SC] Bayesian feedback: completed L2->L1 load stage, excluding
+        # prefetched L1 hits. This excludes H2D, which the device-completion
+        # callback measures separately. No extra synchronization or transfers.
+        if os.getenv("LMCACHE_BAYES_TIMING", "0") == "1" and loaded_keys and request.load_started_at > 0:
+            elapsed_ms = (time.monotonic() - request.load_started_at) * 1000.0
+            if elapsed_ms > 0:
+                logger.info("[BAYES_L2_LOAD_COMPLETE] request=%d chunks=%d elapsed_ms=%.6f",
+                            request.request_id, len(loaded_keys), elapsed_ms)
+
         self._complete_request(request.request_id, retained)
 
     # =========================================================================

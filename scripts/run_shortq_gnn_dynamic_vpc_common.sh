@@ -173,6 +173,30 @@ PLACEMENT_TRACE="${PLACEMENT_DIR}/gnn_chunk_placements.jsonl"
 HASH_PREDICTION_TRACE="${PLACEMENT_DIR}/gnn_hash_prediction_occurrences.jsonl"
 GNN_TIMING_TRACE="${PLACEMENT_DIR}/gnn_prediction_timing.jsonl"
 PLACEMENT_SUMMARY="${PLACEMENT_DIR}/gnn_placement_summary.json"
+KV_BAYES_ENABLE="${KV_BAYES_ENABLE:-0}"
+KV_BAYES_PRIOR_WEIGHT="${KV_BAYES_PRIOR_WEIGHT:-1}"
+KV_BAYES_PRIOR_FILE="${KV_BAYES_PRIOR_FILE:-${REPO}/Hierarchical_KV/shortq_placement/priors/rank_example.json}"
+KV_BAYES_SCORE_FILE="${PLACEMENT_DIR}/gnn_chunk_scores.jsonl"
+KV_BAYES_GPU_GB="${KV_BAYES_GPU_GB:-10}"
+KV_BAYES_DISK_GB="${KV_BAYES_DISK_GB:-100}"
+KV_BAYES_USE_COST_PROXIES="${KV_BAYES_USE_COST_PROXIES:-0}"
+KV_BAYES_DIRECT_COST_FEEDBACK="${KV_BAYES_DIRECT_COST_FEEDBACK:-0}"
+KV_BAYES_POSTERIOR_MODE="${KV_BAYES_POSTERIOR_MODE:-fixed}"
+KV_BAYES_SCORE_PRIOR_COUNT="${KV_BAYES_SCORE_PRIOR_COUNT:-10}"
+KV_BAYES_COST_PRIOR_COUNT="${KV_BAYES_COST_PRIOR_COUNT:-5}"
+KV_BAYES_READMISSION="${KV_BAYES_READMISSION:-1}"
+KV_BAYES_RANDOM_SCORE_SEED="${KV_BAYES_RANDOM_SCORE_SEED:-}"
+if [[ "$KV_BAYES_ENABLE" == "1" ]]; then
+  export LMCACHE_BAYES_TIMING="$KV_BAYES_DIRECT_COST_FEEDBACK"
+  export LMCACHE_BAYES_READMISSION="$KV_BAYES_READMISSION"
+fi
+if [[ "$KV_BAYES_ENABLE" == "1" ]]; then
+  export LMCACHE_GNN_PLACEMENT_DYNAMIC=1 VLLM_KV_IMPORTANCE_DYNAMIC=1
+  SMOKE_FORCE_MIN_UNIQUE_PER_PLACEMENT=0
+  [[ -f "$KV_BAYES_PRIOR_FILE" ]] || {
+    echo "Missing Bayesian prior JSON: $KV_BAYES_PRIOR_FILE" >&2; exit 2;
+  }
+fi
 CLEAN_OLD_LMCACHE="${CLEAN_OLD_LMCACHE:-1}"
 FOREIGN_MPS_MAX_MIB="${FOREIGN_MPS_MAX_MIB:-64}"
 
@@ -303,6 +327,15 @@ wait_health() {
   return 1
 }
 
+{ echo "job_id=${SLURM_JOB_ID:-unset}";
+  echo "cpus_per_task=${SLURM_CPUS_PER_TASK:-unset}";
+  echo "nproc=$(nproc)";
+  taskset -pc $$ || true;
+  scontrol show job "${SLURM_JOB_ID:-}" 2>/dev/null | grep -E 'NumCPUs=|ReqTRES=|AllocTRES=' || true;
+  git rev-parse HEAD 2>/dev/null || true;
+  git status --short 2>/dev/null || true;
+} > "${RUN_DIR}/slurm_and_source.txt"
+
 cat > "${RUN_DIR}/run_config.json" <<JSON
 {
   "profile": "$PROFILE",
@@ -350,11 +383,28 @@ cat > "${RUN_DIR}/run_config.json" <<JSON
   "chunk_vote": $GNN_CHUNK_VOTE_CONFIG_JSON,
   "runtime_metadata": "$RUNTIME_METADATA",
   "vpc_importance_sidecar": "$VPC_IMPORTANCE_SIDECAR",
+  "bayesian_enabled": $KV_BAYES_ENABLE,
+  "bayes_prior_weight": $KV_BAYES_PRIOR_WEIGHT,
+  "bayes_prior_file": "$KV_BAYES_PRIOR_FILE",
+  "bayes_score_file": "$KV_BAYES_SCORE_FILE",
+  "bayes_gpu_gb": $KV_BAYES_GPU_GB,
+  "bayes_disk_gb": $KV_BAYES_DISK_GB,
+  "bayes_cost_observation_proxies": $KV_BAYES_USE_COST_PROXIES,
+  "bayes_direct_timing": $KV_BAYES_DIRECT_COST_FEEDBACK,
+  "bayes_readmission": $KV_BAYES_READMISSION,
+  "bayes_posterior_mode": "$KV_BAYES_POSTERIOR_MODE",
+  "bayes_score_prior_count": $KV_BAYES_SCORE_PRIOR_COUNT,
+  "bayes_cost_prior_count": $KV_BAYES_COST_PRIOR_COUNT,
+  "bayes_random_score_seed": "$KV_BAYES_RANDOM_SCORE_SEED",
   "gnn_inference_batch_size": $GNN_INFERENCE_BATCH_SIZE,
   "smoke_force_min_unique_per_placement": $SMOKE_FORCE_MIN_UNIQUE_PER_PLACEMENT
 }
 JSON
 
+BAYES_PRECOMPUTE_ARGS=()
+if [[ "$KV_BAYES_ENABLE" == "1" ]]; then
+  BAYES_PRECOMPUTE_ARGS=(--bayes_scores_only --bayes_score_file "$KV_BAYES_SCORE_FILE")
+fi
 echo "===== SHORT-Q PRECOMPUTE ($PROFILE) ====="
 python experiments/precompute_shortq_placements.py \
   --dataset_name "$DATASET_NAME" --max_questions "$NUM_QUESTIONS" --retrieval_top_k "$RETRIEVAL_TOP_K" \
@@ -367,8 +417,19 @@ python experiments/precompute_shortq_placements.py \
   --placement_trace "$PLACEMENT_TRACE" --hash_prediction_trace "$HASH_PREDICTION_TRACE" \
   --timing_trace "$GNN_TIMING_TRACE" --summary "$PLACEMENT_SUMMARY" \
   --smoke_force_min_unique_per_placement "$SMOKE_FORCE_MIN_UNIQUE_PER_PLACEMENT" \
+  "${BAYES_PRECOMPUTE_ARGS[@]}" \
   > "${LOG_DIR}/gnn_precompute.log" 2>&1
 
+if [[ "$KV_BAYES_ENABLE" == "1" ]]; then
+  python - "$KV_BAYES_SCORE_FILE" "$NUM_QUESTIONS" <<'PY'
+import json, sys
+rows=[json.loads(x) for x in open(sys.argv[1]) if x.strip()]
+assert len(rows)==int(sys.argv[2]), (len(rows),sys.argv[2])
+assert all(isinstance(row['chunks'],list) and row['chunks'] for row in rows)
+print('[BAYES_SCORES_READY] requests=',len(rows),
+      'chunks=',sum(len(row['chunks']) for row in rows))
+PY
+else
 python - "$RUNTIME_METADATA" "$VPC_IMPORTANCE_SIDECAR" "$PLACEMENT_SUMMARY" <<'PY'
 import json, sys
 runtime=json.load(open(sys.argv[1])); sidecar=json.load(open(sys.argv[2])); summary=json.load(open(sys.argv[3]))
@@ -380,6 +441,7 @@ print('placement_entries', len(runtime))
 print('placement_counts', summary['unique_runtime_placement_counts'])
 print('vpc_sidecar_requests', len(sidecar))
 PY
+fi
 
 L2_JSON=$(python - "$L2_DIR" "$KV_FS_SHARED_WORKERS" \
   "$KV_FS_LOOKUP_WORKERS" "$KV_FS_RETRIEVE_WORKERS" \
@@ -466,6 +528,35 @@ DARGS=(
   --deterministic_request_ids --output_dir "$RESULT_DIR"
 )
 
+if [[ "$KV_BAYES_ENABLE" == "1" ]]; then
+  DARGS+=(
+    --bayes_score_file "$KV_BAYES_SCORE_FILE"
+    --bayes_prior_file "$KV_BAYES_PRIOR_FILE"
+    --bayes_prior_weight "$KV_BAYES_PRIOR_WEIGHT"
+    --bayes_posterior_mode "$KV_BAYES_POSTERIOR_MODE"
+    --bayes_score_prior_count "$KV_BAYES_SCORE_PRIOR_COUNT"
+    --bayes_cost_prior_count "$KV_BAYES_COST_PRIOR_COUNT"
+    --bayes_gpu_gb "$KV_BAYES_GPU_GB"
+    --bayes_cpu_gb "$L1_GB"
+    --bayes_disk_gb "$KV_BAYES_DISK_GB"
+    --bayes_metadata_file "$RUNTIME_METADATA"
+    --bayes_vpc_file "$VPC_IMPORTANCE_SIDECAR"
+    --bayes_lmcache_log "${LOG_DIR}/lmcache.log"
+  )
+  if [[ "$KV_BAYES_USE_COST_PROXIES" == "1" ]]; then
+    DARGS+=(--bayes_use_cost_proxies)
+  fi
+  if [[ "$KV_BAYES_DIRECT_COST_FEEDBACK" == "1" ]]; then
+    DARGS+=(--bayes_direct_cost_feedback)
+  fi
+  if [[ "$KV_BAYES_READMISSION" == "1" ]]; then
+    DARGS+=(--bayes_readmission)
+  fi
+  if [[ -n "$KV_BAYES_RANDOM_SCORE_SEED" ]]; then
+    DARGS+=(--bayes_random_score_seed "$KV_BAYES_RANDOM_SCORE_SEED")
+  fi
+fi
+
 if [[ "$KV_COLD_WARM_STORE_BARRIER" == "1" ]]; then
   DARGS+=(
     --between_phases_store_barrier
@@ -534,7 +625,7 @@ if aware:
 else:
     assert '[GNN_AWARE_VPC_INIT]' not in vl, 'GNN-aware VPC initialized while gate is off'
 
-if profile.endswith('_smoke'):
+if profile.endswith('_smoke') and __import__('os').environ.get('KV_BAYES_ENABLE') != '1':
     counts=placement['unique_runtime_placement_counts']
     assert all(counts.get(t,0) >= 2 for t in ('gpu','cpu','disk')), counts
     if aware:
@@ -550,6 +641,12 @@ if profile.endswith('_smoke'):
         'smoke never persisted a CPU-labelled chunk in L1'
     assert '[GNN_DYNAMIC_L2_COMMIT]' in lm, 'smoke never completed an L2 commit'
     print('GNN_DYNAMIC_VPC_SMOKE_PASS')
+if __import__('os').environ.get('KV_BAYES_ENABLE') == '1':
+    from pathlib import Path
+    dyn=json.loads(Path(__import__('os').environ['LMCACHE_GNN_PLACEMENT_METADATA']).read_text())
+    assert dyn and all(t in ('gpu','cpu','disk','drop') for t in dyn.values())
+    assert (results/'bayes_wave_history.json').exists()
+    print('BAYES_WAVE_RUN_PASS', len(dyn))
 print('GNN_DYNAMIC_VPC_RUN_PASS')
 PY
 

@@ -249,16 +249,25 @@ class GNNDynamicStorePolicy(StorePolicy):
 
     @staticmethod
     def _placements(keys: list[ObjectKey]) -> dict[ObjectKey, str]:
-        from lmcache.v1.distributed.placement_metadata import get_chunk_placement
+        from lmcache.v1.distributed.placement_metadata import get_store_intent
 
-        return {key: get_chunk_placement(key.chunk_hash) for key in keys}
+        return {key: get_store_intent(key) for key in keys}
 
     def select_store_targets(
         self,
         keys: list[ObjectKey],
         adapters: list[AdapterDescriptor],
     ) -> dict[int, list[ObjectKey]]:
-        placements = self._placements(keys)
+        return self.select_store_targets_with_intents(
+            keys, adapters, self._placements(keys))
+
+    def select_store_targets_with_intents(
+        self,
+        keys: list[ObjectKey],
+        adapters: list[AdapterDescriptor],
+        placements: dict[ObjectKey, str],
+    ) -> dict[int, list[ObjectKey]]:
+        """Route according to one snapshot, shared with async completion."""
         if self._l2_backing:
             l2_keys = list(keys)
         else:
@@ -283,7 +292,11 @@ class GNNDynamicStorePolicy(StorePolicy):
         return {ad.index: list(l2_keys) for ad in adapters if l2_keys}
 
     def select_l1_deletions(self, keys: list[ObjectKey]) -> list[ObjectKey]:
-        placements = self._placements(keys)
+        return self.select_l1_deletions_with_intents(keys, self._placements(keys))
+
+    def select_l1_deletions_with_intents(
+        self, keys: list[ObjectKey], placements: dict[ObjectKey, str]
+    ) -> list[ObjectKey]:
         deletions = [key for key in keys if placements[key] == "disk"]
         if keys:
             logger.info(
@@ -298,9 +311,14 @@ class GNNDynamicStorePolicy(StorePolicy):
     def select_l1_deletions_on_store_skip(
         self, keys: list[ObjectKey]
     ) -> list[ObjectKey]:
+        return self.select_l1_deletions_on_store_skip_with_intents(
+            keys, self._placements(keys))
+
+    def select_l1_deletions_on_store_skip_with_intents(
+        self, keys: list[ObjectKey], placements: dict[ObjectKey, str]
+    ) -> list[ObjectKey]:
         # A skipped true-disk object was admitted to L1 only as L2 staging.
         # gpu/cpu placements retain their fast-tier backing copy.
-        placements = self._placements(keys)
         deletions = [key for key in keys if placements[key] == "disk"]
         if keys:
             logger.info(

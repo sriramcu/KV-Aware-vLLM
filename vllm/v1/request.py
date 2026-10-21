@@ -38,8 +38,8 @@ if TYPE_CHECKING:
 
 
 # [SC] Short-Q placement sidecar helpers.
-@lru_cache(maxsize=4)
-def _read_kv_importance_sidecar(path: str) -> dict[str, Any]:
+@lru_cache(maxsize=8)
+def _read_kv_importance_sidecar(path: str, version: tuple[int, int] | None = None) -> dict[str, Any]:
     """Read a stable experiment sidecar once per engine process.
 
     The Short-Q serving experiments generate this file before vLLM starts, so
@@ -89,7 +89,15 @@ def _load_kv_importance_placements(request_id: str) -> dict[int, str]:
     if not path:
         return {}
 
-    all_placements = _read_kv_importance_sidecar(path)
+    if os.environ.get("VLLM_KV_IMPORTANCE_DYNAMIC", "0") == "1":
+        try:
+            st = os.stat(path)
+            version = (st.st_ino, st.st_mtime_ns)
+        except OSError:
+            version = None
+        all_placements = _read_kv_importance_sidecar(path, version)
+    else:
+        all_placements = _read_kv_importance_sidecar(path)
     raw_placements: Any = {}
     for key in _kv_importance_sidecar_keys(request_id):
         candidate = all_placements.get(key)

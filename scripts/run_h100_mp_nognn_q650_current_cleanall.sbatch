@@ -51,6 +51,14 @@ reserve_unique_run_dir() {
 }
 
 RUN_DIR="$(reserve_unique_run_dir "${RUN_ROOT}/h100_nognn_q650_${GRID_LABEL}_${SLURM_JOB_ID}")"
+{ echo "job_id=${SLURM_JOB_ID:-unset}";
+  echo "cpus_per_task=${SLURM_CPUS_PER_TASK:-unset}";
+  echo "nproc=$(nproc)";
+  taskset -pc $$ || true;
+  scontrol show job "${SLURM_JOB_ID:-}" 2>/dev/null | grep -E 'NumCPUs=|ReqTRES=|AllocTRES=' || true;
+  git -C /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM rev-parse HEAD 2>/dev/null || true;
+  git -C /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM status --short 2>/dev/null || true;
+} > "${RUN_DIR}/slurm_and_source.txt"
 LOG_DIR="${RUN_DIR}/logs"
 RESULT_DIR="${RUN_DIR}/results"
 export VLLM_PHASE_TRACE="${VLLM_PHASE_TRACE:-0}"

@@ -40,7 +40,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 import numpy as np
 import pandas as pd
@@ -465,6 +465,8 @@ def generate_in_submission_batches_http(
     policy: RequestPolicy,
     result_file,
     deterministic_request_ids: bool = False,
+    before_wave: Callable[[list[int], str], None] | None = None,
+    after_wave: Callable[[list[int], str], None] | None = None,
 ) -> tuple[list[dict[str, Any]], float]:
     """
     Match the legacy bounded-wave behavior.
@@ -485,6 +487,9 @@ def generate_in_submission_batches_http(
         end_idx = min(start_idx + submission_batch_size, total)
         batch = records[start_idx:end_idx]
         batch_number = start_idx // submission_batch_size + 1
+        source_indices = [r.source_index for r in batch]
+        if before_wave is not None:
+            before_wave(source_indices, phase_name)
 
         print(
             f"[{phase_name}] Submitting batch {batch_number}/{total_batches}: "
@@ -585,6 +590,9 @@ def generate_in_submission_batches_http(
                     f"status={result['http_status']} "
                     f"error={result.get('error')}"
                 )
+
+        if after_wave is not None:
+            after_wave(source_indices, phase_name)
 
         print(
             f"[{phase_name}] Finished batch {batch_number}/{total_batches} "
@@ -1103,6 +1111,24 @@ def parse_arguments():
         default="",
         help="Optional vLLM /metrics snapshot after the store barrier and before warm.",
     )
+    parser.add_argument("--bayes_score_file", default="",
+                        help="Enable wave-level mapper using precomputed hash scores")
+    parser.add_argument("--bayes_prior_file", default="")
+    parser.add_argument("--bayes_prior_weight", type=float, default=1.0)
+    parser.add_argument("--bayes_posterior_mode", choices=("fixed", "pseudo_count"), default="fixed")
+    parser.add_argument("--bayes_score_prior_count", type=float, default=10.0)
+    parser.add_argument("--bayes_cost_prior_count", type=float, default=5.0)
+    parser.add_argument("--bayes_readmission", action="store_true")
+    parser.add_argument("--bayes_random_score_seed", type=int, default=None)
+    parser.add_argument("--bayes_direct_cost_feedback", action="store_true")
+    parser.add_argument("--bayes_gpu_gb", type=float, default=10.0)
+    parser.add_argument("--bayes_cpu_gb", type=float, default=225.0)
+    parser.add_argument("--bayes_disk_gb", type=float, default=100.0)
+    parser.add_argument("--bayes_metadata_file", default="")
+    parser.add_argument("--bayes_vpc_file", default="")
+    parser.add_argument("--bayes_lmcache_log", default="")
+    parser.add_argument("--bayes_use_cost_proxies", action="store_true",
+                        help="EXPERIMENTAL: use nonexclusive LMCache log timing proxies")
     parser.add_argument("--output_dir", required=True)
     parser.add_argument(
         "--metrics_after_cold_path",
@@ -1296,6 +1322,66 @@ def main():
         for source_index in warm_source_indices
     ]
 
+    bayes_mapper = None
+    bayes_reader = None
+    if args.bayes_score_file:
+        from Hierarchical_KV.shortq_placement.bayesian_mapper import (
+            WaveBayesianMapper, LmcacheLogCostReader, LmcacheCompletionCostReader, atomic_json,
+        )
+        required = (args.bayes_prior_file, args.bayes_metadata_file, args.bayes_vpc_file)
+        if any(not x for x in required):
+            raise ValueError("Bayesian mode requires prior, metadata, and VPC file paths")
+        bayes_mapper = WaveBayesianMapper(
+            args.bayes_prior_file, args.bayes_prior_weight,
+            args.bayes_gpu_gb, args.bayes_cpu_gb, args.bayes_disk_gb,
+            args.bayes_score_file, args.bayes_metadata_file, args.bayes_vpc_file,
+            posterior_mode=args.bayes_posterior_mode,
+            score_prior_count=args.bayes_score_prior_count,
+            cost_prior_count=args.bayes_cost_prior_count,
+            readmission=args.bayes_readmission,
+            random_score_seed=args.bayes_random_score_seed,
+        )
+        if set(bayes_mapper.rows) != set(range(num_requests)):
+            raise ValueError("score-file request indices differ from serving requests")
+        if args.bayes_use_cost_proxies and args.bayes_direct_cost_feedback:
+            raise ValueError("choose direct timing or old log proxies, not both")
+        if args.bayes_use_cost_proxies or args.bayes_direct_cost_feedback:
+            if not args.bayes_lmcache_log:
+                raise ValueError("cost feedback requires --bayes_lmcache_log")
+            bayes_reader = (LmcacheCompletionCostReader(args.bayes_lmcache_log)
+                            if args.bayes_direct_cost_feedback else
+                            LmcacheLogCostReader(args.bayes_lmcache_log))
+        print("[BAYES_INIT] " + json.dumps({
+            "score_file": args.bayes_score_file, "prior_file": args.bayes_prior_file,
+            "prior_weight": args.bayes_prior_weight, "capacities_gb": bayes_mapper.capacities,
+            "posterior_mode": args.bayes_posterior_mode,
+            "readmission": args.bayes_readmission,
+            "score_prior_count": args.bayes_score_prior_count,
+            "cost_prior_count": args.bayes_cost_prior_count,
+            "random_score_seed": args.bayes_random_score_seed,
+            "cost_observations": ("completed_transfer" if args.bayes_direct_cost_feedback
+                                  else "log_proxies" if bayes_reader else "prior_only"),
+        }, sort_keys=True), flush=True)
+
+    def _bayes_before_wave(sources: list[int], phase: str) -> None:
+        assert bayes_mapper is not None
+        status = bayes_mapper.publish_wave(sources, phase)
+        # LMCache workers throttle metadata stat checks to 250 ms. Since
+        # snapshots change only between waves, wait for this window to elapse
+        # before submitting requests that introduce newly mapped hashes.
+        time.sleep(0.30)
+        print("[BAYES_WAVE_PUBLISH] " + json.dumps(status, sort_keys=True), flush=True)
+
+    def _bayes_after_wave(sources: list[int], phase: str) -> None:
+        assert bayes_mapper is not None
+        bayes_mapper.observe_scores(sources)
+        observed = bayes_reader.collect(bayes_mapper) if bayes_reader else {}
+        atomic_json(out_dir / "bayes_wave_history.json", bayes_mapper.profiles)
+        print("[BAYES_WAVE_OBSERVE] " + json.dumps({
+            "phase": phase, "new_score_samples": len(bayes_mapper.seen_scores),
+            "cost_observations": observed, "cost_sample_counts": bayes_mapper.cost_counts,
+        }, sort_keys=True), flush=True)
+
     print("Cold run starting...", flush=True)
 
     with (out_dir / "cold_results.jsonl").open(
@@ -1317,6 +1403,8 @@ def main():
                 policy=policy,
                 result_file=f,
                 deterministic_request_ids=args.deterministic_request_ids,
+                before_wave=_bayes_before_wave if bayes_mapper else None,
+                after_wave=_bayes_after_wave if bayes_mapper else None,
             )
         )
 
@@ -1403,6 +1491,8 @@ def main():
                 policy=policy,
                 result_file=f,
                 deterministic_request_ids=args.deterministic_request_ids,
+                before_wave=_bayes_before_wave if bayes_mapper else None,
+                after_wave=_bayes_after_wave if bayes_mapper else None,
             )
         )
 

@@ -1,0 +1,7 @@
+{
+  "comment": "ILLUSTRATIVE UNCALIBRATED PRIOR for future native 0-100 chunk scores. NOT measured.",
+  "score_format": "native_chunk_score_0_100",
+  "score_bin_edges": [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100],
+  "score_bin_probabilities": [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1],
+  "cost_prior_ms": {"cpu": 20, "disk": 500, "recompute": 100}
+}

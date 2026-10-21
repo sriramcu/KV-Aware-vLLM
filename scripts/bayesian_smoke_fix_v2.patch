@@ -1,0 +1,153 @@
+diff --git a/Hierarchical_KV/shortq_placement/priors/rank_smoke_diagnostic.json b/Hierarchical_KV/shortq_placement/priors/rank_smoke_diagnostic.json
+new file mode 100644
+index 0000000..59e7313
+--- /dev/null
++++ b/Hierarchical_KV/shortq_placement/priors/rank_smoke_diagnostic.json
+@@ -0,0 +1,38 @@
++{
++  "comment": "SMOKE TEST ONLY. Quantile-like score bin edges were selected from the previous Q12 run; NOT an independent prior, not suitable for Q650/paper benchmarks. Timing priors remain hypothetical.",
++  "score_format": "mean_32_block_rank_scores",
++  "score_bin_edges": [
++    -0.53,
++    -0.43,
++    -0.41,
++    -0.38,
++    -0.36,
++    -0.335,
++    -0.323,
++    -0.307,
++    -0.288,
++    -0.263,
++    -0.252,
++    -0.225,
++    -0.19
++  ],
++  "score_bin_probabilities": [
++    1,
++    1,
++    1,
++    1,
++    1,
++    1,
++    1,
++    1,
++    1,
++    1,
++    1,
++    1
++  ],
++  "cost_prior_ms": {
++    "cpu": 20,
++    "disk": 500,
++    "recompute": 100
++  }
++}
+diff --git a/scripts/run_h100_bayes_canonical_smoke.sh b/scripts/run_h100_bayes_canonical_smoke.sh
+index 97c3435..95fb439 100755
+--- a/scripts/run_h100_bayes_canonical_smoke.sh
++++ b/scripts/run_h100_bayes_canonical_smoke.sh
+@@ -22,6 +22,10 @@ export EXPERIMENT_LABEL="${EXPERIMENT_LABEL:-bayes_canonical_smoke}"
+ export KV_BAYES_GPU_GB="${KV_BAYES_GPU_GB:-10}"
+ export KV_BAYES_DISK_GB="${KV_BAYES_DISK_GB:-100}"
+ export KV_BAYES_PRIOR_WEIGHT="${KV_BAYES_PRIOR_WEIGHT:-1}"
++# This narrowly binned prior is diagnostic only: derived from the initial
++# Q12 smoke score range, not an independently calibrated production prior.
++SMOKE_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++export KV_BAYES_PRIOR_FILE="${KV_BAYES_PRIOR_FILE:-${SMOKE_REPO}/Hierarchical_KV/shortq_placement/priors/rank_smoke_diagnostic.json}"
+ # Default is prior-only: LMCache diagnostic log intervals are not exclusive GET costs.
+ export KV_BAYES_USE_COST_PROXIES="${KV_BAYES_USE_COST_PROXIES:-0}"
+ exec bash /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM/scripts/run_shortq_gnn_dynamic_vpc_common.sh
+diff --git a/tests/test_bayesian_mapper_cpu.py b/tests/test_bayesian_mapper_cpu.py
+index 1ac9ac2..2a3e1ae 100644
+--- a/tests/test_bayesian_mapper_cpu.py
++++ b/tests/test_bayesian_mapper_cpu.py
+@@ -138,6 +138,55 @@ class BayesianMapperTests(unittest.TestCase):
+             time.sleep(.28)
+             self.assertEqual(module.get_chunk_placement(bytes.fromhex('aa')), 'disk')
+ 
++    def test_missing_hash_bypasses_refresh_throttle_in_two_workers(self):
++        """New-wave hashes must never fall back to disk due to cached metadata."""
++        import importlib.util
++        import logging
++        import os
++        import sys
++        import types
++        from unittest.mock import patch
++        from Hierarchical_KV.shortq_placement.bayesian_mapper import atomic_json
++
++        path = (Path(__file__).resolve().parents[1] /
++                'third_party/LMCache/lmcache/v1/distributed/placement_metadata.py')
++        stub = types.ModuleType('lmcache')
++        stub_log = types.ModuleType('lmcache.logging')
++        stub_log.init_logger = lambda name: logging.getLogger(name)
++        with patch.dict(sys.modules, {'lmcache': stub, 'lmcache.logging': stub_log}), \
++             patch.dict(os.environ, {'LMCACHE_GNN_PLACEMENT_METADATA': str(self.metadata),
++                                     'LMCACHE_GNN_PLACEMENT_DYNAMIC': '1'}):
++            workers = []
++            for n in range(2):
++                spec = importlib.util.spec_from_file_location(f'test_worker_{n}', path)
++                worker = importlib.util.module_from_spec(spec)
++                spec.loader.exec_module(worker)
++                workers.append(worker)
++            a, b, c = ('aa' * 32, 'bb' * 32, 'cc' * 32)
++            atomic_json(self.metadata, {a: 'cpu'})
++            for worker in workers:
++                self.assertEqual(worker.get_chunk_placement(bytes.fromhex(a)), 'cpu')
++            # Publish two successive waves without waiting for the 250-ms poll.
++            atomic_json(self.metadata, {a: 'cpu', b: 'gpu'})
++            for worker in workers:
++                self.assertEqual(worker.get_chunk_placement(bytes.fromhex(b)), 'gpu')
++            atomic_json(self.metadata, {a: 'cpu', b: 'gpu', c: 'drop'})
++            for worker in workers:
++                self.assertEqual(worker.get_chunk_placement(bytes.fromhex(c)), 'drop')
++                self.assertEqual(len(worker._missed), 0)
++            self.assertEqual(workers[0].get_chunk_placement(bytes.fromhex('dd' * 32)), 'disk')
++
++    def test_smoke_prior_discriminates_raw_rank_scores(self):
++        root = Path(__file__).resolve().parents[1]
++        prior = root / 'Hierarchical_KV/shortq_placement/priors/rank_smoke_diagnostic.json'
++        m = WaveBayesianMapper(prior, 1, 10, 225, 100,
++                              self.scores, self.metadata, self.vpc)
++        candidates = [m._tier(m.percentile(score), m.bands())
++                      for score in (-.52, -.4, -.30, -.20)]
++        self.assertGreaterEqual(len(set(candidates)), 3)
++        self.assertEqual(candidates[0], 'drop')
++        self.assertEqual(candidates[-1], 'gpu')
++
+     def test_log_cost_proxies_opt_in(self):
+         m = self.mapper()
+         log = self.dir / 'lm.log'
+diff --git a/third_party/LMCache/lmcache/v1/distributed/placement_metadata.py b/third_party/LMCache/lmcache/v1/distributed/placement_metadata.py
+index f87ad24..57c1351 100644
+--- a/third_party/LMCache/lmcache/v1/distributed/placement_metadata.py
++++ b/third_party/LMCache/lmcache/v1/distributed/placement_metadata.py
+@@ -34,14 +34,14 @@ def _metadata_path() -> str:
+     return os.getenv("LMCACHE_GNN_PLACEMENT_METADATA", "").strip()
+ 
+ 
+-def _load_if_needed() -> None:
++def _load_if_needed(*, force: bool = False) -> None:
+     global _loaded_path, _loaded_stamp, _last_stat_at, _placements
+     path = _metadata_path()
+     dynamic = os.getenv("LMCACHE_GNN_PLACEMENT_DYNAMIC", "0") == "1"
+     # Existing static behavior is unchanged unless the new env flag is on.
+     if not dynamic and path == _loaded_path:
+         return
+-    if dynamic and path == _loaded_path and time.monotonic() - _last_stat_at < 0.25:
++    if dynamic and not force and path == _loaded_path and time.monotonic() - _last_stat_at < 0.25:
+         return
+     with _lock:
+         if not dynamic and path == _loaded_path:
+@@ -79,6 +79,12 @@ def get_chunk_placement(
+     _load_if_needed()
+     key = bytes(chunk_hash).hex().lower()
+     placement = _placements.get(key)
++    if placement is None and os.getenv("LMCACHE_GNN_PLACEMENT_DYNAMIC", "0") == "1":
++        # A new wave may be published inside the 250-ms stat throttle.
++        # Unknown hashes must not fall back to disk based on a stale snapshot.
++        # Re-stat immediately (serialized under _lock) and retry the lookup.
++        _load_if_needed(force=True)
++        placement = _placements.get(key)
+     if placement is not None:
+         return placement
+     default = missing_default.lower()

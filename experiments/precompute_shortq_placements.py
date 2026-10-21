@@ -88,6 +88,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     p.add_argument("--inference_batch_size", type=int, default=1)
     p.add_argument("--runtime_metadata", required=True)
+    p.add_argument("--bayes_scores_only", action="store_true",
+                   help="Export prefix-hash chunk scores only; mapper assigns tiers during serving")
+    p.add_argument("--bayes_score_file", default="", help="JSONL chunk-score artifact")
     p.add_argument(
         "--vpc_importance_sidecar",
         default="",
@@ -414,6 +417,7 @@ def main() -> None:
     random_placement_summary: dict[str, Any] | None = None
 
     occurrences: list[dict[str, Any]] = []
+    bayes_score_rows: list[dict[str, Any]] = []
     hash_prediction_rows: list[dict[str, Any]] = []
     timing_rows: list[dict[str, Any]] = []
     occurrence_placements: list[str] = []
@@ -540,6 +544,25 @@ def main() -> None:
 
             post_t0 = time.perf_counter()
             valid_blocks = int(block_mask[0].sum().item())
+            if args.bayes_scores_only:
+                # Mean of the 32 real 16-token block rank-head outputs per
+                # complete 512-token LMCache chunk. Incomplete tail excluded.
+                hashes = hasher.compute_chunk_hashes(serving_ids)
+                if len(hashes) != len(serving_ids) // args.chunk_size:
+                    raise AssertionError("LMCache hash/chunk alignment mismatch")
+                score_row = {"source_index": source_index, "chunks": []}
+                for chunk_index, chunk_hash in enumerate(hashes):
+                    lo = chunk_index * blocks_per_chunk
+                    hi = lo + blocks_per_chunk
+                    score = float(rank_scores[lo:hi].float().mean().item())
+                    if not math.isfinite(score):
+                        raise ValueError(f"nonfinite rank score source={source_index} chunk={chunk_index}")
+                    score_row["chunks"].append({"chunk_hash": chunk_hash.hex(), "score": score})
+                bayes_score_rows.append(score_row)
+                print(f"[BAYES_SCORE_PRECOMPUTE] source={source_index} "
+                      f"full_chunks={len(hashes)}", flush=True)
+                continue
+
             class_ids = get_block_predictions(
                 class_logits[:valid_blocks], rank_scores[:valid_blocks]
             ).tolist()
@@ -683,6 +706,16 @@ def main() -> None:
             )
 
     inference_seconds = time.monotonic() - inference_started
+    if args.bayes_scores_only:
+        if not args.bayes_score_file:
+            raise ValueError("--bayes_scores_only requires --bayes_score_file")
+        score_path = Path(args.bayes_score_file)
+        score_path.parent.mkdir(parents=True, exist_ok=True)
+        with score_path.open("w", encoding="utf-8") as f:
+            for row in bayes_score_rows:
+                f.write(json.dumps(row, sort_keys=True) + "\n")
+        if len(bayes_score_rows) != len(prompts):
+            raise AssertionError("missing GNN score rows")
     peak_cuda_memory_bytes = (
         int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else None
     )
@@ -830,6 +863,8 @@ def main() -> None:
         "conflict_occurrences": conflict_occurrences,
         "smoke_force_min_unique_per_placement": args.smoke_force_min_unique_per_placement,
         "smoke_runtime_overrides": smoke_overrides,
+        "bayes_scores_only": args.bayes_scores_only,
+        "bayes_score_file": args.bayes_score_file or None,
         "runtime_metadata": str(runtime_path),
         "vpc_importance_sidecar": args.vpc_importance_sidecar or None,
         "placement_trace": str(trace_path),

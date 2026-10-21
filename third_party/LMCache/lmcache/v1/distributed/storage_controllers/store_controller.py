@@ -231,6 +231,10 @@ class InFlightStoreTask:
     source_bytes: int = 0
     """L1 bytes held on behalf of this in-flight L2 store task."""
 
+    # [SC] Admission-time tier snapshot; never consult a mutable hash map
+    # again when this asynchronous store finishes. None = legacy behavior.
+    bayes_store_intents: dict[ObjectKey, str] | None = None
+
 
 # Main class
 
@@ -654,6 +658,30 @@ class StoreController(StorageControllerInterface):
             logger.info("StoreController detached adapter %d", adapter_id)
             done.set()
 
+
+    # [SC] New Bayesian readmission path only: hold an immutable per-task
+    # routing snapshot. Legacy GNN and no-GNN policies keep their old calls.
+    def _bayes_snapshot(self, keys: list[ObjectKey]) -> dict[ObjectKey, str] | None:
+        if os.getenv("LMCACHE_BAYES_READMISSION", "0") != "1":
+            return None
+        if not hasattr(self._policy, "select_store_targets_with_intents"):
+            return None
+        return self._policy._placements(keys)
+
+    def _store_targets(self, keys, adapters, intents):
+        if intents is not None:
+            return self._policy.select_store_targets_with_intents(keys, adapters, intents)
+        return self._policy.select_store_targets(keys, adapters)
+
+    def _l1_deletions(self, keys, intents, *, skipped=False):
+        if intents is not None:
+            if skipped:
+                return self._policy.select_l1_deletions_on_store_skip_with_intents(keys, intents)
+            return self._policy.select_l1_deletions_with_intents(keys, intents)
+        if skipped:
+            return self._policy.select_l1_deletions_on_store_skip(keys)
+        return self._policy.select_l1_deletions(keys)
+
     def _process_new_keys(self, keys: list[ObjectKey]) -> None:
         """Process a batch of newly written keys.
 
@@ -705,7 +733,8 @@ class StoreController(StorageControllerInterface):
             for adapter_id, desc in self._adapter_descriptors.items()
             if adapter_id not in self._draining
         ]
-        plan = self._policy.select_store_targets(keys, routing_descriptors)
+        intents = self._bayes_snapshot(keys)
+        plan = self._store_targets(keys, routing_descriptors, intents)
 
         target_pairs: list[tuple[int, ObjectKey]] = []
         key_set = set(keys)
@@ -773,9 +802,7 @@ class StoreController(StorageControllerInterface):
             0, self._max_inflight_store_bytes - self._status_in_flight_bytes
         )
         if required_bytes > remaining_bytes:
-            delete_keys = self._policy.select_l1_deletions_on_store_skip(
-                unique_target_keys
-            )
+            delete_keys = self._l1_deletions(unique_target_keys, intents, skipped=True)
             if delete_keys:
                 self._l1_manager.delete(delete_keys)
             self._status_store_cap_skipped_key_count += len(target_pairs)
@@ -795,7 +822,7 @@ class StoreController(StorageControllerInterface):
         self._store_cap_preapproved.update(target_pairs)
         try:
             for group in _group_keys_by_shape(keys).values():
-                self._submit_store_for_single_shape(group)
+                self._submit_store_for_single_shape(group, intents=intents)
         finally:
             # Any leftovers correspond to a policy/read-path anomaly where the
             # normal submission did not consume a preapproval token.
@@ -810,6 +837,7 @@ class StoreController(StorageControllerInterface):
         adapter_index: int,
         keys: list[ObjectKey],
         objs: list,
+        intents: dict[ObjectKey, str] | None = None,
     ) -> tuple[list[ObjectKey], list]:
         if not keys or self._max_inflight_store_bytes <= 0:
             return keys, objs
@@ -831,7 +859,7 @@ class StoreController(StorageControllerInterface):
         skipped_keys = keys[admit_count:]
         skipped_bytes = object_bytes * len(skipped_keys)
         self._l1_manager.finish_read(skipped_keys)
-        delete_keys = self._policy.select_l1_deletions_on_store_skip(skipped_keys)
+        delete_keys = self._l1_deletions(skipped_keys, intents, skipped=True)
         if delete_keys:
             self._l1_manager.delete(delete_keys)
 
@@ -850,7 +878,9 @@ class StoreController(StorageControllerInterface):
         )
         return keys[:admit_count], objs[:admit_count]
 
-    def _submit_store_for_single_shape(self, keys: list[ObjectKey]) -> None:
+    def _submit_store_for_single_shape(
+        self, keys: list[ObjectKey], *, intents: dict[ObjectKey, str] | None = None
+    ) -> None:
         """Submit ``keys`` (all same shape) to their target adapters."""
         # Only route to adapters that are live (not draining). Descriptors
         # for draining adapters are kept for in-flight completion handling
@@ -860,7 +890,9 @@ class StoreController(StorageControllerInterface):
             for adapter_id, desc in self._adapter_descriptors.items()
             if adapter_id not in self._draining
         ]
-        plan = self._policy.select_store_targets(keys, routing_descriptors)
+        if intents is None:
+            intents = self._bayes_snapshot(keys)
+        plan = self._store_targets(keys, routing_descriptors, intents)
 
         l1_mgr = self._l1_manager
 
@@ -934,7 +966,7 @@ class StoreController(StorageControllerInterface):
 
             # [SC] Bound L1 bytes retained on behalf of queued/running L2 PUTs.
             successful_keys, successful_objs = self._apply_store_admission_budget(
-                adapter_index, successful_keys, successful_objs
+                adapter_index, successful_keys, successful_objs, intents
             )
 
             if not successful_keys:
@@ -960,6 +992,10 @@ class StoreController(StorageControllerInterface):
                 # [SC] Record source-byte ownership for rolling-budget release.
                 submitted_at=time.monotonic(),
                 source_bytes=total_bytes,
+                bayes_store_intents=(
+                    {key: intents[key] for key in successful_keys}
+                    if intents is not None else None
+                ),
             )
             self._status_in_flight_count += 1
             self._status_in_flight_bytes += total_bytes
@@ -1078,6 +1114,20 @@ class StoreController(StorageControllerInterface):
             "l2_name": l2_name,
             "bytes_transferred": task.l2_bytes_transferred,
         }
+        if task.bayes_store_intents is not None:
+            # Detect a same-ObjectKey repin before this older task finalized.
+            # Decisions below still use the old task's immutable snapshot.
+            from lmcache.v1.distributed.placement_metadata import get_store_intent
+            for key, staged_tier in task.bayes_store_intents.items():
+                current_tier = get_store_intent(key)
+                if current_tier != staged_tier:
+                    logger.warning(
+                        "[BAYES_INFLIGHT_STORE_REPIN] adapter=%d task=%s "
+                        "hash=%s staged=%s current=%s",
+                        adapter_index, task_id, key.chunk_hash.hex(),
+                        staged_tier, current_tier,
+                    )
+
         if success:
             # [SC] Barrier diagnostics distinguish successful from failed drain.
             self._status_completed_store_count += 1
@@ -1098,7 +1148,7 @@ class StoreController(StorageControllerInterface):
                 adapter_index,
                 len(task.keys),
             )
-            delete_keys = self._policy.select_l1_deletions(task.keys)
+            delete_keys = self._l1_deletions(task.keys, task.bayes_store_intents)
             if delete_keys:
                 l1_mgr.delete(delete_keys)
         else:

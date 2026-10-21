@@ -1,0 +1,1125 @@
+diff --git a/Hierarchical_KV/shortq_placement/bayesian_mapper.py b/Hierarchical_KV/shortq_placement/bayesian_mapper.py
+new file mode 100644
+index 0000000..782fe33
+--- /dev/null
++++ b/Hierarchical_KV/shortq_placement/bayesian_mapper.py
+@@ -0,0 +1,289 @@
++"""Small, opt-in wave-level KV mapper. No torch/vLLM/LMCache imports.
++
++A score source yields ordered (chunk_hash, score) pairs. One fixed-weight
++prior-regularized histogram and tier-cost means produce percentile cutoffs.
++Placement metadata uses the existing hash -> gpu/cpu/disk/drop format.
++"""
++from __future__ import annotations
++
++from collections import Counter
++import json
++import math
++import os
++from pathlib import Path
++import re
++from typing import Any
++
++TIERS = ("gpu", "cpu", "disk")
++
++
++def atomic_json(path: str | Path, data: Any) -> None:
++    path = Path(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
++    try:
++        tmp.write_text(json.dumps(data, sort_keys=True, indent=2) + "\n", encoding="utf-8")
++        os.replace(tmp, path)
++    finally:
++        if tmp.exists():
++            tmp.unlink()
++
++
++def read_score_rows(path: str | Path) -> dict[int, list[tuple[str, float]]]:
++    rows: dict[int, list[tuple[str, float]]] = {}
++    with Path(path).open(encoding="utf-8") as f:
++        for line in f:
++            if not line.strip():
++                continue
++            row = json.loads(line)
++            idx = int(row["source_index"])
++            if idx in rows:
++                raise ValueError(f"duplicate score request {idx}")
++            chunks = [(str(r["chunk_hash"]).lower(), float(r["score"])) for r in row["chunks"]]
++            if any(not math.isfinite(v) for _, v in chunks):
++                raise ValueError(f"non-finite score at request {idx}")
++            rows[idx] = chunks
++    if not rows:
++        raise ValueError("score file has no requests")
++    return rows
++
++
++class WaveBayesianMapper:
++    def __init__(self, prior_file: str | Path, weight: float, gpu_gb: float,
++                 cpu_gb: float, disk_gb: float, score_file: str | Path,
++                 metadata_file: str | Path, vpc_file: str | Path):
++        if not math.isfinite(weight) or weight < 0:
++            raise ValueError("prior weight must be finite and >= 0")
++        self.weight = float(weight)
++        self.prior = json.loads(Path(prior_file).read_text(encoding="utf-8"))
++        self.edges = [float(x) for x in self.prior["score_bin_edges"]]
++        self.prior_hist = [float(x) for x in self.prior["score_bin_probabilities"]]
++        if len(self.edges) != len(self.prior_hist) + 1 or len(self.edges) < 3:
++            raise ValueError("score histogram bins/edges mismatch")
++        if any(not math.isfinite(x) for x in self.edges + self.prior_hist):
++            raise ValueError("nonfinite histogram prior")
++        if any(b <= a for a, b in zip(self.edges, self.edges[1:])):
++            raise ValueError("histogram edges must be strictly increasing")
++        if any(x < 0 for x in self.prior_hist) or sum(self.prior_hist) <= 0:
++            raise ValueError("histogram prior must be nonnegative with positive mass")
++        s = sum(self.prior_hist)
++        self.prior_hist = [v / s for v in self.prior_hist]
++        self.prior_ms = {t: float(self.prior["cost_prior_ms"][t]) for t in ("cpu", "disk", "recompute")}
++        if any(not math.isfinite(x) or x <= 0 for x in self.prior_ms.values()):
++            raise ValueError("cost_prior_ms values must be finite and > 0")
++        self.capacities = {"gpu": float(gpu_gb), "cpu": float(cpu_gb), "disk": float(disk_gb)}
++        if any(not math.isfinite(v) or v < 0 for v in self.capacities.values()) or sum(self.capacities.values()) <= 0:
++            raise ValueError("capacities must be finite/nonnegative and at least one positive")
++        self.rows = read_score_rows(score_file)
++        self.metadata_file = Path(metadata_file)
++        self.vpc_file = Path(vpc_file)
++        self.assigned: dict[str, str] = {}
++        self.request_labels: dict[str, dict[str, str]] = {}
++        self.seen_scores: set[str] = set()
++        self.hist_counts = [0] * len(self.prior_hist)
++        self.cost_sum_ms = {"cpu": 0.0, "disk": 0.0}
++        self.cost_counts = {"cpu": 0, "disk": 0}
++        self.out_of_range_scores = 0
++        self.epoch = 0
++        self.profiles: list[dict[str, Any]] = []
++
++    def _bin(self, score: float) -> int:
++        # Clamp outliers, count/report them via diagnostics; never silently wrap.
++        import bisect
++        return max(0, min(len(self.hist_counts) - 1, bisect.bisect_right(self.edges, score) - 1))
++
++    def observe_scores(self, source_indices: list[int]) -> None:
++        for source in source_indices:
++            if source not in self.rows:
++                raise KeyError(f"GNN score missing for source_index={source}")
++            for hash_hex, score in self.rows[source]:
++                if hash_hex not in self.seen_scores:
++                    self.seen_scores.add(hash_hex)
++                    self.out_of_range_scores += int(score < self.edges[0] or score > self.edges[-1])
++                    self.hist_counts[self._bin(score)] += 1
++
++    def observe_cost(self, tier: str, milliseconds_per_chunk: float, count: int = 1) -> None:
++        if tier not in self.cost_counts:
++            raise ValueError(tier)
++        if not math.isfinite(milliseconds_per_chunk) or milliseconds_per_chunk <= 0 or count <= 0:
++            raise ValueError("invalid retrieval observation")
++        self.cost_sum_ms[tier] += milliseconds_per_chunk * count
++        self.cost_counts[tier] += count
++
++    def estimated_cost(self, tier: str) -> float:
++        if tier == "recompute":
++            return self.prior_ms[tier]  # No reliable GPU recompute timer in this patch.
++        n = self.cost_counts[tier]
++        if n == 0:
++            return self.prior_ms[tier]
++        return ((self.weight * self.prior_ms[tier]) + self.cost_sum_ms[tier] / n) / (self.weight + 1.0)
++
++    def probabilities(self) -> list[float]:
++        n = sum(self.hist_counts)
++        if n == 0:
++            return list(self.prior_hist)
++        obs = [v / n for v in self.hist_counts]
++        return [(self.weight * a + b) / (self.weight + 1.0) for a, b in zip(self.prior_hist, obs)]
++
++    def percentile(self, score: float) -> float:
++        bins = self.probabilities()
++        idx = self._bin(score)
++        lo, hi = self.edges[idx], self.edges[idx + 1]
++        fraction = min(1.0, max(0.0, (score - lo) / (hi - lo)))
++        return min(1.0, max(0.0, sum(bins[:idx]) + bins[idx] * fraction))
++
++    def bands(self) -> dict[str, float]:
++        csum = sum(self.capacities.values())
++        tau = self.estimated_cost("recompute")
++        fractions = {
++            "gpu": self.capacities["gpu"] / csum,
++            "cpu": self.capacities["cpu"] / csum * min(1.0, tau / self.estimated_cost("cpu")),
++            "disk": self.capacities["disk"] / csum * min(1.0, tau / self.estimated_cost("disk")),
++        }
++        fractions["drop"] = max(0.0, 1.0 - sum(fractions.values()))
++        return {
++            "gpu": 1.0 - fractions["gpu"],
++            "cpu": 1.0 - fractions["gpu"] - fractions["cpu"],
++            "disk": fractions["drop"],
++            "fractions": fractions,
++        }
++
++    @staticmethod
++    def _tier(percentile: float, bands: dict[str, float]) -> str:
++        if percentile >= bands["gpu"]:
++            return "gpu"
++        if percentile >= bands["cpu"]:
++            return "cpu"
++        if percentile >= bands["disk"]:
++            return "disk"
++        return "drop"
++
++    @staticmethod
++    def _prefix_closure(candidates: list[str], percentiles: list[float],
++                        hashes: list[str], fixed: dict[str, str],
++                        bands: dict[str, float]) -> tuple[list[str], int, bool]:
++        """Constrained O(n) minimum deviation. A fixed hash cannot migrate.
++
++        When fixed labels conflict (a fixed store following a fixed DROP), keep
++        them and suppress NEW admissions after the earliest fixed DROP.
++        Existing historical stranding is reported as infeasible, not hidden.
++        """
++        n = len(candidates)
++        discard = [max(0.0, p - bands[t]) if t != "drop" else 0.0
++                   for t, p in zip(candidates, percentiles)]
++        repair = [max(0.0, bands["disk"] - p) if t == "drop" else 0.0
++                  for t, p in zip(candidates, percentiles)]
++        loss = sum(discard)
++        best_loss = float("inf")
++        best_m = 0
++        has_feasible = False
++        # Fixed stores require m > their last position. Fixed DROPs require
++        # m <= their first position. Constraints are computed once: O(n).
++        min_m = max((i + 1 for i, h in enumerate(hashes)
++                     if h in fixed and fixed[h] != "drop"), default=0)
++        max_m = min((i for i, h in enumerate(hashes)
++                     if fixed.get(h) == "drop"), default=n)
++        # Candidate m denotes number of retained chunks, 0 .. n.
++        for m in range(n + 1):
++            feasible = min_m <= m <= max_m
++            if feasible and loss < best_loss - 1e-12:
++                has_feasible, best_loss, best_m = True, loss, m
++            if m < n:
++                loss += repair[m] - discard[m]
++        if not has_feasible:
++            first_fixed_drop = next((i for i, h in enumerate(hashes)
++                                     if fixed.get(h) == "drop"), n)
++            best_m = first_fixed_drop
++        result = []
++        for i, (h, tier) in enumerate(zip(hashes, candidates)):
++            if h in fixed:
++                result.append(fixed[h])
++            elif i < best_m:
++                result.append(tier if tier != "drop" else "disk")
++            else:
++                result.append("drop")
++        return result, best_m, has_feasible
++
++    def publish_wave(self, source_indices: list[int], phase: str) -> dict[str, Any]:
++        # Use only data available from PREVIOUS completed waves to map this wave.
++        self.epoch += 1
++        b = self.bands()
++        new_count = 0
++        contradictions = 0
++        for source in source_indices:
++            seq = self.rows[source]
++            hashes = [h for h, _ in seq]
++            ps = [self.percentile(s) for _, s in seq]
++            proposals = [self._tier(p, b) for p in ps]
++            finalized, cutoff, feasible = self._prefix_closure(proposals, ps, hashes, self.assigned, b)
++            contradictions += int(not feasible)
++            block_labels = {}
++            for i, (h, tier) in enumerate(zip(hashes, finalized)):
++                if h not in self.assigned:
++                    self.assigned[h] = tier
++                    new_count += 1
++                label = self.assigned[h]
++                # Native VPC physical block granularity is 16 tokens.
++                for native in range(i * 32, (i + 1) * 32):
++                    block_labels[str(native)] = "disk" if label == "drop" else label
++            self.request_labels[str(source)] = block_labels
++        # Both files replaced before submitting requests; no requests in flight.
++        atomic_json(self.metadata_file, self.assigned)
++        atomic_json(self.vpc_file, self.request_labels)
++        status = {
++            "epoch": self.epoch, "phase": phase, "requests": len(source_indices),
++            "new_hashes": new_count, "total_hashes": len(self.assigned),
++            "score_samples": len(self.seen_scores),
++            "score_out_of_prior_range": self.out_of_range_scores,
++            "cost_sample_counts": dict(self.cost_counts),
++            "cost_estimate_ms": {t: self.estimated_cost(t) for t in ("cpu", "disk", "recompute")},
++            "thresholds": {k: b[k] for k in TIERS},
++            "nominal_shares": b["fractions"],
++            "fixed_conflict_requests": contradictions,
++            "mapped_counts": dict(Counter(self.assigned.values())),
++        }
++        self.profiles.append(status)
++        return status
++
++
++class LmcacheLogCostReader:
++    """Experimental LOG PROXIES ONLY; not exclusive device retrieval timings.
++
++    Disk: MP_PREFETCH_DONE load_s / loaded_keys (includes scheduling).
++    CPU: 'Retrieved N tokens in S seconds' / 512-chunk equivalents
++    (H2D submission-side wall time; can include prefetched disk chunks).
++    To avoid unjustified placement tuning, no cost is fed back unless
++    the user explicitly enables proxy observations.
++    """
++    _load = re.compile(r"\[MP_PREFETCH_DONE\].*?load_s=([0-9.]+).*?loaded_keys=(\d+)")
++    _retrieve = re.compile(r"Retrieved (\d+) tokens in ([0-9.]+) seconds")
++
++    def __init__(self, logfile: str | Path):
++        self.logfile = Path(logfile)
++        self.offset = 0
++
++    def collect(self, mapper: WaveBayesianMapper) -> dict[str, int]:
++        counts = {"cpu_proxy": 0, "disk_proxy": 0}
++        if not self.logfile.exists():
++            return counts
++        with self.logfile.open(encoding="utf-8", errors="replace") as f:
++            f.seek(self.offset)
++            data = f.read()
++            if not data.endswith("\n"):
++                at = data.rfind("\n")
++                if at < 0:
++                    return counts
++                data, tail = data[:at + 1], data[at + 1:]
++                f.seek(f.tell() - len(tail.encode('utf-8', errors='replace')))
++            self.offset = f.tell()
++        for line in data.splitlines():
++            match = self._load.search(line)
++            if match and int(match[2]) and float(match[1]) > 0:
++                mapper.observe_cost("disk", float(match[1]) * 1000 / int(match[2]), count=int(match[2]))
++                counts["disk_proxy"] += 1
++            match = self._retrieve.search(line)
++            if match and int(match[1]) >= 512 and float(match[2]) > 0:
++                chunks = int(match[1]) // 512
++                mapper.observe_cost("cpu", float(match[2]) * 1000 / (int(match[1]) / 512), count=chunks)
++                counts["cpu_proxy"] += 1
++        return counts
+diff --git a/Hierarchical_KV/shortq_placement/priors/importance_0_100_example.json b/Hierarchical_KV/shortq_placement/priors/importance_0_100_example.json
+new file mode 100644
+index 0000000..8abec06
+--- /dev/null
++++ b/Hierarchical_KV/shortq_placement/priors/importance_0_100_example.json
+@@ -0,0 +1,7 @@
++{
++  "comment": "ILLUSTRATIVE UNCALIBRATED PRIOR for future native 0-100 chunk scores. NOT measured.",
++  "score_format": "native_chunk_score_0_100",
++  "score_bin_edges": [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100],
++  "score_bin_probabilities": [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1],
++  "cost_prior_ms": {"cpu": 20, "disk": 500, "recompute": 100}
++}
+diff --git a/Hierarchical_KV/shortq_placement/priors/rank_example.json b/Hierarchical_KV/shortq_placement/priors/rank_example.json
+new file mode 100644
+index 0000000..14b0c6e
+--- /dev/null
++++ b/Hierarchical_KV/shortq_placement/priors/rank_example.json
+@@ -0,0 +1,7 @@
++{
++  "comment": "ILLUSTRATIVE UNCALIBRATED PRIOR for current raw mean block-rank outputs. NOT measured on H100. Replace score histogram and time priors before headline experiments.",
++  "score_format": "mean_32_block_rank_scores",
++  "score_bin_edges": [-20, -10, -5, -3, -2, -1, 0, 1, 2, 3, 5, 10, 20],
++  "score_bin_probabilities": [0.01, 0.03, 0.06, 0.10, 0.14, 0.16, 0.16, 0.14, 0.10, 0.06, 0.03, 0.01],
++  "cost_prior_ms": {"cpu": 20, "disk": 500, "recompute": 100}
++}
+diff --git a/docs/BAYES_WAVE_PLACEMENT.md b/docs/BAYES_WAVE_PLACEMENT.md
+new file mode 100644
+index 0000000..6561c9f
+--- /dev/null
++++ b/docs/BAYES_WAVE_PLACEMENT.md
+@@ -0,0 +1,177 @@
++# Experimental wave-level Bayesian KV placement (Python-only)
++
++This is an **opt-in research prototype** layered on top of the earlier canonical
++passage-order + phase-trace changes. It does not replace the current GNN
++checkpoint, vLLM GPU allocator, LMCache LRU, disk PUT cap or safety fallbacks.
++The patch has **CPU-only tests**, but has **not yet run on an H100**.
++
++## 1. Pipeline and semantics
++
++Precomputation computes a **mean of 32 existing 16-token `rank_head` scores**
++for each complete, real 512-token LMCache prefix-hash chunk. It writes
++`placement/gnn_chunk_scores.jsonl` with source indices and ordered `(hash, score)`
++records. In Bayesian mode **no placements are precomputed**. Incomplete tail
++chunks are omitted because LMCache doesn't persist them at 512-token boundaries.
++
++The existing submission-wave driver maps each wave *just before* submitting
++HTTP requests, using the prior and observations from **completed earlier waves**.
++The same hash always keeps its first assignment across cold and warm. The
++metadata files are atomically replaced between waves, and version-aware readers
++in LMCache and vLLM reload them. No hash migration or eviction changes.
++
++Score posterior: for each histogram bin `p=(w*prior_prob + observed_prob)/(w+1)`.
++Count **unique prefix hashes** only, after each completed wave. Before any
++samples, use the prior. Percentile interpolation is uniform *within* each
++histogram bin. Scores outside bin edges are clamped, so validate bin coverage.
++
++Cost posterior: `estimated_ms=(w*prior_ms + observed_mean_ms)/(w+1)`.
++A tier without observations retains its prior. `w=1` keeps exactly 50/50
++prior/empirical average **regardless of sample count**; this is *fixed-weight
++prior regularization*, not a conventional conjugate posterior. `recompute_ms`
++remains a fixed reference until reliable timing is available.
++
++For tiers `gpu,cpu,disk`, first allocate capacity shares
++`a_i=C_i/sum(C)`. Set retention `r_gpu=1` and
++`r_i=min(1, recompute_ms/retrieve_ms_i)` for CPU and disk.
++Final shares: `rho_i=a_i*r_i`; `rho_DROP=sum(a_i*(1-r_i))`.
++Map percentile bands GPU (high) -> CPU -> disk -> DROP (low).
++Then apply O(n) **minimum-deviation prefix closure** to the ordered chunks,
++constrained by first-seen hash decisions. An irreconcilable fixed DROP/store
++hole is logged as `fixed_conflict_requests`; we do not silently migrate an
++existing hash. Disk repairs are still subject to **existing** LMCache store
++throttling and may fail to persist. Closure is admission consistency, not a
++physical or post-eviction guarantee of complete reusable prefixes.
++
++**Capacities** are total *effective budgets*, not current free space or an
++estimate of total workload size. GPU budget must be conservative reusable
++VPC capacity, not all HBM. Disk budget must be a configured useful disk-cache
++budget, not the entire filesystem. No automatic disk/cpu capacity-ratio
++clipping is implemented yet. Backing GPU-intended chunks in CPU (existing
++`KV_GNN_L1_BACKING=1`) can make physical occupancy differ from tier shares.
++
++## 2. Prior files, costs and critical caveats
++
++`Hierarchical_KV/shortq_placement/priors/rank_example.json` is an
++**illustrative, uncalibrated** prior for the existing unbounded rank head.
++`importance_0_100_example.json` demonstrates the *same* interface for future
++native chunk importance scores. Both include **hypothetical** 20/500/100 ms
++CPU/disk/recompute costs; these are **not actual H100 measurements** and must
++not support performance claims. Calibrate priors from external/training data
++or independent probes. A 0–100 score producer does **not** exist in this patch.
++
++`KV_BAYES_PRIOR_WEIGHT` is the single weight, default 1. Set
++`KV_BAYES_PRIOR_FILE` to the JSON to select your score scale/prior. Verify
++**score direction** (larger raw rank must mean more important), raw-score
++coverage within bin edges, and score/placement correlations before trusting
++mapping.
++
++**Crucial timing limitation:** `KV_BAYES_USE_COST_PROXIES=0` (default) means
++no live measured retrieval costs are fed into the mapper; only the score
++histogram adapts between waves, while tier costs retain configured priors.
++This is the safe integration smoke mode. You may set
++`KV_BAYES_USE_COST_PROXIES=1` for a **mechanism-only adaptive-cost smoke**.
++That opt-in mode uses the diagnostic LMCache log's `MP_PREFETCH_DONE load_s /
++loaded_keys` as a disk proxy and `Retrieved N tokens in S seconds` as a CPU
++proxy. These are **NOT** isolated GPU-complete CPU/disk retrieval times: they
++can include queuing, asynchronous submission and cross-tier staging. Results
++with these proxies should **not** be presented as a validated adaptive
++cost-benefit algorithm. Reliable synchronized tier timing is the next
++instrumentation task; the mapper interface does not need to change for it.
++
++## 3. Applying the patch on a new branch
++
++This patch was generated against the uploaded repo ZIP **after applying**
++`canonical_q650_phase_trace.patch`, which your existing H100 runs used.
++Inside the cluster checkout:
++
++```bash
++cd /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
++git status --short                # commit/stash anything important first
++git switch -c feat/bayes-wave-kv # choose another name if it already exists
++# Download bayesian_wave_kv.patch from this chat, then scp/copy into this repo.
++git apply --check bayesian_wave_kv.patch
++git apply bayesian_wave_kv.patch
++```
++
++If `git apply --check` fails, **STOP**; don't use `--force` or patch
++individual hunks blindly. Send the error and `git status --short` for
++reconciliation with your current checkout.
++
++Run CPU checks **before** starting any GPU server:
++
++```bash
++source /mnt/shared/gpfs/home/sriramc2/venvs/kvaware-vllm029/bin/activate
++python -m unittest discover -s tests -p test_bayesian_mapper_cpu.py -v
++bash -n scripts/run_h100_bayes_canonical_smoke.sh \
++  scripts/run_shortq_gnn_dynamic_vpc_common.sh
++python -m compileall -q Hierarchical_KV/shortq_placement/bayesian_mapper.py \
++  experiments/precompute_shortq_placements.py experiments/mp_nognn_project.py \
++  vllm/v1/request.py \
++  third_party/LMCache/lmcache/v1/distributed/placement_metadata.py
++python - <<'PY'
++import vllm
++print('vllm import:', vllm.__file__)
++import lmcache
++print('lmcache import:', lmcache.__file__)
++PY
++```
++
++The import paths must resolve to the modified checkout and vendored LMCache.
++Python-only edits require a **server restart**, not a vLLM CUDA rebuild.
++
++## 4. First H100 smoke, INSIDE the existing `srun` allocation
++
++**CAUTION: the common launcher defaults to `CLEAN_OLD_LMCACHE=1` and removes
++all contents directly beneath `/scratch2/sriramc2`.** Copy old results off
++scratch or set `CLEAN_OLD_LMCACHE=0` only when you can ensure isolation.
++
++```bash
++cd /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
++KV_BAYES_PRIOR_WEIGHT=1 \
++KV_BAYES_GPU_GB=10 KV_BAYES_DISK_GB=100 \
++NUM_QUESTIONS=12 SUBMISSION_BATCH_SIZE=4 \
++KV_BAYES_USE_COST_PROXIES=0 \
++bash scripts/run_h100_bayes_canonical_smoke.sh
++```
++
++`h100_smoke` uses Q12, canonical order, cold shuffle seed 0, warm random seed
++1, 16 output tokens and three wave updates per phase. It deliberately does
++**not** require artificially forcing every tier into the smoke workload.
++For later cost-feedback *wiring validation only* (not an accuracy benchmark),
++repeat with `KV_BAYES_USE_COST_PROXIES=1`. Observe `cost_sample_counts` and
++`cost_estimate_ms` change in the `BAYES_WAVE_PUBLISH` logs, if tier hits occur.
++
++After the launcher prints `run_dir=...`:
++
++```bash
++RUNDIR=/path/printed/by/launcher
++cat "$RUNDIR/results/bayes_wave_history.json"
++grep '\[BAYES_' "$RUNDIR/logs/driver.log" | tail -25
++cat "$RUNDIR/placement/runtime_hash_to_placement.json" | head
++cat "$RUNDIR/results/summary.json"
++grep -E 'GNN_PLACEMENT_METADATA_MISS|Traceback|ERROR' \
++  "$RUNDIR/logs/lmcache.log" "$RUNDIR/logs/vllm.log" | tail -30
++```
++
++Check `BAYES_WAVE_RUN_PASS`, no placement metadata misses, multiple epochs,
++new hashes before first request of each wave, stable repeated hashes, no
++request failures, and completed cold-to-warm store barrier.
++
++## 5. Scope and known limitations
++
++- This is **not** an H100-validated patch. CPU tests validate the mapper,
++  not actual multiserver startup/refresh, thread timing or throughput.
++- The GNN still runs **offline**, but emits scores only in Bayesian mode;
++  a future online score producer can write the same request-indexed data.
++- The `prior_weight=1` average does not converge to the empirical mean as
++  samples grow; it converges to the midpoint of prior and empirical means.
++- At most four B200 waves per 650-request phase; thresholds change only
++  between completed waves, not per chunk/within a wave.
++- LMCache readers throttle dynamic metadata version checks to 250ms;
++  the wave driver waits 300ms after atomically publishing both snapshots
++  before submitting requests, preventing stale metadata at a wave boundary.
++- The GPU `window` VPC remains unchanged in this integration. Benchmark
++  comparisons must account for its existing CPU scheduling overhead.
++- No change to LRU, disk PUT cap, starvation fallback or canonical ordering.
++- Full 0–100 score inference, reliable exclusive cost timing, and global
++  workload-capacity knowledge are intentionally out of scope.
+diff --git a/experiments/mp_nognn_project.py b/experiments/mp_nognn_project.py
+index 6af5c69..f1631bc 100755
+--- a/experiments/mp_nognn_project.py
++++ b/experiments/mp_nognn_project.py
+@@ -40,7 +40,7 @@ import time
+ from concurrent.futures import ThreadPoolExecutor, as_completed
+ from dataclasses import dataclass
+ from pathlib import Path
+-from typing import Any, Protocol
++from typing import Any, Callable, Protocol
+ 
+ import numpy as np
+ import pandas as pd
+@@ -465,6 +465,8 @@ def generate_in_submission_batches_http(
+     policy: RequestPolicy,
+     result_file,
+     deterministic_request_ids: bool = False,
++    before_wave: Callable[[list[int], str], None] | None = None,
++    after_wave: Callable[[list[int], str], None] | None = None,
+ ) -> tuple[list[dict[str, Any]], float]:
+     """
+     Match the legacy bounded-wave behavior.
+@@ -485,6 +487,9 @@ def generate_in_submission_batches_http(
+         end_idx = min(start_idx + submission_batch_size, total)
+         batch = records[start_idx:end_idx]
+         batch_number = start_idx // submission_batch_size + 1
++        source_indices = [r.source_index for r in batch]
++        if before_wave is not None:
++            before_wave(source_indices, phase_name)
+ 
+         print(
+             f"[{phase_name}] Submitting batch {batch_number}/{total_batches}: "
+@@ -586,6 +591,9 @@ def generate_in_submission_batches_http(
+                     f"error={result.get('error')}"
+                 )
+ 
++        if after_wave is not None:
++            after_wave(source_indices, phase_name)
++
+         print(
+             f"[{phase_name}] Finished batch {batch_number}/{total_batches} "
+             f"in {time.monotonic() - batch_start:.2f} seconds",
+@@ -1103,6 +1111,18 @@ def parse_arguments():
+         default="",
+         help="Optional vLLM /metrics snapshot after the store barrier and before warm.",
+     )
++    parser.add_argument("--bayes_score_file", default="",
++                        help="Enable wave-level mapper using precomputed hash scores")
++    parser.add_argument("--bayes_prior_file", default="")
++    parser.add_argument("--bayes_prior_weight", type=float, default=1.0)
++    parser.add_argument("--bayes_gpu_gb", type=float, default=10.0)
++    parser.add_argument("--bayes_cpu_gb", type=float, default=225.0)
++    parser.add_argument("--bayes_disk_gb", type=float, default=100.0)
++    parser.add_argument("--bayes_metadata_file", default="")
++    parser.add_argument("--bayes_vpc_file", default="")
++    parser.add_argument("--bayes_lmcache_log", default="")
++    parser.add_argument("--bayes_use_cost_proxies", action="store_true",
++                        help="EXPERIMENTAL: use nonexclusive LMCache log timing proxies")
+     parser.add_argument("--output_dir", required=True)
+     parser.add_argument(
+         "--metrics_after_cold_path",
+@@ -1296,6 +1316,51 @@ def main():
+         for source_index in warm_source_indices
+     ]
+ 
++    bayes_mapper = None
++    bayes_reader = None
++    if args.bayes_score_file:
++        from Hierarchical_KV.shortq_placement.bayesian_mapper import (
++            WaveBayesianMapper, LmcacheLogCostReader, atomic_json,
++        )
++        required = (args.bayes_prior_file, args.bayes_metadata_file, args.bayes_vpc_file)
++        if any(not x for x in required):
++            raise ValueError("Bayesian mode requires prior, metadata, and VPC file paths")
++        bayes_mapper = WaveBayesianMapper(
++            args.bayes_prior_file, args.bayes_prior_weight,
++            args.bayes_gpu_gb, args.bayes_cpu_gb, args.bayes_disk_gb,
++            args.bayes_score_file, args.bayes_metadata_file, args.bayes_vpc_file,
++        )
++        if set(bayes_mapper.rows) != set(range(num_requests)):
++            raise ValueError("score-file request indices differ from serving requests")
++        if args.bayes_use_cost_proxies:
++            if not args.bayes_lmcache_log:
++                raise ValueError("--bayes_use_cost_proxies requires --bayes_lmcache_log")
++            bayes_reader = LmcacheLogCostReader(args.bayes_lmcache_log)
++        print("[BAYES_INIT] " + json.dumps({
++            "score_file": args.bayes_score_file, "prior_file": args.bayes_prior_file,
++            "prior_weight": args.bayes_prior_weight, "capacities_gb": bayes_mapper.capacities,
++            "cost_observations": "log_proxies" if bayes_reader else "prior_only",
++        }, sort_keys=True), flush=True)
++
++    def _bayes_before_wave(sources: list[int], phase: str) -> None:
++        assert bayes_mapper is not None
++        status = bayes_mapper.publish_wave(sources, phase)
++        # LMCache workers throttle metadata stat checks to 250 ms. Since
++        # snapshots change only between waves, wait for this window to elapse
++        # before submitting requests that introduce newly mapped hashes.
++        time.sleep(0.30)
++        print("[BAYES_WAVE_PUBLISH] " + json.dumps(status, sort_keys=True), flush=True)
++
++    def _bayes_after_wave(sources: list[int], phase: str) -> None:
++        assert bayes_mapper is not None
++        bayes_mapper.observe_scores(sources)
++        observed = bayes_reader.collect(bayes_mapper) if bayes_reader else {}
++        atomic_json(out_dir / "bayes_wave_history.json", bayes_mapper.profiles)
++        print("[BAYES_WAVE_OBSERVE] " + json.dumps({
++            "phase": phase, "new_score_samples": len(bayes_mapper.seen_scores),
++            "cost_observations": observed, "cost_sample_counts": bayes_mapper.cost_counts,
++        }, sort_keys=True), flush=True)
++
+     print("Cold run starting...", flush=True)
+ 
+     with (out_dir / "cold_results.jsonl").open(
+@@ -1317,6 +1382,8 @@ def main():
+                 policy=policy,
+                 result_file=f,
+                 deterministic_request_ids=args.deterministic_request_ids,
++                before_wave=_bayes_before_wave if bayes_mapper else None,
++                after_wave=_bayes_after_wave if bayes_mapper else None,
+             )
+         )
+ 
+@@ -1403,6 +1470,8 @@ def main():
+                 policy=policy,
+                 result_file=f,
+                 deterministic_request_ids=args.deterministic_request_ids,
++                before_wave=_bayes_before_wave if bayes_mapper else None,
++                after_wave=_bayes_after_wave if bayes_mapper else None,
+             )
+         )
+ 
+diff --git a/experiments/precompute_shortq_placements.py b/experiments/precompute_shortq_placements.py
+index 1999d42..483c653 100755
+--- a/experiments/precompute_shortq_placements.py
++++ b/experiments/precompute_shortq_placements.py
+@@ -88,6 +88,9 @@ def parse_args() -> argparse.Namespace:
+     p.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
+     p.add_argument("--inference_batch_size", type=int, default=1)
+     p.add_argument("--runtime_metadata", required=True)
++    p.add_argument("--bayes_scores_only", action="store_true",
++                   help="Export prefix-hash chunk scores only; mapper assigns tiers during serving")
++    p.add_argument("--bayes_score_file", default="", help="JSONL chunk-score artifact")
+     p.add_argument(
+         "--vpc_importance_sidecar",
+         default="",
+@@ -414,6 +417,7 @@ def main() -> None:
+     random_placement_summary: dict[str, Any] | None = None
+ 
+     occurrences: list[dict[str, Any]] = []
++    bayes_score_rows: list[dict[str, Any]] = []
+     hash_prediction_rows: list[dict[str, Any]] = []
+     timing_rows: list[dict[str, Any]] = []
+     occurrence_placements: list[str] = []
+@@ -540,6 +544,25 @@ def main() -> None:
+ 
+             post_t0 = time.perf_counter()
+             valid_blocks = int(block_mask[0].sum().item())
++            if args.bayes_scores_only:
++                # Mean of the 32 real 16-token block rank-head outputs per
++                # complete 512-token LMCache chunk. Incomplete tail excluded.
++                hashes = hasher.compute_chunk_hashes(serving_ids)
++                if len(hashes) != len(serving_ids) // args.chunk_size:
++                    raise AssertionError("LMCache hash/chunk alignment mismatch")
++                score_row = {"source_index": source_index, "chunks": []}
++                for chunk_index, chunk_hash in enumerate(hashes):
++                    lo = chunk_index * blocks_per_chunk
++                    hi = lo + blocks_per_chunk
++                    score = float(rank_scores[lo:hi].float().mean().item())
++                    if not math.isfinite(score):
++                        raise ValueError(f"nonfinite rank score source={source_index} chunk={chunk_index}")
++                    score_row["chunks"].append({"chunk_hash": chunk_hash.hex(), "score": score})
++                bayes_score_rows.append(score_row)
++                print(f"[BAYES_SCORE_PRECOMPUTE] source={source_index} "
++                      f"full_chunks={len(hashes)}", flush=True)
++                continue
++
+             class_ids = get_block_predictions(
+                 class_logits[:valid_blocks], rank_scores[:valid_blocks]
+             ).tolist()
+@@ -683,6 +706,16 @@ def main() -> None:
+             )
+ 
+     inference_seconds = time.monotonic() - inference_started
++    if args.bayes_scores_only:
++        if not args.bayes_score_file:
++            raise ValueError("--bayes_scores_only requires --bayes_score_file")
++        score_path = Path(args.bayes_score_file)
++        score_path.parent.mkdir(parents=True, exist_ok=True)
++        with score_path.open("w", encoding="utf-8") as f:
++            for row in bayes_score_rows:
++                f.write(json.dumps(row, sort_keys=True) + "\n")
++        if len(bayes_score_rows) != len(prompts):
++            raise AssertionError("missing GNN score rows")
+     peak_cuda_memory_bytes = (
+         int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else None
+     )
+@@ -830,6 +863,8 @@ def main() -> None:
+         "conflict_occurrences": conflict_occurrences,
+         "smoke_force_min_unique_per_placement": args.smoke_force_min_unique_per_placement,
+         "smoke_runtime_overrides": smoke_overrides,
++        "bayes_scores_only": args.bayes_scores_only,
++        "bayes_score_file": args.bayes_score_file or None,
+         "runtime_metadata": str(runtime_path),
+         "vpc_importance_sidecar": args.vpc_importance_sidecar or None,
+         "placement_trace": str(trace_path),
+diff --git a/scripts/run_h100_bayes_canonical_smoke.sh b/scripts/run_h100_bayes_canonical_smoke.sh
+new file mode 100755
+index 0000000..97c3435
+--- /dev/null
++++ b/scripts/run_h100_bayes_canonical_smoke.sh
+@@ -0,0 +1,27 @@
++#!/usr/bin/env bash
++# Run INSIDE an allocated 2x H100 `srun`; do not submit another Slurm job.
++set -Eeuo pipefail
++export KV_GNN_DYNAMIC_PROFILE=h100_smoke
++export KV_BAYES_ENABLE=1
++export KV_PASSAGE_ORDER_POLICY=canonical
++export KV_REQUEST_ORDER=seeded_shuffle KV_REQUEST_ORDER_SEED=0
++export WARM_ORDER=random WARM_ORDER_SEED=1
++export NUM_QUESTIONS="${NUM_QUESTIONS:-12}"
++export SUBMISSION_BATCH_SIZE="${SUBMISSION_BATCH_SIZE:-4}"
++export MIN_TOKENS="${MIN_TOKENS:-16}" MAX_TOKENS="${MAX_TOKENS:-16}"
++export MAX_NUM_SEQS=16
++export LMCACHE_L1_SIZE_GB="${LMCACHE_L1_SIZE_GB:-225}"
++export LMCACHE_MP_MAX_INFLIGHT_STORE_GB=0.25
++export LMCACHE_L2_LOAD_MAX_IN_FLIGHT=2 LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT=16
++export KV_MUTUAL_PREFIX=1 KV_VPC_SUFFICIENT_BYPASS=1
++export KV_COLD_WARM_STORE_BARRIER=1 LMCACHE_MP_PREFIX_DIAGNOSTICS=1
++export KV_GNN_AWARE_VPC=1 KV_GNN_L1_BACKING=1 KV_GNN_L2_BACKING=0
++export GNN_CHUNK_VOTE_POLICY=threshold_with_drop_plurality
++export VLLM_PHASE_TRACE=1 VLLM_PHASE_TRACE_DEVICE_TIMING=0
++export EXPERIMENT_LABEL="${EXPERIMENT_LABEL:-bayes_canonical_smoke}"
++export KV_BAYES_GPU_GB="${KV_BAYES_GPU_GB:-10}"
++export KV_BAYES_DISK_GB="${KV_BAYES_DISK_GB:-100}"
++export KV_BAYES_PRIOR_WEIGHT="${KV_BAYES_PRIOR_WEIGHT:-1}"
++# Default is prior-only: LMCache diagnostic log intervals are not exclusive GET costs.
++export KV_BAYES_USE_COST_PROXIES="${KV_BAYES_USE_COST_PROXIES:-0}"
++exec bash /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM/scripts/run_shortq_gnn_dynamic_vpc_common.sh
+diff --git a/scripts/run_shortq_gnn_dynamic_vpc_common.sh b/scripts/run_shortq_gnn_dynamic_vpc_common.sh
+index 75ba16a..66bb97e 100755
+--- a/scripts/run_shortq_gnn_dynamic_vpc_common.sh
++++ b/scripts/run_shortq_gnn_dynamic_vpc_common.sh
+@@ -173,6 +173,20 @@ PLACEMENT_TRACE="${PLACEMENT_DIR}/gnn_chunk_placements.jsonl"
+ HASH_PREDICTION_TRACE="${PLACEMENT_DIR}/gnn_hash_prediction_occurrences.jsonl"
+ GNN_TIMING_TRACE="${PLACEMENT_DIR}/gnn_prediction_timing.jsonl"
+ PLACEMENT_SUMMARY="${PLACEMENT_DIR}/gnn_placement_summary.json"
++KV_BAYES_ENABLE="${KV_BAYES_ENABLE:-0}"
++KV_BAYES_PRIOR_WEIGHT="${KV_BAYES_PRIOR_WEIGHT:-1}"
++KV_BAYES_PRIOR_FILE="${KV_BAYES_PRIOR_FILE:-${REPO}/Hierarchical_KV/shortq_placement/priors/rank_example.json}"
++KV_BAYES_SCORE_FILE="${PLACEMENT_DIR}/gnn_chunk_scores.jsonl"
++KV_BAYES_GPU_GB="${KV_BAYES_GPU_GB:-10}"
++KV_BAYES_DISK_GB="${KV_BAYES_DISK_GB:-100}"
++KV_BAYES_USE_COST_PROXIES="${KV_BAYES_USE_COST_PROXIES:-0}"
++if [[ "$KV_BAYES_ENABLE" == "1" ]]; then
++  export LMCACHE_GNN_PLACEMENT_DYNAMIC=1 VLLM_KV_IMPORTANCE_DYNAMIC=1
++  SMOKE_FORCE_MIN_UNIQUE_PER_PLACEMENT=0
++  [[ -f "$KV_BAYES_PRIOR_FILE" ]] || {
++    echo "Missing Bayesian prior JSON: $KV_BAYES_PRIOR_FILE" >&2; exit 2;
++  }
++fi
+ CLEAN_OLD_LMCACHE="${CLEAN_OLD_LMCACHE:-1}"
+ FOREIGN_MPS_MAX_MIB="${FOREIGN_MPS_MAX_MIB:-64}"
+ 
+@@ -350,11 +364,22 @@ cat > "${RUN_DIR}/run_config.json" <<JSON
+   "chunk_vote": $GNN_CHUNK_VOTE_CONFIG_JSON,
+   "runtime_metadata": "$RUNTIME_METADATA",
+   "vpc_importance_sidecar": "$VPC_IMPORTANCE_SIDECAR",
++  "bayesian_enabled": $KV_BAYES_ENABLE,
++  "bayes_prior_weight": $KV_BAYES_PRIOR_WEIGHT,
++  "bayes_prior_file": "$KV_BAYES_PRIOR_FILE",
++  "bayes_score_file": "$KV_BAYES_SCORE_FILE",
++  "bayes_gpu_gb": $KV_BAYES_GPU_GB,
++  "bayes_disk_gb": $KV_BAYES_DISK_GB,
++  "bayes_cost_observation_proxies": $KV_BAYES_USE_COST_PROXIES,
+   "gnn_inference_batch_size": $GNN_INFERENCE_BATCH_SIZE,
+   "smoke_force_min_unique_per_placement": $SMOKE_FORCE_MIN_UNIQUE_PER_PLACEMENT
+ }
+ JSON
+ 
++BAYES_PRECOMPUTE_ARGS=()
++if [[ "$KV_BAYES_ENABLE" == "1" ]]; then
++  BAYES_PRECOMPUTE_ARGS=(--bayes_scores_only --bayes_score_file "$KV_BAYES_SCORE_FILE")
++fi
+ echo "===== SHORT-Q PRECOMPUTE ($PROFILE) ====="
+ python experiments/precompute_shortq_placements.py \
+   --dataset_name "$DATASET_NAME" --max_questions "$NUM_QUESTIONS" --retrieval_top_k "$RETRIEVAL_TOP_K" \
+@@ -367,8 +392,19 @@ python experiments/precompute_shortq_placements.py \
+   --placement_trace "$PLACEMENT_TRACE" --hash_prediction_trace "$HASH_PREDICTION_TRACE" \
+   --timing_trace "$GNN_TIMING_TRACE" --summary "$PLACEMENT_SUMMARY" \
+   --smoke_force_min_unique_per_placement "$SMOKE_FORCE_MIN_UNIQUE_PER_PLACEMENT" \
++  "${BAYES_PRECOMPUTE_ARGS[@]}" \
+   > "${LOG_DIR}/gnn_precompute.log" 2>&1
+ 
++if [[ "$KV_BAYES_ENABLE" == "1" ]]; then
++  python - "$KV_BAYES_SCORE_FILE" "$NUM_QUESTIONS" <<'PY'
++import json, sys
++rows=[json.loads(x) for x in open(sys.argv[1]) if x.strip()]
++assert len(rows)==int(sys.argv[2]), (len(rows),sys.argv[2])
++assert all(isinstance(row['chunks'],list) and row['chunks'] for row in rows)
++print('[BAYES_SCORES_READY] requests=',len(rows),
++      'chunks=',sum(len(row['chunks']) for row in rows))
++PY
++else
+ python - "$RUNTIME_METADATA" "$VPC_IMPORTANCE_SIDECAR" "$PLACEMENT_SUMMARY" <<'PY'
+ import json, sys
+ runtime=json.load(open(sys.argv[1])); sidecar=json.load(open(sys.argv[2])); summary=json.load(open(sys.argv[3]))
+@@ -380,6 +416,7 @@ print('placement_entries', len(runtime))
+ print('placement_counts', summary['unique_runtime_placement_counts'])
+ print('vpc_sidecar_requests', len(sidecar))
+ PY
++fi
+ 
+ L2_JSON=$(python - "$L2_DIR" "$KV_FS_SHARED_WORKERS" \
+   "$KV_FS_LOOKUP_WORKERS" "$KV_FS_RETRIEVE_WORKERS" \
+@@ -466,6 +503,23 @@ DARGS=(
+   --deterministic_request_ids --output_dir "$RESULT_DIR"
+ )
+ 
++if [[ "$KV_BAYES_ENABLE" == "1" ]]; then
++  DARGS+=(
++    --bayes_score_file "$KV_BAYES_SCORE_FILE"
++    --bayes_prior_file "$KV_BAYES_PRIOR_FILE"
++    --bayes_prior_weight "$KV_BAYES_PRIOR_WEIGHT"
++    --bayes_gpu_gb "$KV_BAYES_GPU_GB"
++    --bayes_cpu_gb "$L1_GB"
++    --bayes_disk_gb "$KV_BAYES_DISK_GB"
++    --bayes_metadata_file "$RUNTIME_METADATA"
++    --bayes_vpc_file "$VPC_IMPORTANCE_SIDECAR"
++    --bayes_lmcache_log "${LOG_DIR}/lmcache.log"
++  )
++  if [[ "$KV_BAYES_USE_COST_PROXIES" == "1" ]]; then
++    DARGS+=(--bayes_use_cost_proxies)
++  fi
++fi
++
+ if [[ "$KV_COLD_WARM_STORE_BARRIER" == "1" ]]; then
+   DARGS+=(
+     --between_phases_store_barrier
+@@ -534,7 +588,7 @@ if aware:
+ else:
+     assert '[GNN_AWARE_VPC_INIT]' not in vl, 'GNN-aware VPC initialized while gate is off'
+ 
+-if profile.endswith('_smoke'):
++if profile.endswith('_smoke') and __import__('os').environ.get('KV_BAYES_ENABLE') != '1':
+     counts=placement['unique_runtime_placement_counts']
+     assert all(counts.get(t,0) >= 2 for t in ('gpu','cpu','disk')), counts
+     if aware:
+@@ -550,6 +604,12 @@ if profile.endswith('_smoke'):
+         'smoke never persisted a CPU-labelled chunk in L1'
+     assert '[GNN_DYNAMIC_L2_COMMIT]' in lm, 'smoke never completed an L2 commit'
+     print('GNN_DYNAMIC_VPC_SMOKE_PASS')
++if __import__('os').environ.get('KV_BAYES_ENABLE') == '1':
++    from pathlib import Path
++    dyn=json.loads(Path(__import__('os').environ['LMCACHE_GNN_PLACEMENT_METADATA']).read_text())
++    assert dyn and all(t in ('gpu','cpu','disk','drop') for t in dyn.values())
++    assert (results/'bayes_wave_history.json').exists()
++    print('BAYES_WAVE_RUN_PASS', len(dyn))
+ print('GNN_DYNAMIC_VPC_RUN_PASS')
+ PY
+ 
+diff --git a/tests/test_bayesian_mapper_cpu.py b/tests/test_bayesian_mapper_cpu.py
+new file mode 100644
+index 0000000..1ac9ac2
+--- /dev/null
++++ b/tests/test_bayesian_mapper_cpu.py
+@@ -0,0 +1,155 @@
++"""Pure Python checks; no GPU, network or vLLM service required."""
++from __future__ import annotations
++
++import json
++from pathlib import Path
++import tempfile
++import unittest
++
++from Hierarchical_KV.shortq_placement.bayesian_mapper import (
++    WaveBayesianMapper, LmcacheLogCostReader,
++)
++
++
++class BayesianMapperTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.dir = Path(self.tmp.name)
++        self.prior = self.dir / 'prior.json'
++        self.scores = self.dir / 'scores.jsonl'
++        self.metadata = self.dir / 'placement.json'
++        self.vpc = self.dir / 'sidecar.json'
++        self.prior.write_text(json.dumps({
++            'score_bin_edges': [0, 25, 50, 75, 100],
++            'score_bin_probabilities': [0.25] * 4,
++            'cost_prior_ms': {'cpu': 20, 'disk': 500, 'recompute': 100},
++        }))
++        rows = [
++            {'source_index': 0, 'chunks': [
++                {'chunk_hash': 'a' * 64, 'score': 98},
++                {'chunk_hash': 'b' * 64, 'score': 78},
++                {'chunk_hash': 'c' * 64, 'score': 50},
++                {'chunk_hash': 'd' * 64, 'score': 20},
++            ]},
++            {'source_index': 1, 'chunks': [
++                {'chunk_hash': 'a' * 64, 'score': 98},
++                {'chunk_hash': 'e' * 64, 'score': 77},
++                {'chunk_hash': 'f' * 64, 'score': 10},
++            ]},
++        ]
++        self.scores.write_text(''.join(json.dumps(r) + '\n' for r in rows))
++
++    def mapper(self, weight=1, gpu=10, cpu=100, disk=100):
++        return WaveBayesianMapper(self.prior, weight, gpu, cpu, disk,
++                                  self.scores, self.metadata, self.vpc)
++
++    def test_recompute_thresholded_cost_tax_and_monotonicity(self):
++        m = self.mapper()
++        p = m.bands()['fractions']
++        self.assertAlmostEqual(p['gpu'], 10 / 210)
++        self.assertAlmostEqual(p['cpu'], 100 / 210)  # CPU faster: no tax
++        self.assertAlmostEqual(p['disk'], 100 / 210 * .2)  # 5x slower
++        self.assertAlmostEqual(sum(p.values()), 1.0)
++        old_drop = p['drop']
++        m.observe_cost('disk', 200)
++        self.assertAlmostEqual(m.estimated_cost('disk'), 350)  # w=1, half prior
++        self.assertLess(m.bands()['fractions']['drop'], old_drop)
++
++    def test_prior_weight_is_fixed_even_with_many_observations(self):
++        m = self.mapper(weight=1)
++        m.observe_cost('cpu', 80, count=10000)
++        self.assertAlmostEqual(m.estimated_cost('cpu'), 50)
++        a = self.mapper(weight=0)
++        a.observe_cost('cpu', 80, count=10000)
++        self.assertAlmostEqual(a.estimated_cost('cpu'), 80)
++        b = self.mapper(weight=2)
++        b.observe_cost('cpu', 80, count=10000)
++        self.assertAlmostEqual(b.estimated_cost('cpu'), 40)
++
++    def test_unique_score_samples_and_bayesian_histogram(self):
++        m = self.mapper()
++        self.assertAlmostEqual(m.percentile(50), 0.5)
++        m.observe_scores([0])
++        self.assertEqual(len(m.seen_scores), 4)
++        m.observe_scores([1])
++        self.assertEqual(len(m.seen_scores), 6)  # repeated first hash counted once
++        self.assertAlmostEqual(sum(m.probabilities()), 1.0)
++        self.assertLess(m.percentile(20), m.percentile(78))
++
++    def test_prefix_closure_favors_discard_over_repair(self):
++        b = {'gpu': 0.9, 'cpu': .5, 'disk': .3}
++        # GPU, DROP, CPU: repairing the DROP costs .1; discarding CPU costs .03.
++        r, cutoff, feasible = WaveBayesianMapper._prefix_closure(
++            ['gpu', 'drop', 'cpu'], [.95, .2, .53], ['h1', 'h2', 'h3'], {}, b)
++        self.assertTrue(feasible)
++        self.assertEqual(cutoff, 1)
++        self.assertEqual(r, ['gpu', 'drop', 'drop'])
++
++    def test_fixed_conflict_is_diagnosed_not_migrated(self):
++        b = {'gpu': .9, 'cpu': .5, 'disk': .3}
++        r, cutoff, feasible = WaveBayesianMapper._prefix_closure(
++            ['cpu', 'gpu'], [.6, .99], ['h1', 'h2'],
++            {'h1': 'drop', 'h2': 'gpu'}, b)
++        self.assertFalse(feasible)
++        self.assertEqual(r, ['drop', 'gpu'])
++
++    def test_two_wave_snapshot_and_immutable_hash(self):
++        m = self.mapper()
++        w1 = m.publish_wave([0], 'cold')
++        self.assertEqual(w1['epoch'], 1)
++        first = dict(m.assigned)
++        sidecar1 = json.loads(self.vpc.read_text())
++        self.assertEqual(len(sidecar1['0']), 32 * 4)
++        m.observe_scores([0])
++        m.observe_cost('disk', 200, count=100)
++        w2 = m.publish_wave([1], 'warm')
++        self.assertEqual(w2['epoch'], 2)
++        self.assertEqual(first['a' * 64], m.assigned['a' * 64])
++        self.assertEqual(len(json.loads(self.metadata.read_text())), len(m.assigned))
++        self.assertIn('0', json.loads(self.vpc.read_text()))
++        self.assertIn('1', json.loads(self.vpc.read_text()))
++        self.assertEqual(w2['score_samples'], 4)  # wave-1 observations only
++
++    def test_lmcache_dynamic_hash_loader_refreshes(self):
++        # Load the standalone metadata module without importing LMCache native deps.
++        import importlib.util
++        import logging
++        import os
++        import sys
++        import types
++        import time
++        from unittest.mock import patch
++        root = Path(__file__).resolve().parents[1]
++        path = root / 'third_party/LMCache/lmcache/v1/distributed/placement_metadata.py'
++        stub = types.ModuleType('lmcache')
++        stub_log = types.ModuleType('lmcache.logging')
++        stub_log.init_logger = lambda name: logging.getLogger(name)
++        spec = importlib.util.spec_from_file_location('bayes_test_metadata', path)
++        module = importlib.util.module_from_spec(spec)
++        with patch.dict(sys.modules, {'lmcache': stub, 'lmcache.logging': stub_log}), \
++             patch.dict(os.environ, {'LMCACHE_GNN_PLACEMENT_METADATA': str(self.metadata),
++                                     'LMCACHE_GNN_PLACEMENT_DYNAMIC': '1'}):
++            spec.loader.exec_module(module)
++            from Hierarchical_KV.shortq_placement.bayesian_mapper import atomic_json
++            atomic_json(self.metadata, {'aa': 'cpu'})
++            self.assertEqual(module.get_chunk_placement(bytes.fromhex('aa')), 'cpu')
++            atomic_json(self.metadata, {'aa': 'disk'})
++            time.sleep(.28)
++            self.assertEqual(module.get_chunk_placement(bytes.fromhex('aa')), 'disk')
++
++    def test_log_cost_proxies_opt_in(self):
++        m = self.mapper()
++        log = self.dir / 'lm.log'
++        log.write_text('[MP_PREFETCH_DONE] request=2 phase=LOAD lookup_s=0.01 load_wait_s=0.2 load_s=0.8 retained_keys=2 loaded_keys=4 failed_keys=0\n'
++                       'Retrieved 1024 tokens in 0.040 seconds\n')
++        reader = LmcacheLogCostReader(log)
++        counts = reader.collect(m)
++        self.assertEqual(counts, {'cpu_proxy': 1, 'disk_proxy': 1})
++        self.assertAlmostEqual(m.estimated_cost('cpu'), (20 + 20) / 2)
++        self.assertAlmostEqual(m.estimated_cost('disk'), (500 + 200) / 2)
++        self.assertEqual(reader.collect(m), {'cpu_proxy': 0, 'disk_proxy': 0})
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/third_party/LMCache/lmcache/v1/distributed/placement_metadata.py b/third_party/LMCache/lmcache/v1/distributed/placement_metadata.py
+index 3b4b0c0..f87ad24 100644
+--- a/third_party/LMCache/lmcache/v1/distributed/placement_metadata.py
++++ b/third_party/LMCache/lmcache/v1/distributed/placement_metadata.py
+@@ -14,6 +14,7 @@ from __future__ import annotations
+ 
+ import json
+ import os
++import time
+ from pathlib import Path
+ from threading import Lock
+ 
+@@ -23,6 +24,8 @@ logger = init_logger(__name__)
+ _VALID_PLACEMENTS = {"gpu", "cpu", "disk", "drop"}
+ _lock = Lock()
+ _loaded_path: str | None = None
++_loaded_stamp: tuple[int, int] | None = None
++_last_stat_at = 0.0
+ _placements: dict[str, str] = {}
+ _missed: set[str] = set()
+ 
+@@ -32,16 +35,29 @@ def _metadata_path() -> str:
+ 
+ 
+ def _load_if_needed() -> None:
+-    global _loaded_path, _placements
++    global _loaded_path, _loaded_stamp, _last_stat_at, _placements
+     path = _metadata_path()
+-    if path == _loaded_path:
++    dynamic = os.getenv("LMCACHE_GNN_PLACEMENT_DYNAMIC", "0") == "1"
++    # Existing static behavior is unchanged unless the new env flag is on.
++    if not dynamic and path == _loaded_path:
++        return
++    if dynamic and path == _loaded_path and time.monotonic() - _last_stat_at < 0.25:
+         return
+     with _lock:
+-        if path == _loaded_path:
++        if not dynamic and path == _loaded_path:
+             return
+         if not path:
+-            _placements = {}
+-            _loaded_path = path
++            _placements, _loaded_path, _loaded_stamp = {}, path, None
++            return
++        try:
++            st = Path(path).stat()
++            stamp = (st.st_ino, st.st_mtime_ns)
++        except FileNotFoundError:
++            if _loaded_path is not None:
++                return  # Avoid discarding the last good mapping on a transient error.
++            raise
++        _last_stat_at = time.monotonic()
++        if path == _loaded_path and stamp == _loaded_stamp:
+             return
+         raw = json.loads(Path(path).read_text(encoding="utf-8"))
+         if not isinstance(raw, dict):
+@@ -52,9 +68,8 @@ def _load_if_needed() -> None:
+             if placement not in _VALID_PLACEMENTS:
+                 raise ValueError(f"invalid placement for {key}: {value!r}")
+             parsed[str(key).lower()] = placement
+-        _placements = parsed
+-        _loaded_path = path
+-        logger.info("[GNN_PLACEMENT_METADATA] path=%s entries=%d", path, len(parsed))
++        _placements, _loaded_path, _loaded_stamp = parsed, path, stamp
++        logger.info("[GNN_PLACEMENT_METADATA] path=%s entries=%d stamp=%s", path, len(parsed), stamp)
+ 
+ 
+ def get_chunk_placement(
+diff --git a/vllm/v1/request.py b/vllm/v1/request.py
+index f102a1d..7eaf6a8 100644
+--- a/vllm/v1/request.py
++++ b/vllm/v1/request.py
+@@ -38,8 +38,8 @@ if TYPE_CHECKING:
+ 
+ 
+ # [SC] Short-Q placement sidecar helpers.
+-@lru_cache(maxsize=4)
+-def _read_kv_importance_sidecar(path: str) -> dict[str, Any]:
++@lru_cache(maxsize=8)
++def _read_kv_importance_sidecar(path: str, version: tuple[int, int] | None = None) -> dict[str, Any]:
+     """Read a stable experiment sidecar once per engine process.
+ 
+     The Short-Q serving experiments generate this file before vLLM starts, so
+@@ -89,7 +89,15 @@ def _load_kv_importance_placements(request_id: str) -> dict[int, str]:
+     if not path:
+         return {}
+ 
+-    all_placements = _read_kv_importance_sidecar(path)
++    if os.environ.get("VLLM_KV_IMPORTANCE_DYNAMIC", "0") == "1":
++        try:
++            st = os.stat(path)
++            version = (st.st_ino, st.st_mtime_ns)
++        except OSError:
++            version = None
++        all_placements = _read_kv_importance_sidecar(path, version)
++    else:
++        all_placements = _read_kv_importance_sidecar(path)
+     raw_placements: Any = {}
+     for key in _kv_importance_sidecar_keys(request_id):
+         candidate = all_placements.get(key)
