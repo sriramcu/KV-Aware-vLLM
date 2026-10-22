@@ -20,7 +20,8 @@ export GNN_CHUNK_VOTE_POLICY=threshold_with_drop_plurality
 export VLLM_PHASE_TRACE=1 VLLM_PHASE_TRACE_DEVICE_TIMING=0
 export EXPERIMENT_LABEL="${EXPERIMENT_LABEL:-bayes_canonical_smoke}"
 export KV_BAYES_GPU_GB="${KV_BAYES_GPU_GB:-10}"
-export KV_BAYES_DISK_GB="${KV_BAYES_DISK_GB:-100}"
+export LMCACHE_L2_SIZE_GB="${LMCACHE_L2_SIZE_GB:-100}"
+export KV_BAYES_DISK_GB="${KV_BAYES_DISK_GB:-$LMCACHE_L2_SIZE_GB}"
 export KV_BAYES_PRIOR_WEIGHT="${KV_BAYES_PRIOR_WEIGHT:-1}"
 # This narrowly binned prior is diagnostic only: derived from the initial
 # Q12 smoke score range, not an independently calibrated production prior.

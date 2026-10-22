@@ -30,6 +30,9 @@ GNN_INFERENCE_BATCH_SIZE="${GNN_INFERENCE_BATCH_SIZE:-1}"
 KV_GNN_AWARE_VPC="${KV_GNN_AWARE_VPC:-1}"
 KV_GNN_L1_BACKING="${KV_GNN_L1_BACKING:-1}"
 LMCACHE_L1_SIZE_GB="${LMCACHE_L1_SIZE_GB:-200}"
+LMCACHE_L2_SIZE_GB="${LMCACHE_L2_SIZE_GB:-100}"
+LMCACHE_L2_EVICTION_TRIGGER="${LMCACHE_L2_EVICTION_TRIGGER:-0.90}"
+LMCACHE_L2_EVICTION_RATIO="${LMCACHE_L2_EVICTION_RATIO:-0.10}"
 # Optional durability experiment: back every host-resident GNN prompt chunk to
 # L2 while preserving its original VPC/L1 placement. Disabled by default so
 # existing grid runs are unchanged.
@@ -73,16 +76,23 @@ done
 "$VENV/bin/python" - "$LMCACHE_L2_LOAD_MAX_IN_FLIGHT" \
   "$LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT" "$LMCACHE_MP_MAX_INFLIGHT_STORE_GB" \
   "$KV_FS_SHARED_WORKERS" "$KV_FS_LOOKUP_WORKERS" "$KV_FS_RETRIEVE_WORKERS" \
-  "$KV_FS_STORE_WORKERS" "$KV_FS_DELETE_WORKERS" <<'PY'
+  "$KV_FS_STORE_WORKERS" "$KV_FS_DELETE_WORKERS" \
+  "$LMCACHE_L2_SIZE_GB" "$LMCACHE_L2_EVICTION_TRIGGER" "$LMCACHE_L2_EVICTION_RATIO" <<'PY'
 import sys
 load_pf, lookup_pf = map(int, sys.argv[1:3])
 store_cap_gb = float(sys.argv[3])
 shared = int(sys.argv[4])
-workers = list(map(int, sys.argv[5:]))
+# The four per-operation worker counts precede the three L2 capacity/eviction
+# arguments. Do not try to parse float watermarks (e.g. 0.90) as worker counts.
+assert len(sys.argv) == 12, f"Unexpected L2 validation argument count: {len(sys.argv) - 1}"
+workers = list(map(int, sys.argv[5:9]))
+l2_size_gb, trigger, ratio = map(float, sys.argv[9:12])
 assert load_pf > 0 and lookup_pf > 0, (load_pf, lookup_pf)
 assert store_cap_gb >= 0, store_cap_gb
 assert shared > 0, shared
 assert all(x >= 0 for x in workers), workers
+assert l2_size_gb > 0, l2_size_gb
+assert 0 < trigger <= 1 and 0 < ratio <= 1, (trigger, ratio)
 PY
 
 case "$PROFILE" in
@@ -177,8 +187,16 @@ KV_BAYES_ENABLE="${KV_BAYES_ENABLE:-0}"
 KV_BAYES_PRIOR_WEIGHT="${KV_BAYES_PRIOR_WEIGHT:-1}"
 KV_BAYES_PRIOR_FILE="${KV_BAYES_PRIOR_FILE:-${REPO}/Hierarchical_KV/shortq_placement/priors/rank_example.json}"
 KV_BAYES_SCORE_FILE="${PLACEMENT_DIR}/gnn_chunk_scores.jsonl"
+KV_BAYES_SCORE_FORMAT="${KV_BAYES_SCORE_FORMAT:-mean_32_block_rank_scores}"
+case "$KV_BAYES_SCORE_FORMAT" in
+  mean_32_block_rank_scores|expected_ordinal_0_100) ;;
+  *) echo "Unsupported KV_BAYES_SCORE_FORMAT=$KV_BAYES_SCORE_FORMAT" >&2; exit 2 ;;
+esac
 KV_BAYES_GPU_GB="${KV_BAYES_GPU_GB:-10}"
-KV_BAYES_DISK_GB="${KV_BAYES_DISK_GB:-100}"
+KV_BAYES_DISK_GB="${KV_BAYES_DISK_GB:-$LMCACHE_L2_SIZE_GB}"
+if [[ "$KV_BAYES_ENABLE" == "1" && "$KV_BAYES_DISK_GB" != "$LMCACHE_L2_SIZE_GB" ]]; then
+  echo "ERROR: mapper disk budget must match physical L2 size for this experiment" >&2; exit 2
+fi
 KV_BAYES_USE_COST_PROXIES="${KV_BAYES_USE_COST_PROXIES:-0}"
 KV_BAYES_DIRECT_COST_FEEDBACK="${KV_BAYES_DIRECT_COST_FEEDBACK:-0}"
 KV_BAYES_POSTERIOR_MODE="${KV_BAYES_POSTERIOR_MODE:-fixed}"
@@ -196,6 +214,16 @@ if [[ "$KV_BAYES_ENABLE" == "1" ]]; then
   [[ -f "$KV_BAYES_PRIOR_FILE" ]] || {
     echo "Missing Bayesian prior JSON: $KV_BAYES_PRIOR_FILE" >&2; exit 2;
   }
+  # Never silently interpret the old negative rank-score histogram as 0-100.
+  python - "$KV_BAYES_PRIOR_FILE" "$KV_BAYES_SCORE_FORMAT" <<'PY'
+import json, sys
+prior = json.load(open(sys.argv[1]))
+actual, expected = prior.get('score_format'), sys.argv[2]
+if actual != expected:
+    raise SystemExit(f"Bayesian prior score_format={actual!r} != selected {expected!r}; "
+                     "regenerate or select the compatible score histogram")
+print('[BAYES_SCORE_PRIOR_FORMAT]', actual, flush=True)
+PY
 fi
 CLEAN_OLD_LMCACHE="${CLEAN_OLD_LMCACHE:-1}"
 FOREIGN_MPS_MAX_MIB="${FOREIGN_MPS_MAX_MIB:-64}"
@@ -387,8 +415,12 @@ cat > "${RUN_DIR}/run_config.json" <<JSON
   "bayes_prior_weight": $KV_BAYES_PRIOR_WEIGHT,
   "bayes_prior_file": "$KV_BAYES_PRIOR_FILE",
   "bayes_score_file": "$KV_BAYES_SCORE_FILE",
+  "bayes_score_format": "$KV_BAYES_SCORE_FORMAT",
   "bayes_gpu_gb": $KV_BAYES_GPU_GB,
   "bayes_disk_gb": $KV_BAYES_DISK_GB,
+  "lmcache_l2_size_gb": $LMCACHE_L2_SIZE_GB,
+  "lmcache_l2_eviction_trigger": $LMCACHE_L2_EVICTION_TRIGGER,
+  "lmcache_l2_eviction_ratio": $LMCACHE_L2_EVICTION_RATIO,
   "bayes_cost_observation_proxies": $KV_BAYES_USE_COST_PROXIES,
   "bayes_direct_timing": $KV_BAYES_DIRECT_COST_FEEDBACK,
   "bayes_readmission": $KV_BAYES_READMISSION,
@@ -403,7 +435,8 @@ JSON
 
 BAYES_PRECOMPUTE_ARGS=()
 if [[ "$KV_BAYES_ENABLE" == "1" ]]; then
-  BAYES_PRECOMPUTE_ARGS=(--bayes_scores_only --bayes_score_file "$KV_BAYES_SCORE_FILE")
+  BAYES_PRECOMPUTE_ARGS=(--bayes_scores_only --bayes_score_file "$KV_BAYES_SCORE_FILE"
+                         --bayes_score_format "$KV_BAYES_SCORE_FORMAT")
 fi
 echo "===== SHORT-Q PRECOMPUTE ($PROFILE) ====="
 python experiments/precompute_shortq_placements.py \
@@ -421,10 +454,11 @@ python experiments/precompute_shortq_placements.py \
   > "${LOG_DIR}/gnn_precompute.log" 2>&1
 
 if [[ "$KV_BAYES_ENABLE" == "1" ]]; then
-  python - "$KV_BAYES_SCORE_FILE" "$NUM_QUESTIONS" <<'PY'
+  python - "$KV_BAYES_SCORE_FILE" "$NUM_QUESTIONS" "$KV_BAYES_SCORE_FORMAT" <<'PY'
 import json, sys
 rows=[json.loads(x) for x in open(sys.argv[1]) if x.strip()]
 assert len(rows)==int(sys.argv[2]), (len(rows),sys.argv[2])
+assert all(row.get('score_format') == sys.argv[3] for row in rows), 'Wrong GNN score format'
 assert all(isinstance(row['chunks'],list) and row['chunks'] for row in rows)
 print('[BAYES_SCORES_READY] requests=',len(rows),
       'chunks=',sum(len(row['chunks']) for row in rows))
@@ -445,7 +479,8 @@ fi
 
 L2_JSON=$(python - "$L2_DIR" "$KV_FS_SHARED_WORKERS" \
   "$KV_FS_LOOKUP_WORKERS" "$KV_FS_RETRIEVE_WORKERS" \
-  "$KV_FS_STORE_WORKERS" "$KV_FS_DELETE_WORKERS" <<'PY'
+  "$KV_FS_STORE_WORKERS" "$KV_FS_DELETE_WORKERS" \
+  "$LMCACHE_L2_SIZE_GB" "$LMCACHE_L2_EVICTION_TRIGGER" "$LMCACHE_L2_EVICTION_RATIO" <<'PY'
 import json,sys
 spec = {
     'type': 'fs_native',
@@ -453,6 +488,12 @@ spec = {
     'num_workers': int(sys.argv[2]),
     'use_odirect': False,
 }
+size, trigger, ratio = map(float, sys.argv[7:10])
+if size <= 0 or not 0 < trigger <= 1 or not 0 < ratio <= 1:
+    raise ValueError('L2 capacity must be positive; watermarks must be in (0,1]')
+spec['max_capacity_gb'] = size
+spec['eviction'] = {'eviction_policy': 'LRU', 'trigger_watermark': trigger,
+                    'eviction_ratio': ratio}
 names = ('lookup', 'retrieve', 'store', 'delete')
 counts = map(int, sys.argv[3:7])
 per_op = {name: count for name, count in zip(names, counts) if count > 0}

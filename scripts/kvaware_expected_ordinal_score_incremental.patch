@@ -1,0 +1,485 @@
+diff --git a/Hierarchical_KV/shortq_placement/bayesian_mapper.py b/Hierarchical_KV/shortq_placement/bayesian_mapper.py
+index 8fa4492..23d6aba 100644
+--- a/Hierarchical_KV/shortq_placement/bayesian_mapper.py
++++ b/Hierarchical_KV/shortq_placement/bayesian_mapper.py
+@@ -162,6 +162,26 @@ class WaveBayesianMapper:
+         fraction = min(1.0, max(0.0, (score - lo) / (hi - lo)))
+         return min(1.0, max(0.0, sum(bins[:idx]) + bins[idx] * fraction))
+ 
++    def score_at_percentile(self, percentile: float) -> float:
++        """Invert current piecewise-uniform posterior CDF for diagnostics.
++
++        These raw cutoffs are approximate within histogram bins, not exact
++        empirical percentiles; nothing here changes placement decisions.
++        """
++        if not math.isfinite(percentile) or not 0 <= percentile <= 1:
++            raise ValueError("percentile must be finite and in [0,1]")
++        if percentile <= 0:
++            return self.edges[0]
++        if percentile >= 1:
++            return self.edges[-1]
++        acc = 0.0
++        for i, mass in enumerate(self.probabilities()):
++            end = acc + mass
++            if mass > 0 and percentile <= end:
++                return self.edges[i] + (self.edges[i+1] - self.edges[i]) * ((percentile-acc)/mass)
++            acc = end
++        return self.edges[-1]
++
+     def bands(self) -> dict[str, float]:
+         csum = sum(self.capacities.values())
+         tau = self.estimated_cost("recompute")
+@@ -286,6 +306,9 @@ class WaveBayesianMapper:
+             "cost_sample_counts": dict(self.cost_counts),
+             "cost_estimate_ms": {t: self.estimated_cost(t) for t in ("cpu", "disk", "recompute")},
+             "thresholds": {k: b[k] for k in TIERS},
++            "score_format": self.prior.get("score_format", "unknown"),
++            "raw_score_cutoffs": {k: self.score_at_percentile(b[k]) for k in TIERS},
++            "raw_score_cutoffs_note": "piecewise-uniform posterior histogram inverse, not exact quantiles",
+             "nominal_shares": b["fractions"],
+             "fixed_conflict_requests": contradictions,
+             "mapped_counts": dict(Counter(self.assigned.values())),
+diff --git a/Hierarchical_KV/shortq_placement/expected_ordinal.py b/Hierarchical_KV/shortq_placement/expected_ordinal.py
+new file mode 100644
+index 0000000..18d070c
+--- /dev/null
++++ b/Hierarchical_KV/shortq_placement/expected_ordinal.py
+@@ -0,0 +1,58 @@
++"""Class-head ordinal expectation for complete LMCache chunks.
++
++Class order is the frozen Short-Q checkpoint order: DROP, DISK, CPU, GPU.
++The equally spaced ordinal values (0,1,2,3) are a documented convention,
++NOT calibrated hit probabilities and NOT hardware placement decisions.
++"""
++from __future__ import annotations
++
++import math
++
++SCORE_FORMAT = "expected_ordinal_0_100"
++RANK_SCORE_FORMAT = "mean_32_block_rank_scores"
++
++
++def expected_ordinal_from_logits(logits: list[list[float]], blocks_per_chunk: int = 32,
++                                 full_chunks: int | None = None) -> list[float]:
++    """Pure-Python reference used to derive offline score-distribution priors.
++
++    Only complete chunks are scored; the trailing incomplete chunk is omitted.
++    Softmax is stabilized to avoid overflow with large logits.
++    """
++    if blocks_per_chunk <= 0:
++        raise ValueError("blocks_per_chunk must be positive")
++    if full_chunks is None:
++        full_chunks = len(logits) // blocks_per_chunk
++    if full_chunks < 0 or full_chunks * blocks_per_chunk > len(logits):
++        raise ValueError("inconsistent complete chunk count and logit length")
++    values: list[float] = []
++    for block in logits[:full_chunks * blocks_per_chunk]:
++        if len(block) != 4 or any(not math.isfinite(float(v)) for v in block):
++            raise ValueError("expected exactly four finite class logits")
++        maximum = max(block)
++        weights = [math.exp(float(v) - maximum) for v in block]
++        total = sum(weights)
++        values.append(100.0 / 3.0 * (weights[1] + 2 * weights[2] + 3 * weights[3]) / total)
++    return [sum(values[i:i + blocks_per_chunk]) / blocks_per_chunk
++            for i in range(0, len(values), blocks_per_chunk)]
++
++
++def expected_ordinal_from_torch_logits(class_logits, full_chunks: int,
++                                       blocks_per_chunk: int = 32) -> list[float]:
++    """Vectorized runtime preprocessing, in one GPU -> host result per request."""
++    import torch
++    if blocks_per_chunk <= 0 or full_chunks < 0:
++        raise ValueError("invalid chunk geometry")
++    block_count = full_chunks * blocks_per_chunk
++    if class_logits.ndim != 2 or class_logits.shape[-1] != 4 or class_logits.shape[0] < block_count:
++        raise ValueError("class logits shape mismatches LMCache chunks")
++    if not full_chunks:
++        return []
++    logits = class_logits[:block_count].float()
++    if not bool(torch.isfinite(logits).all()):
++        raise ValueError("nonfinite class logits")
++    probs = logits.softmax(dim=-1)
++    # Classes: drop=0, disk=1, cpu=2, gpu=3.
++    expected = probs[:, 1] + 2.0 * probs[:, 2] + 3.0 * probs[:, 3]
++    scores = expected.reshape(full_chunks, blocks_per_chunk).mean(dim=-1) * (100.0 / 3.0)
++    return [float(v) for v in scores.tolist()]
+diff --git a/experiments/build_expected_ordinal_prior.py b/experiments/build_expected_ordinal_prior.py
+new file mode 100644
+index 0000000..ca52462
+--- /dev/null
++++ b/experiments/build_expected_ordinal_prior.py
+@@ -0,0 +1,152 @@
++"""Build an exploratory 0–100 class-expectation score prior from a raw-head probe.
++
++This does NOT train the GNN, measure hardware, or derive priors automatically
++from serving-test queries. If supplied the Q650 probe, its output is only
++valid for exploratory/diagnostic Q650 experiments (test-distribution leakage).
++For future held-out evaluations, use a separate calibration split instead.
++"""
++from __future__ import annotations
++
++import argparse
++from contextlib import contextmanager
++import json
++import math
++from pathlib import Path
++import statistics
++import zipfile
++import sys
++
++REPO_ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(REPO_ROOT))
++
++from Hierarchical_KV.shortq_placement.expected_ordinal import (
++    SCORE_FORMAT, expected_ordinal_from_logits,
++)
++
++
++@contextmanager
++def open_probe(path: Path):
++    if path.suffix.lower() == '.zip':
++        with zipfile.ZipFile(path) as archive:
++            matching = [n for n in archive.namelist()
++                        if n.endswith('/placement/gnn_raw_heads_16token.jsonl')]
++            if len(matching) != 1:
++                raise ValueError(f'Expected exactly one raw-head JSONL in ZIP, found {matching}')
++            with archive.open(matching[0]) as stream:
++                yield (json.loads(line) for line in stream if line.strip())
++    else:
++        with path.open(encoding='utf-8') as stream:
++            yield (json.loads(line) for line in stream if line.strip())
++
++
++def quantile_edges(scores: list[float], maximum_bins: int) -> list[float]:
++    """Variable-width histogram bins, approximately equal empirical mass.
++
++    Unlike coarse uniform 25-point bins these resolve the strongly clustered
++    scores at the lower end of the 0–100 classification expectation range.
++    """
++    ordered = sorted(scores)
++    n = len(ordered)
++    bin_count = min(maximum_bins, n)
++    edges = [0.0]
++    for b in range(1, bin_count):
++        offset = b * n // bin_count
++        left, right = ordered[offset - 1], ordered[offset]
++        candidate = (left + right) / 2
++        if left < right and edges[-1] < candidate < 100.0:
++            edges.append(candidate)
++    edges.append(100.0)
++    if any(b <= a for a, b in zip(edges, edges[1:])):
++        raise ValueError('Nonincreasing histogram edges')
++    return edges
++
++
++def create_prior(raw_path: Path, costs_path: Path, *, bins: int) -> dict:
++    if bins < 4 or bins > 1024:
++        raise ValueError('bin limit must be in [4,1024]')
++    original = json.loads(costs_path.read_text(encoding='utf-8'))
++    if not {'cpu', 'disk', 'recompute'} <= original.get('cost_prior_ms', {}).keys():
++        raise ValueError('Cost prior must contain CPU, disk and recompute values')
++    for k in ('cpu', 'disk', 'recompute'):
++        if not math.isfinite(float(original['cost_prior_ms'][k])) or float(original['cost_prior_ms'][k]) <= 0:
++            raise ValueError(f'Invalid hardware cost prior {k}')
++    first_seen: dict[str, float] = {}
++    requests = 0
++    occurrences = 0
++    with open_probe(raw_path) as rows:
++        for row in rows:
++            requests += 1
++            if int(row['native_block_tokens']) != 16 or int(row['lmcache_chunk_tokens']) != 512:
++                raise ValueError('Unexpected 16/512 chunk geometry')
++            bpc = int(row['blocks_per_chunk'])
++            if bpc != 32:
++                raise ValueError('Expected 32 native blocks per full chunk')
++            hashes = row['chunk_hashes']
++            logits = row['block_class_logits']
++            if len(hashes) != int(row['prompt_tokens']) // 512:
++                raise ValueError('Hashes do not match complete LMCache prompt chunks')
++            computed = expected_ordinal_from_logits(logits, bpc, full_chunks=len(hashes))
++            if len(computed) != len(hashes):
++                raise ValueError(f'Incorrect complete chunk count in request {requests}')
++            occurrences += len(hashes)
++            for h, v in zip(hashes, computed, strict=True):
++                if len(h) != 64 or not 0 <= v <= 100 or not math.isfinite(v):
++                    raise ValueError(f'Invalid score/hash: {h} {v}')
++                first_seen.setdefault(str(h).lower(), v)
++    if not first_seen:
++        raise ValueError('No complete chunks in calibration raw heads')
++    scores = list(first_seen.values())
++    edges = quantile_edges(scores, bins)
++    import bisect
++    counts = [0] * (len(edges) - 1)
++    for score in scores:
++        idx = max(0, min(len(counts) - 1, bisect.bisect_right(edges, score) - 1))
++        counts[idx] += 1
++    n = len(scores)
++    prior = dict(original)
++    prior.update({
++        'score_format': SCORE_FORMAT,
++        'score_bin_edges': edges,
++        'score_bin_probabilities': [c / n for c in counts],
++        'score_calibration': {
++            'method': 'first-observed unique prefix-hash expectation of DROP=0, DISK=1, CPU=2, GPU=3',
++            'score_range': [0, 100],
++            'source': str(raw_path),
++            'requests': requests,
++            'chunk_occurrences': occurrences,
++            'distinct_chunk_hashes': n,
++            'bins': len(counts),
++            'min': min(scores),
++            'max': max(scores),
++            'median': statistics.median(scores),
++            'test_workload_leakage_warning': (
++                'If this raw-head file is from Q650 TEST (such as job 29864), this prior '
++                'is ONLY suitable for exploratory analysis, not paper held-out results.'),
++        },
++        'comment': ('Expected ordinal score distribution from GNN class logits. '
++                    'Hardware cost priors were copied UNCHANGED from cost-prior input. '
++                    'Do not assume the score histogram is hardware-dependent or test-independent.'),
++    })
++    return prior
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__)
++    ap.add_argument('--raw-heads', type=Path, required=True,
++                    help='Probe ZIP from job 29864, or gnn_raw_heads_16token.jsonl')
++    ap.add_argument('--cost-prior', type=Path, required=True,
++                    help='Hardware cost prior JSON (e.g. successful L40 job 29859)')
++    ap.add_argument('--out', type=Path, required=True)
++    ap.add_argument('--bins', type=int, default=256)
++    a = ap.parse_args()
++    result = create_prior(a.raw_heads, a.cost_prior, bins=a.bins)
++    if a.out.resolve() == a.cost_prior.resolve():
++        ap.error('Refusing to overwrite calibrated cost-prior input')
++    a.out.parent.mkdir(parents=True, exist_ok=True)
++    a.out.write_text(json.dumps(result, indent=2, sort_keys=True, allow_nan=False) + '\n')
++    print('[EXPECTED_ORDINAL_PRIOR]',a.out,'hashes=',result['score_calibration']['distinct_chunk_hashes'],
++          'bins=',result['score_calibration']['bins'], 'costs_ms=',result['cost_prior_ms'],flush=True)
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/experiments/precompute_shortq_placements.py b/experiments/precompute_shortq_placements.py
+index 483c653..4e911c3 100644
+--- a/experiments/precompute_shortq_placements.py
++++ b/experiments/precompute_shortq_placements.py
+@@ -35,6 +35,11 @@ from experiments.mp_nognn_project import (  # noqa: E402
+     load_questions,
+     reorder_requests,
+ )
++from Hierarchical_KV.shortq_placement.expected_ordinal import (
++    SCORE_FORMAT as EXPECTED_ORDINAL_FORMAT,
++    RANK_SCORE_FORMAT,
++    expected_ordinal_from_torch_logits,
++)
+ from Hierarchical_KV.shortq_placement.block_prediction import get_block_predictions  # noqa: E402
+ from Hierarchical_KV.shortq_placement.chunk_voting import (
+     assign_random_exclusive_placements,
+@@ -91,6 +96,9 @@ def parse_args() -> argparse.Namespace:
+     p.add_argument("--bayes_scores_only", action="store_true",
+                    help="Export prefix-hash chunk scores only; mapper assigns tiers during serving")
+     p.add_argument("--bayes_score_file", default="", help="JSONL chunk-score artifact")
++    p.add_argument("--bayes_score_format", choices=[RANK_SCORE_FORMAT, EXPECTED_ORDINAL_FORMAT],
++                   default=RANK_SCORE_FORMAT,
++                   help="Score representation for Bayesian path; no effect on legacy voting")
+     p.add_argument(
+         "--vpc_importance_sidecar",
+         default="",
+@@ -545,18 +553,25 @@ def main() -> None:
+             post_t0 = time.perf_counter()
+             valid_blocks = int(block_mask[0].sum().item())
+             if args.bayes_scores_only:
+-                # Mean of the 32 real 16-token block rank-head outputs per
+-                # complete 512-token LMCache chunk. Incomplete tail excluded.
++                # Score complete LMCache chunks only. The incomplete tail is
++                # not persisted and must not influence any complete chunk.
+                 hashes = hasher.compute_chunk_hashes(serving_ids)
+                 if len(hashes) != len(serving_ids) // args.chunk_size:
+                     raise AssertionError("LMCache hash/chunk alignment mismatch")
+-                score_row = {"source_index": source_index, "chunks": []}
+-                for chunk_index, chunk_hash in enumerate(hashes):
+-                    lo = chunk_index * blocks_per_chunk
+-                    hi = lo + blocks_per_chunk
+-                    score = float(rank_scores[lo:hi].float().mean().item())
+-                    if not math.isfinite(score):
+-                        raise ValueError(f"nonfinite rank score source={source_index} chunk={chunk_index}")
++                score_row = {"source_index": source_index,
++                             "score_format": args.bayes_score_format, "chunks": []}
++                if args.bayes_score_format == EXPECTED_ORDINAL_FORMAT:
++                    chunk_scores = expected_ordinal_from_torch_logits(
++                        class_logits, len(hashes), blocks_per_chunk)
++                else:
++                    # Preserve the historical rank-head mean path exactly.
++                    chunk_scores = [float(rank_scores[j*blocks_per_chunk:(j+1)*blocks_per_chunk]
++                                          .float().mean().item()) for j in range(len(hashes))]
++                for chunk_index, (chunk_hash, score) in enumerate(zip(hashes, chunk_scores, strict=True)):
++                    if not math.isfinite(score) or (args.bayes_score_format == EXPECTED_ORDINAL_FORMAT
++                                                     and not 0 <= score <= 100):
++                        raise ValueError(f"invalid {args.bayes_score_format} score "
++                                         f"source={source_index} chunk={chunk_index}: {score}")
+                     score_row["chunks"].append({"chunk_hash": chunk_hash.hex(), "score": score})
+                 bayes_score_rows.append(score_row)
+                 print(f"[BAYES_SCORE_PRECOMPUTE] source={source_index} "
+@@ -864,6 +879,7 @@ def main() -> None:
+         "smoke_force_min_unique_per_placement": args.smoke_force_min_unique_per_placement,
+         "smoke_runtime_overrides": smoke_overrides,
+         "bayes_scores_only": args.bayes_scores_only,
++        "bayes_score_format": args.bayes_score_format if args.bayes_scores_only else None,
+         "bayes_score_file": args.bayes_score_file or None,
+         "runtime_metadata": str(runtime_path),
+         "vpc_importance_sidecar": args.vpc_importance_sidecar or None,
+diff --git a/scripts/run_shortq_gnn_dynamic_vpc_common.sh b/scripts/run_shortq_gnn_dynamic_vpc_common.sh
+index 1b1ef13..f4ea1da 100644
+--- a/scripts/run_shortq_gnn_dynamic_vpc_common.sh
++++ b/scripts/run_shortq_gnn_dynamic_vpc_common.sh
+@@ -187,6 +187,11 @@ KV_BAYES_ENABLE="${KV_BAYES_ENABLE:-0}"
+ KV_BAYES_PRIOR_WEIGHT="${KV_BAYES_PRIOR_WEIGHT:-1}"
+ KV_BAYES_PRIOR_FILE="${KV_BAYES_PRIOR_FILE:-${REPO}/Hierarchical_KV/shortq_placement/priors/rank_example.json}"
+ KV_BAYES_SCORE_FILE="${PLACEMENT_DIR}/gnn_chunk_scores.jsonl"
++KV_BAYES_SCORE_FORMAT="${KV_BAYES_SCORE_FORMAT:-mean_32_block_rank_scores}"
++case "$KV_BAYES_SCORE_FORMAT" in
++  mean_32_block_rank_scores|expected_ordinal_0_100) ;;
++  *) echo "Unsupported KV_BAYES_SCORE_FORMAT=$KV_BAYES_SCORE_FORMAT" >&2; exit 2 ;;
++esac
+ KV_BAYES_GPU_GB="${KV_BAYES_GPU_GB:-10}"
+ KV_BAYES_DISK_GB="${KV_BAYES_DISK_GB:-$LMCACHE_L2_SIZE_GB}"
+ if [[ "$KV_BAYES_ENABLE" == "1" && "$KV_BAYES_DISK_GB" != "$LMCACHE_L2_SIZE_GB" ]]; then
+@@ -209,6 +214,16 @@ if [[ "$KV_BAYES_ENABLE" == "1" ]]; then
+   [[ -f "$KV_BAYES_PRIOR_FILE" ]] || {
+     echo "Missing Bayesian prior JSON: $KV_BAYES_PRIOR_FILE" >&2; exit 2;
+   }
++  # Never silently interpret the old negative rank-score histogram as 0-100.
++  python - "$KV_BAYES_PRIOR_FILE" "$KV_BAYES_SCORE_FORMAT" <<'PY'
++import json, sys
++prior = json.load(open(sys.argv[1]))
++actual, expected = prior.get('score_format'), sys.argv[2]
++if actual != expected:
++    raise SystemExit(f"Bayesian prior score_format={actual!r} != selected {expected!r}; "
++                     "regenerate or select the compatible score histogram")
++print('[BAYES_SCORE_PRIOR_FORMAT]', actual, flush=True)
++PY
+ fi
+ CLEAN_OLD_LMCACHE="${CLEAN_OLD_LMCACHE:-1}"
+ FOREIGN_MPS_MAX_MIB="${FOREIGN_MPS_MAX_MIB:-64}"
+@@ -400,6 +415,7 @@ cat > "${RUN_DIR}/run_config.json" <<JSON
+   "bayes_prior_weight": $KV_BAYES_PRIOR_WEIGHT,
+   "bayes_prior_file": "$KV_BAYES_PRIOR_FILE",
+   "bayes_score_file": "$KV_BAYES_SCORE_FILE",
++  "bayes_score_format": "$KV_BAYES_SCORE_FORMAT",
+   "bayes_gpu_gb": $KV_BAYES_GPU_GB,
+   "bayes_disk_gb": $KV_BAYES_DISK_GB,
+   "lmcache_l2_size_gb": $LMCACHE_L2_SIZE_GB,
+@@ -419,7 +435,8 @@ JSON
+ 
+ BAYES_PRECOMPUTE_ARGS=()
+ if [[ "$KV_BAYES_ENABLE" == "1" ]]; then
+-  BAYES_PRECOMPUTE_ARGS=(--bayes_scores_only --bayes_score_file "$KV_BAYES_SCORE_FILE")
++  BAYES_PRECOMPUTE_ARGS=(--bayes_scores_only --bayes_score_file "$KV_BAYES_SCORE_FILE"
++                         --bayes_score_format "$KV_BAYES_SCORE_FORMAT")
+ fi
+ echo "===== SHORT-Q PRECOMPUTE ($PROFILE) ====="
+ python experiments/precompute_shortq_placements.py \
+@@ -437,10 +454,11 @@ python experiments/precompute_shortq_placements.py \
+   > "${LOG_DIR}/gnn_precompute.log" 2>&1
+ 
+ if [[ "$KV_BAYES_ENABLE" == "1" ]]; then
+-  python - "$KV_BAYES_SCORE_FILE" "$NUM_QUESTIONS" <<'PY'
++  python - "$KV_BAYES_SCORE_FILE" "$NUM_QUESTIONS" "$KV_BAYES_SCORE_FORMAT" <<'PY'
+ import json, sys
+ rows=[json.loads(x) for x in open(sys.argv[1]) if x.strip()]
+ assert len(rows)==int(sys.argv[2]), (len(rows),sys.argv[2])
++assert all(row.get('score_format') == sys.argv[3] for row in rows), 'Wrong GNN score format'
+ assert all(isinstance(row['chunks'],list) and row['chunks'] for row in rows)
+ print('[BAYES_SCORES_READY] requests=',len(rows),
+       'chunks=',sum(len(row['chunks']) for row in rows))
+diff --git a/tests/test_expected_ordinal_score.py b/tests/test_expected_ordinal_score.py
+new file mode 100644
+index 0000000..4cd1982
+--- /dev/null
++++ b/tests/test_expected_ordinal_score.py
+@@ -0,0 +1,83 @@
++"""CPU-only regression tests for class-head score export and compatible priors."""
++from __future__ import annotations
++import json
++import math
++from pathlib import Path
++import tempfile
++import unittest
++from Hierarchical_KV.shortq_placement.expected_ordinal import (
++    expected_ordinal_from_logits, expected_ordinal_from_torch_logits, SCORE_FORMAT,
++)
++from experiments.build_expected_ordinal_prior import create_prior
++from Hierarchical_KV.shortq_placement.bayesian_mapper import WaveBayesianMapper
++
++
++class ExpectedOrdinalTests(unittest.TestCase):
++    def test_ordinal_math_and_chunk_mean_no_voting(self):
++        # One chunk, four equally weighted classes repeated 32 times: score=50.
++        uniform = [[0.0] * 4 for _ in range(32)]
++        self.assertAlmostEqual(expected_ordinal_from_logits(uniform)[0], 50.0, places=5)
++        # Incomplete 16-token tail must never influence persisted chunk score.
++        self.assertEqual(expected_ordinal_from_logits(uniform + [[-100, -100, -100, 100]]), [50.0])
++        # Probe may export a complete 16-token tail block that does NOT
++        # represent a complete 512-token LMCache chunk.
++        self.assertEqual(expected_ordinal_from_logits(uniform*2, full_chunks=1), [50.0])
++        high_gpu = [[-10, -10, -10, 10] for _ in range(32)]
++        low_drop = [[10, -10, -10, -10] for _ in range(32)]
++        self.assertGreater(expected_ordinal_from_logits(high_gpu)[0], 99.9)
++        self.assertLess(expected_ordinal_from_logits(low_drop)[0], 0.1)
++        with self.assertRaises(ValueError):
++            expected_ordinal_from_logits([[float('nan'), 0, 0, 0] for _ in range(32)])
++
++    def test_matches_torch_export(self):
++        import torch
++        values = torch.tensor([[i/10., -i/15., i/12., (-1)**i / 3.] for i in range(64)],dtype=torch.float32)
++        a = expected_ordinal_from_logits(values.tolist())
++        b = expected_ordinal_from_torch_logits(values,2,32)
++        self.assertEqual(len(a), len(b))
++        for x,y in zip(a,b): self.assertAlmostEqual(x,y,places=4)
++
++    def test_mapper_cutoff_is_diagnostic_only(self):
++        with tempfile.TemporaryDirectory() as d:
++            d=Path(d)
++            prior=d/'p.json';scores=d/'s.jsonl'
++            prior.write_text(json.dumps({'score_format':SCORE_FORMAT,
++                'score_bin_edges':[0,25,50,75,100],
++                'score_bin_probabilities':[0.25]*4,
++                'cost_prior_ms':{'cpu':25,'disk':200,'recompute':100}}))
++            scores.write_text(json.dumps({'source_index':0,'chunks':[
++                {'chunk_hash':'f'*64, 'score':92}]})+'\n')
++            m=WaveBayesianMapper(prior,1,10,100,100,scores,d/'m.json',d/'v.json')
++            self.assertAlmostEqual(m.score_at_percentile(.625), 62.5)
++            bands=m.bands()
++            result=m.publish_wave([0], 'cold')
++            self.assertEqual(result['thresholds'],{k:bands[k] for k in ('gpu','cpu','disk')})
++            self.assertIn('raw_score_cutoffs',result)
++            self.assertEqual(result['score_format'],SCORE_FORMAT)
++
++    def test_prior_construction_does_not_change_hardware_costs(self):
++        with tempfile.TemporaryDirectory() as d:
++            d=Path(d)
++            cost=d/'cost.json'; raw=d/'raw.jsonl'
++            base={'score_format': 'mean_32_block_rank_scores',
++                  'score_bin_edges':[-1,0,1], 'score_bin_probabilities':[1,1],
++                  'cost_prior_ms':{'cpu':2.9,'disk':87,'recompute':73},
++                  'cost_calibration':{'recompute_prior_measured':True}}
++            cost.write_text(json.dumps(base))
++            rows=[]
++            for i in range(30):
++                logits=[[0,0,i/6, i/10] for _ in range(32)]
++                rows.append({'source_index':i, 'prompt_tokens':512, 'native_block_tokens':16,
++                             'lmcache_chunk_tokens':512,'blocks_per_chunk':32,
++                             'block_class_logits':logits,
++                             'chunk_hashes':[f'{i:064x}']})
++            raw.write_text('\n'.join(map(json.dumps, rows))+'\n')
++            p=create_prior(raw,cost,bins=10)
++            self.assertEqual(p['score_format'], SCORE_FORMAT)
++            self.assertEqual(p['cost_prior_ms'],base['cost_prior_ms'])
++            self.assertEqual(p['cost_calibration'],base['cost_calibration'])
++            self.assertEqual(p['score_calibration']['distinct_chunk_hashes'],30)
++            self.assertEqual(len(p['score_bin_edges']),len(p['score_bin_probabilities'])+1)
++            self.assertAlmostEqual(sum(p['score_bin_probabilities']),1.0)
++
++if __name__ == '__main__': unittest.main()

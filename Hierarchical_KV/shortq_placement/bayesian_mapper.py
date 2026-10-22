@@ -108,8 +108,8 @@ class WaveBayesianMapper:
         self.request_labels: dict[str, dict[str, str]] = {}
         self.seen_scores: set[str] = set()
         self.hist_counts = [0] * len(self.prior_hist)
-        self.cost_sum_ms = {"cpu": 0.0, "disk": 0.0}
-        self.cost_counts = {"cpu": 0, "disk": 0}
+        self.cost_sum_ms = {"cpu": 0.0, "disk": 0.0, "recompute": 0.0}
+        self.cost_counts = {"cpu": 0.0, "disk": 0.0, "recompute": 0.0}
         self.out_of_range_scores = 0
         self.epoch = 0
         self.profiles: list[dict[str, Any]] = []
@@ -129,17 +129,15 @@ class WaveBayesianMapper:
                     self.out_of_range_scores += int(score < self.edges[0] or score > self.edges[-1])
                     self.hist_counts[self._bin(score)] += 1
 
-    def observe_cost(self, tier: str, milliseconds_per_chunk: float, count: int = 1) -> None:
+    def observe_cost(self, tier: str, milliseconds_per_chunk: float, count: float = 1) -> None:
         if tier not in self.cost_counts:
             raise ValueError(tier)
         if not math.isfinite(milliseconds_per_chunk) or milliseconds_per_chunk <= 0 or count <= 0:
-            raise ValueError("invalid retrieval observation")
+            raise ValueError("invalid tier-cost observation")
         self.cost_sum_ms[tier] += milliseconds_per_chunk * count
         self.cost_counts[tier] += count
 
     def estimated_cost(self, tier: str) -> float:
-        if tier == "recompute":
-            return self.prior_ms[tier]  # No reliable GPU recompute timer in this patch.
         n = self.cost_counts[tier]
         if n == 0:
             return self.prior_ms[tier]
@@ -163,6 +161,26 @@ class WaveBayesianMapper:
         lo, hi = self.edges[idx], self.edges[idx + 1]
         fraction = min(1.0, max(0.0, (score - lo) / (hi - lo)))
         return min(1.0, max(0.0, sum(bins[:idx]) + bins[idx] * fraction))
+
+    def score_at_percentile(self, percentile: float) -> float:
+        """Invert current piecewise-uniform posterior CDF for diagnostics.
+
+        These raw cutoffs are approximate within histogram bins, not exact
+        empirical percentiles; nothing here changes placement decisions.
+        """
+        if not math.isfinite(percentile) or not 0 <= percentile <= 1:
+            raise ValueError("percentile must be finite and in [0,1]")
+        if percentile <= 0:
+            return self.edges[0]
+        if percentile >= 1:
+            return self.edges[-1]
+        acc = 0.0
+        for i, mass in enumerate(self.probabilities()):
+            end = acc + mass
+            if mass > 0 and percentile <= end:
+                return self.edges[i] + (self.edges[i+1] - self.edges[i]) * ((percentile-acc)/mass)
+            acc = end
+        return self.edges[-1]
 
     def bands(self) -> dict[str, float]:
         csum = sum(self.capacities.values())
@@ -288,6 +306,9 @@ class WaveBayesianMapper:
             "cost_sample_counts": dict(self.cost_counts),
             "cost_estimate_ms": {t: self.estimated_cost(t) for t in ("cpu", "disk", "recompute")},
             "thresholds": {k: b[k] for k in TIERS},
+            "score_format": self.prior.get("score_format", "unknown"),
+            "raw_score_cutoffs": {k: self.score_at_percentile(b[k]) for k in TIERS},
+            "raw_score_cutoffs_note": "piecewise-uniform posterior histogram inverse, not exact quantiles",
             "nominal_shares": b["fractions"],
             "fixed_conflict_requests": contradictions,
             "mapped_counts": dict(Counter(self.assigned.values())),
@@ -340,24 +361,29 @@ class LmcacheLogCostReader:
 
 
 class LmcacheCompletionCostReader(LmcacheLogCostReader):
-    """Completed-device H2D + finished L2 load stage, no blocking synchronize.
+    """Completed runtime H2D and L2 load stages; associate by external request.
 
-    H2D measures elapsed time until a stream-ordered callback runs. L2 stage
-    measures from load start to completion. Their sum is an approximate serial
-    GET-path cost, not an exclusive service time nor a causal E2E cost. The
-    components are not matched per request; report as a calibrated proxy.
+    L2 stage and H2D are not exclusive service costs and may overlap. A matched
+    H2D request may contain both L1 and L2 chunks; its per-chunk H2D value is
+    an approximation, not a per-key physical transfer trace. A wave-local H2D
+    average is used ONLY if no matched request was observed, and is reported.
     """
-    _h2d = re.compile(r"\[BAYES_H2D_COMPLETE\].*?chunks=(\d+).*?elapsed_ms=([0-9.]+)")
-    _disk = re.compile(r"\[BAYES_L2_LOAD_COMPLETE\].*?chunks=(\d+).*?elapsed_ms=([0-9.]+)")
+    _h2d = re.compile(
+        r"\[BAYES_H2D_COMPLETE\].*?request=(\S+).*?chunks=(\d+).*?elapsed_ms=([0-9.]+)")
+    _disk = re.compile(
+        r"\[BAYES_L2_LOAD_COMPLETE\].*?external_request=(\S+).*?chunks=(\d+).*?elapsed_ms=([0-9.]+)")
+    _legacy_disk = re.compile(
+        r"\[BAYES_L2_LOAD_COMPLETE\].*?chunks=(\d+).*?elapsed_ms=([0-9.]+)")
 
     def collect(self, mapper: WaveBayesianMapper) -> dict[str, int]:
-        counts = {"h2d_completed": 0, "disk_load_completed": 0}
+        counts = {"h2d_completed": 0, "disk_load_completed": 0,
+                  "disk_matched": 0, "disk_wave_fallback": 0,
+                  "disk_legacy_unmatched": 0}
         if not self.logfile.exists():
             return counts
         with self.logfile.open(encoding="utf-8", errors="replace") as f:
             f.seek(self.offset)
             data = f.read()
-            # Preserve complete lines only; never double-count partially written logs.
             if not data.endswith("\n"):
                 cut = data.rfind("\n")
                 if cut < 0:
@@ -365,25 +391,120 @@ class LmcacheCompletionCostReader(LmcacheLogCostReader):
                 data = data[:cut + 1]
                 f.seek(self.offset + len(data.encode("utf-8", errors="replace")))
             self.offset = f.tell()
-        new_disk_sum, new_disk_n = 0.0, 0
+        h2d_by_request: dict[str, list[float]] = {}
+        disk_rows: list[tuple[str | None, int, float]] = []
+        wave_h2d_sum = 0.0
+        wave_h2d_n = 0
         for line in data.splitlines():
             m = self._h2d.search(line)
-            if m and int(m[1]) > 0 and float(m[2]) > 0:
-                n = int(m[1])
-                mapper.observe_cost("cpu", float(m[2]) / n, count=n)
+            if m and int(m[2]) > 0 and float(m[3]) > 0:
+                key, n, elapsed = m[1], int(m[2]), float(m[3])
+                per_chunk = elapsed / n
+                mapper.observe_cost("cpu", per_chunk, count=n)
+                h2d_by_request.setdefault(key, []).append(per_chunk)
+                wave_h2d_sum += elapsed
+                wave_h2d_n += n
                 counts["h2d_completed"] += 1
             m = self._disk.search(line)
-            if m and int(m[1]) > 0 and float(m[2]) > 0:
-                n = int(m[1])
-                new_disk_sum += float(m[2])
-                new_disk_n += n
+            if m and int(m[2]) > 0 and float(m[3]) > 0:
+                disk_rows.append((m[1], int(m[2]), float(m[3])))
                 counts["disk_load_completed"] += 1
-        if new_disk_n:
-            # Disk GET includes loading from disk into host plus H2D. Use the
-            # best observed H2D component. Unlike the old log proxy this H2D
-            # measurement is collected after device-stream completion.
-            h2d_per_chunk = (mapper.cost_sum_ms["cpu"] / mapper.cost_counts["cpu"]
-                             if mapper.cost_counts["cpu"] else mapper.prior_ms["cpu"])
-            mapper.observe_cost("disk", new_disk_sum / new_disk_n + h2d_per_chunk,
-                                count=new_disk_n)
+            elif "[BAYES_L2_LOAD_COMPLETE]" in line:
+                legacy = self._legacy_disk.search(line)
+                if legacy and int(legacy[1]) > 0 and float(legacy[2]) > 0:
+                    disk_rows.append((None, int(legacy[1]), float(legacy[2])))
+                    counts["disk_load_completed"] += 1
+                    counts["disk_legacy_unmatched"] += 1
+        fallback = (wave_h2d_sum / wave_h2d_n if wave_h2d_n else None)
+        for key, n, elapsed in disk_rows:
+            if key is not None and key in h2d_by_request:
+                # TP2 logical readiness is controlled by the slower rank.
+                h2d = max(h2d_by_request[key])
+                counts["disk_matched"] += 1
+            elif fallback is not None:
+                h2d = fallback
+                counts["disk_wave_fallback"] += 1
+            else:
+                # Do not mix a lifetime CPU H2D mean with the current L2
+                # sample; retain the prior until representative H2D exists.
+                continue
+            mapper.observe_cost("disk", elapsed / n + h2d, count=n)
         return counts
+
+
+class PhaseRecomputeCostReader:
+    """Wave-level effective recomputation cost per 512 prompt tokens.
+
+    Synchronous steps: model-executor result minus submit timestamp.
+    Asynchronous steps: elapsed between consecutive *completed* engine steps,
+    clipped at the current step's submit time to exclude idle gaps. This is a
+    completion-throughput proxy, not the isolated GPU duration or the latency
+    of a single request. It adapts to actual engine contention without forcing
+    synchronous scheduling. Decode-heavy and undersized steps are excluded.
+    No GPU synchronization is introduced.
+    """
+    def __init__(self, trace_dir: str | Path, *, min_prefill_fraction: float = 0.9,
+                 min_prompt_tokens: int = 512):
+        self.trace_dir = Path(trace_dir)
+        self.offsets: dict[Path, int] = {}
+        # Per-engine-process completion time, persisted across wave reads.
+        self._last_completion_ns: dict[Path, int] = {}
+        self.min_prefill_fraction = min_prefill_fraction
+        self.min_prompt_tokens = min_prompt_tokens
+
+    def collect(self, mapper: WaveBayesianMapper) -> dict[str, int | float]:
+        status: dict[str, int | float] = {"recompute_steps": 0,
+            "recompute_skipped": 0, "recompute_chunk_equivalents": 0.0,
+            "recompute_async_steps": 0, "recompute_sync_steps": 0}
+        if not self.trace_dir.is_dir():
+            return status
+        for path in sorted(self.trace_dir.glob("phase_engine.pid*.jsonl")):
+            with path.open(encoding="utf-8", errors="replace") as f:
+                f.seek(self.offsets.get(path, 0))
+                data = f.read()
+                if not data.endswith("\n"):
+                    cut = data.rfind("\n")
+                    if cut < 0:
+                        continue
+                    data = data[:cut + 1]
+                    f.seek(self.offsets.get(path, 0) + len(data.encode("utf-8", errors="replace")))
+                self.offsets[path] = f.tell()
+            for line in data.splitlines():
+                try:
+                    row = json.loads(line)
+                    if row.get("kind") != "engine_step":
+                        continue
+                    prompt = int(row.get("prompt_compute_tokens", 0))
+                    decode = int(row.get("decode_position_tokens", 0))
+                    end_ns = int(row["result_end_ns"])
+                    submit_ns = int(row["submit_end_ns"])
+                    if row.get("async_scheduling", False):
+                        # Futures overlap in async mode, so an individual
+                        # result_end-submit_end interval includes prior queued
+                        # work. Attribute the *incremental completion interval*
+                        # to this batch instead. Preserve continuity even when
+                        # this step is a zero-token/drain/decode step.
+                        previous_end = self._last_completion_ns.get(path)
+                        elapsed_ns = end_ns - max(submit_ns,
+                                                 previous_end if previous_end is not None
+                                                 else submit_ns)
+                        mode = "async"
+                    else:
+                        elapsed_ns = end_ns - submit_ns
+                        mode = "sync"
+                    if end_ns > 0:
+                        self._last_completion_ns[path] = max(
+                            end_ns, self._last_completion_ns.get(path, 0))
+                    if (prompt < self.min_prompt_tokens or elapsed_ns <= 0 or
+                            prompt / max(1, prompt + decode) < self.min_prefill_fraction):
+                        status["recompute_skipped"] += 1
+                        continue
+                    chunks = prompt / 512.0
+                    mapper.observe_cost("recompute", (elapsed_ns / 1e6) / chunks,
+                                        count=chunks)
+                    status["recompute_steps"] += 1
+                    status[f"recompute_{mode}_steps"] += 1
+                    status["recompute_chunk_equivalents"] += chunks
+                except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+                    status["recompute_skipped"] += 1
+        return status

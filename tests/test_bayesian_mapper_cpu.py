@@ -245,11 +245,109 @@ class BayesianMapperTests(unittest.TestCase):
         log.write_text('noise\n[BAYES_H2D_COMPLETE] request=a chunks=2 elapsed_ms=40.000\n'
                        '[BAYES_L2_LOAD_COMPLETE] request=7 chunks=4 elapsed_ms=800.000\n')
         r = LmcacheCompletionCostReader(log)
-        self.assertEqual(r.collect(m), {'h2d_completed': 1, 'disk_load_completed': 1})
-        self.assertEqual(m.cost_counts, {'cpu': 2, 'disk': 4})
+        first = r.collect(m)
+        self.assertEqual(first['h2d_completed'], 1)
+        self.assertEqual(first['disk_load_completed'], 1)
+        self.assertEqual(first['disk_wave_fallback'], 1)
+        self.assertEqual(m.cost_counts, {'cpu': 2, 'disk': 4, 'recompute': 0})
         self.assertAlmostEqual(m.estimated_cost('cpu'), 20)
         self.assertAlmostEqual(m.estimated_cost('disk'), 360)
-        self.assertEqual(r.collect(m), {'h2d_completed': 0, 'disk_load_completed': 0})
+        self.assertEqual(r.collect(m)['h2d_completed'], 0)
+        self.assertEqual(r.collect(m)['disk_load_completed'], 0)
+
+    def test_recompute_cost_is_observed_and_weighted(self):
+        m = self.mapper()
+        self.assertAlmostEqual(m.estimated_cost('recompute'), 100)
+        m.observe_cost('recompute', 200, count=2.5)
+        m.observe_cost('recompute', 80, count=0.5)
+        self.assertAlmostEqual(m.cost_counts['recompute'], 3)
+        self.assertAlmostEqual(m.estimated_cost('recompute'),
+                               (100 + (200*2.5+80*.5)/3)/2)
+        self.assertAlmostEqual(m.bands()['fractions']['cpu'], 100/210)
+
+    def test_matching_l2_h2d_by_external_request(self):
+        from Hierarchical_KV.shortq_placement.bayesian_mapper import LmcacheCompletionCostReader
+        m = self.mapper()
+        log = self.dir / 'matched.log'
+        log.write_text(
+            '[BAYES_L2_LOAD_COMPLETE] request=19 external_request=req-a chunks=2 elapsed_ms=60\n'
+            '[BAYES_H2D_COMPLETE] request=req-a chunks=4 elapsed_ms=80\n'
+            '[BAYES_H2D_COMPLETE] request=req-a chunks=4 elapsed_ms=120\n'
+            '[BAYES_H2D_COMPLETE] request=req-b chunks=2 elapsed_ms=700\n'
+        )
+        counts = LmcacheCompletionCostReader(log).collect(m)
+        self.assertEqual(counts['disk_matched'], 1)
+        self.assertEqual(counts['disk_wave_fallback'], 0)
+        # Matched H2D is max(80/4, 120/4) = 30ms, not req-b's 350ms.
+        self.assertAlmostEqual(m.estimated_cost('disk'), (500 + 60/2 + 30)/2)
+
+    def test_async_recompute_reader_uses_nonoverlapping_completion_intervals(self):
+        from Hierarchical_KV.shortq_placement.bayesian_mapper import PhaseRecomputeCostReader
+        import json
+        m = self.mapper()
+        trace_dir = self.dir / 'async-trace'
+        trace_dir.mkdir()
+        logfile = trace_dir / 'phase_engine.pid77.jsonl'
+
+        def row(end_ns, submit_ns, prompt, *, decode=0):
+            return json.dumps({"kind": "engine_step", "async_scheduling": True,
+                               "result_end_ns": end_ns, "submit_end_ns": submit_ns,
+                               "prompt_compute_tokens": prompt,
+                               "decode_position_tokens": decode}) + '\n'
+
+        # Two pipelined forwards were submitted concurrently. The raw
+        # (end-submit) time of the second includes the first and must not
+        # be counted a second time. First = 100 ms, second = 80 ms.
+        logfile.write_text(row(200_000_000, 100_000_000, 512) +
+                           row(280_000_000, 110_000_000, 1024))
+        reader = PhaseRecomputeCostReader(trace_dir)
+        stats = reader.collect(m)
+        self.assertEqual(stats['recompute_steps'], 2)
+        self.assertEqual(stats['recompute_async_steps'], 2)
+        self.assertEqual(stats['recompute_sync_steps'], 0)
+        self.assertEqual(m.cost_counts['recompute'], 3)
+        self.assertAlmostEqual(m.estimated_cost('recompute'),
+                               (100 + (100 + 80) / 3) / 2)
+
+        # A zero-token completed step moves the completion watermark but
+        # does not enter the recomputation average. A new wave must pick up
+        # that watermark without replaying old observations.
+        with logfile.open('a') as f:
+            f.write(row(320_000_000, 270_000_000, 0) +
+                    row(400_000_000, 310_000_000, 512))
+        stats = reader.collect(m)
+        self.assertEqual(stats['recompute_steps'], 1)
+        self.assertEqual(stats['recompute_async_steps'], 1)
+        self.assertEqual(stats['recompute_skipped'], 1)
+        self.assertEqual(m.cost_counts['recompute'], 4)
+        self.assertAlmostEqual(m.estimated_cost('recompute'),
+                               (100 + (100 + 80 + 80) / 4) / 2)
+        self.assertEqual(reader.collect(m)['recompute_steps'], 0)
+
+    def test_phase_recompute_reader_exactly_once_and_partial_line(self):
+        from Hierarchical_KV.shortq_placement.bayesian_mapper import PhaseRecomputeCostReader
+        m = self.mapper()
+        trace_dir = self.dir / 'trace'
+        trace_dir.mkdir()
+        logfile = trace_dir / 'phase_engine.pid1.jsonl'
+        entry = lambda prompt, decode, elapsed_ms: json.dumps({
+            'kind': 'engine_step', 'prompt_compute_tokens': prompt,
+            'decode_position_tokens': decode, 'submit_end_ns': 1000,
+            'result_end_ns': 1000 + int(elapsed_ms * 1e6)}) + '\n'
+        logfile.write_text(entry(1024, 0, 200) + entry(1024, 1000, 100) +
+                           '{"kind":"engine_step"')
+        r = PhaseRecomputeCostReader(trace_dir)
+        status = r.collect(m)
+        self.assertEqual(status['recompute_steps'], 1)
+        self.assertEqual(status['recompute_skipped'], 1)
+        self.assertEqual(m.cost_counts['recompute'], 2)
+        self.assertAlmostEqual(m.estimated_cost('recompute'), (100+100)/2)
+        with logfile.open('a') as f:
+            f.write('\n' + entry(512, 0, 60))
+        # Previous incomplete JSON line is skipped, but new data is read.
+        self.assertEqual(r.collect(m)['recompute_steps'], 1)
+        self.assertEqual(r.collect(m)['recompute_steps'], 0)
+        self.assertAlmostEqual(m.cost_counts['recompute'], 3)
 
     def test_inflight_store_pin_survives_snapshot_change(self):
         import importlib.util

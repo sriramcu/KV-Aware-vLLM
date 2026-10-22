@@ -35,6 +35,11 @@ from experiments.mp_nognn_project import (  # noqa: E402
     load_questions,
     reorder_requests,
 )
+from Hierarchical_KV.shortq_placement.expected_ordinal import (
+    SCORE_FORMAT as EXPECTED_ORDINAL_FORMAT,
+    RANK_SCORE_FORMAT,
+    expected_ordinal_from_torch_logits,
+)
 from Hierarchical_KV.shortq_placement.block_prediction import get_block_predictions  # noqa: E402
 from Hierarchical_KV.shortq_placement.chunk_voting import (
     assign_random_exclusive_placements,
@@ -91,6 +96,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bayes_scores_only", action="store_true",
                    help="Export prefix-hash chunk scores only; mapper assigns tiers during serving")
     p.add_argument("--bayes_score_file", default="", help="JSONL chunk-score artifact")
+    p.add_argument("--bayes_score_format", choices=[RANK_SCORE_FORMAT, EXPECTED_ORDINAL_FORMAT],
+                   default=RANK_SCORE_FORMAT,
+                   help="Score representation for Bayesian path; no effect on legacy voting")
     p.add_argument(
         "--vpc_importance_sidecar",
         default="",
@@ -545,18 +553,25 @@ def main() -> None:
             post_t0 = time.perf_counter()
             valid_blocks = int(block_mask[0].sum().item())
             if args.bayes_scores_only:
-                # Mean of the 32 real 16-token block rank-head outputs per
-                # complete 512-token LMCache chunk. Incomplete tail excluded.
+                # Score complete LMCache chunks only. The incomplete tail is
+                # not persisted and must not influence any complete chunk.
                 hashes = hasher.compute_chunk_hashes(serving_ids)
                 if len(hashes) != len(serving_ids) // args.chunk_size:
                     raise AssertionError("LMCache hash/chunk alignment mismatch")
-                score_row = {"source_index": source_index, "chunks": []}
-                for chunk_index, chunk_hash in enumerate(hashes):
-                    lo = chunk_index * blocks_per_chunk
-                    hi = lo + blocks_per_chunk
-                    score = float(rank_scores[lo:hi].float().mean().item())
-                    if not math.isfinite(score):
-                        raise ValueError(f"nonfinite rank score source={source_index} chunk={chunk_index}")
+                score_row = {"source_index": source_index,
+                             "score_format": args.bayes_score_format, "chunks": []}
+                if args.bayes_score_format == EXPECTED_ORDINAL_FORMAT:
+                    chunk_scores = expected_ordinal_from_torch_logits(
+                        class_logits, len(hashes), blocks_per_chunk)
+                else:
+                    # Preserve the historical rank-head mean path exactly.
+                    chunk_scores = [float(rank_scores[j*blocks_per_chunk:(j+1)*blocks_per_chunk]
+                                          .float().mean().item()) for j in range(len(hashes))]
+                for chunk_index, (chunk_hash, score) in enumerate(zip(hashes, chunk_scores, strict=True)):
+                    if not math.isfinite(score) or (args.bayes_score_format == EXPECTED_ORDINAL_FORMAT
+                                                     and not 0 <= score <= 100):
+                        raise ValueError(f"invalid {args.bayes_score_format} score "
+                                         f"source={source_index} chunk={chunk_index}: {score}")
                     score_row["chunks"].append({"chunk_hash": chunk_hash.hex(), "score": score})
                 bayes_score_rows.append(score_row)
                 print(f"[BAYES_SCORE_PRECOMPUTE] source={source_index} "
@@ -864,6 +879,7 @@ def main() -> None:
         "smoke_force_min_unique_per_placement": args.smoke_force_min_unique_per_placement,
         "smoke_runtime_overrides": smoke_overrides,
         "bayes_scores_only": args.bayes_scores_only,
+        "bayes_score_format": args.bayes_score_format if args.bayes_scores_only else None,
         "bayes_score_file": args.bayes_score_file or None,
         "runtime_metadata": str(runtime_path),
         "vpc_importance_sidecar": args.vpc_importance_sidecar or None,

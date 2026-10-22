@@ -1324,9 +1324,11 @@ def main():
 
     bayes_mapper = None
     bayes_reader = None
+    recompute_reader = None
     if args.bayes_score_file:
         from Hierarchical_KV.shortq_placement.bayesian_mapper import (
-            WaveBayesianMapper, LmcacheLogCostReader, LmcacheCompletionCostReader, atomic_json,
+            WaveBayesianMapper, LmcacheLogCostReader, LmcacheCompletionCostReader,
+            PhaseRecomputeCostReader, atomic_json,
         )
         required = (args.bayes_prior_file, args.bayes_metadata_file, args.bayes_vpc_file)
         if any(not x for x in required):
@@ -1351,6 +1353,11 @@ def main():
             bayes_reader = (LmcacheCompletionCostReader(args.bayes_lmcache_log)
                             if args.bayes_direct_cost_feedback else
                             LmcacheLogCostReader(args.bayes_lmcache_log))
+        if args.bayes_direct_cost_feedback:
+            trace_dir = os.environ.get("VLLM_PHASE_TRACE_DIR", "")
+            if not trace_dir or os.environ.get("VLLM_PHASE_TRACE") != "1":
+                raise ValueError("Online recompute feedback requires VLLM_PHASE_TRACE=1 and VLLM_PHASE_TRACE_DIR")
+            recompute_reader = PhaseRecomputeCostReader(trace_dir)
         print("[BAYES_INIT] " + json.dumps({
             "score_file": args.bayes_score_file, "prior_file": args.bayes_prior_file,
             "prior_weight": args.bayes_prior_weight, "capacities_gb": bayes_mapper.capacities,
@@ -1376,6 +1383,8 @@ def main():
         assert bayes_mapper is not None
         bayes_mapper.observe_scores(sources)
         observed = bayes_reader.collect(bayes_mapper) if bayes_reader else {}
+        if recompute_reader is not None:
+            observed.update(recompute_reader.collect(bayes_mapper))
         atomic_json(out_dir / "bayes_wave_history.json", bayes_mapper.profiles)
         print("[BAYES_WAVE_OBSERVE] " + json.dumps({
             "phase": phase, "new_score_samples": len(bayes_mapper.seen_scores),

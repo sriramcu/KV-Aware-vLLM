@@ -685,6 +685,7 @@ class EngineCore:
                     scheduler_output, non_block=True
                 )
             if sc_timing is not None:
+                scheduler_output._sc_phase_async_scheduling = True
                 sc_timing[id(scheduler_output)] = (
                     sc_t0, sc_t1, sc_phase_trace.now_ns())
             if self.is_ec_consumer:

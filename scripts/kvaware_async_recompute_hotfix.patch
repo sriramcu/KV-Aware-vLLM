@@ -1,0 +1,183 @@
+--- a/Hierarchical_KV/shortq_placement/bayesian_mapper.py
++++ b/Hierarchical_KV/shortq_placement/bayesian_mapper.py
+@@ -410,23 +410,29 @@
+ 
+ 
+ class PhaseRecomputeCostReader:
+-    """Wave-level model-executor elapsed cost per 512 actual prompt tokens.
+-
+-    Nonblocking CPU-side engine timestamps include executor/queue contention;
+-    mixed decode-heavy or async pipelined steps are excluded. This is a
+-    congestion-aware effective proxy, not exclusive GPU compute or marginal
+-    critical-path time. No GPU synchronization or profiling process needed.
++    """Wave-level effective recomputation cost per 512 prompt tokens.
++
++    Synchronous steps: model-executor result minus submit timestamp.
++    Asynchronous steps: elapsed between consecutive *completed* engine steps,
++    clipped at the current step's submit time to exclude idle gaps. This is a
++    completion-throughput proxy, not the isolated GPU duration or the latency
++    of a single request. It adapts to actual engine contention without forcing
++    synchronous scheduling. Decode-heavy and undersized steps are excluded.
++    No GPU synchronization is introduced.
+     """
+     def __init__(self, trace_dir: str | Path, *, min_prefill_fraction: float = 0.9,
+                  min_prompt_tokens: int = 512):
+         self.trace_dir = Path(trace_dir)
+         self.offsets: dict[Path, int] = {}
++        # Per-engine-process completion time, persisted across wave reads.
++        self._last_completion_ns: dict[Path, int] = {}
+         self.min_prefill_fraction = min_prefill_fraction
+         self.min_prompt_tokens = min_prompt_tokens
+ 
+     def collect(self, mapper: WaveBayesianMapper) -> dict[str, int | float]:
+         status: dict[str, int | float] = {"recompute_steps": 0,
+-            "recompute_skipped": 0, "recompute_chunk_equivalents": 0.0}
++            "recompute_skipped": 0, "recompute_chunk_equivalents": 0.0,
++            "recompute_async_steps": 0, "recompute_sync_steps": 0}
+         if not self.trace_dir.is_dir():
+             return status
+         for path in sorted(self.trace_dir.glob("phase_engine.pid*.jsonl")):
+@@ -447,12 +453,25 @@
+                         continue
+                     prompt = int(row.get("prompt_compute_tokens", 0))
+                     decode = int(row.get("decode_position_tokens", 0))
+-                    # In async scheduler mode the interval can include other
+-                    # queued steps; reject those until separately attributed.
++                    end_ns = int(row["result_end_ns"])
++                    submit_ns = int(row["submit_end_ns"])
+                     if row.get("async_scheduling", False):
+-                        status["recompute_skipped"] += 1
+-                        continue
+-                    elapsed_ns = int(row["result_end_ns"]) - int(row["submit_end_ns"])
++                        # Futures overlap in async mode, so an individual
++                        # result_end-submit_end interval includes prior queued
++                        # work. Attribute the *incremental completion interval*
++                        # to this batch instead. Preserve continuity even when
++                        # this step is a zero-token/drain/decode step.
++                        previous_end = self._last_completion_ns.get(path)
++                        elapsed_ns = end_ns - max(submit_ns,
++                                                 previous_end if previous_end is not None
++                                                 else submit_ns)
++                        mode = "async"
++                    else:
++                        elapsed_ns = end_ns - submit_ns
++                        mode = "sync"
++                    if end_ns > 0:
++                        self._last_completion_ns[path] = max(
++                            end_ns, self._last_completion_ns.get(path, 0))
+                     if (prompt < self.min_prompt_tokens or elapsed_ns <= 0 or
+                             prompt / max(1, prompt + decode) < self.min_prefill_fraction):
+                         status["recompute_skipped"] += 1
+@@ -461,6 +480,7 @@
+                     mapper.observe_cost("recompute", (elapsed_ns / 1e6) / chunks,
+                                         count=chunks)
+                     status["recompute_steps"] += 1
++                    status[f"recompute_{mode}_steps"] += 1
+                     status["recompute_chunk_equivalents"] += chunks
+                 except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+                     status["recompute_skipped"] += 1
+--- a/experiments/calibrate_bayesian_recompute.py
++++ b/experiments/calibrate_bayesian_recompute.py
+@@ -1,4 +1,4 @@
+-"""One-off H100 TP2 *model-backed* prefill prior; no test-set prompts.
++"""One-off model-backed prefill prior; no test-set prompts.
+ 
+ Uses actual serving model and scheduler engine-step wall intervals. This is
+ an effective congestion-aware recompute reference per 512 prompt tokens,
+@@ -41,7 +41,7 @@
+     from vllm import LLM, SamplingParams
+     from Hierarchical_KV.shortq_placement.bayesian_mapper import PhaseRecomputeCostReader
+ 
+-    print('[BAYES_CALIB_RECOMPUTE] loading actual TP2 serving model', flush=True)
++    print('[BAYES_CALIB_RECOMPUTE] loading actual serving model', flush=True)
+     llm = LLM(model=args.model, tensor_parallel_size=2, quantization='fp8',
+               gpu_memory_utilization=args.gpu_utilization,
+               max_model_len=args.max_model_len, max_num_seqs=16,
+@@ -86,20 +86,22 @@
+     prior = json.loads(args.prior_in.read_text(encoding='utf-8'))
+     prior['cost_prior_ms']['recompute'] = round(prior_ms, 5)
+     prior['comment'] = ('Score histogram unchanged; CPU/disk standalone transfer calibration; '
+-                        'recompute reference is a short actual-model TP2 prefill probe.')
++                        'recompute reference is a short actual-model prefill probe.')
+     meta = prior.setdefault('cost_calibration', {})
+     meta.update({
+         'recompute_prior_measured': True,
+-        'recompute_method': 'TP2 actual-model prefill engine executor wait; chunk-equivalent weighted mean',
++        'recompute_method': 'actual-model prefill engine completion-throughput proxy (async) or executor interval (sync); chunk-equivalent weighted mean',
+         'recompute_model': args.model,
+         'recompute_samples': len(sink.samples),
++        'recompute_async_steps': stats['recompute_async_steps'],
++        'recompute_sync_steps': stats['recompute_sync_steps'],
+         'recompute_chunk_equivalents': total_chunks,
+         'recompute_step_median_ms_per_chunk': statistics.median(v for v, _ in sink.samples),
+         'recompute_step_min_ms_per_chunk': min(v for v, _ in sink.samples),
+         'recompute_step_max_ms_per_chunk': max(v for v, _ in sink.samples),
+         'recompute_probe_prompt_lengths': list(lengths),
+         'recompute_probe_rounds': args.rounds,
+-        'recompute_warning': 'Engine executor wait includes queue/overhead, not marginal request E2E; isolated short probe may not recreate high-load congestion',
++        'recompute_warning': 'Async samples are consecutive completion-throughput intervals, not individual forward latency; sync samples include executor waiting. Neither is marginal E2E; short calibration may not recreate serving congestion.',
+     })
+     args.prior_out.parent.mkdir(parents=True, exist_ok=True)
+     with tempfile.NamedTemporaryFile('w', encoding='utf-8', dir=args.prior_out.parent,
+@@ -109,7 +111,8 @@
+         f.write('\n')
+     os.replace(tmp, args.prior_out)
+     print(f'[BAYES_CALIB_RECOMPUTE] prior={prior_ms:.5f}ms samples={len(sink.samples)} '
+-          f'chunks={total_chunks:.2f} written={args.prior_out}', flush=True)
++          f'chunks={total_chunks:.2f} async={stats["recompute_async_steps"]} '
++          f'sync={stats["recompute_sync_steps"]} written={args.prior_out}', flush=True)
+ 
+ 
+ if __name__ == '__main__':
+--- a/tests/test_bayesian_mapper_cpu.py
++++ b/tests/test_bayesian_mapper_cpu.py
+@@ -280,6 +280,49 @@
+         self.assertEqual(counts['disk_wave_fallback'], 0)
+         # Matched H2D is max(80/4, 120/4) = 30ms, not req-b's 350ms.
+         self.assertAlmostEqual(m.estimated_cost('disk'), (500 + 60/2 + 30)/2)
++
++    def test_async_recompute_reader_uses_nonoverlapping_completion_intervals(self):
++        from Hierarchical_KV.shortq_placement.bayesian_mapper import PhaseRecomputeCostReader
++        import json
++        m = self.mapper()
++        trace_dir = self.dir / 'async-trace'
++        trace_dir.mkdir()
++        logfile = trace_dir / 'phase_engine.pid77.jsonl'
++
++        def row(end_ns, submit_ns, prompt, *, decode=0):
++            return json.dumps({"kind": "engine_step", "async_scheduling": True,
++                               "result_end_ns": end_ns, "submit_end_ns": submit_ns,
++                               "prompt_compute_tokens": prompt,
++                               "decode_position_tokens": decode}) + '\n'
++
++        # Two pipelined forwards were submitted concurrently. The raw
++        # (end-submit) time of the second includes the first and must not
++        # be counted a second time. First = 100 ms, second = 80 ms.
++        logfile.write_text(row(200_000_000, 100_000_000, 512) +
++                           row(280_000_000, 110_000_000, 1024))
++        reader = PhaseRecomputeCostReader(trace_dir)
++        stats = reader.collect(m)
++        self.assertEqual(stats['recompute_steps'], 2)
++        self.assertEqual(stats['recompute_async_steps'], 2)
++        self.assertEqual(stats['recompute_sync_steps'], 0)
++        self.assertEqual(m.cost_counts['recompute'], 3)
++        self.assertAlmostEqual(m.estimated_cost('recompute'),
++                               (100 + (100 + 80) / 3) / 2)
++
++        # A zero-token completed step moves the completion watermark but
++        # does not enter the recomputation average. A new wave must pick up
++        # that watermark without replaying old observations.
++        with logfile.open('a') as f:
++            f.write(row(320_000_000, 270_000_000, 0) +
++                    row(400_000_000, 310_000_000, 512))
++        stats = reader.collect(m)
++        self.assertEqual(stats['recompute_steps'], 1)
++        self.assertEqual(stats['recompute_async_steps'], 1)
++        self.assertEqual(stats['recompute_skipped'], 1)
++        self.assertEqual(m.cost_counts['recompute'], 4)
++        self.assertAlmostEqual(m.estimated_cost('recompute'),
++                               (100 + (100 + 80 + 80) / 4) / 2)
++        self.assertEqual(reader.collect(m)['recompute_steps'], 0)
+ 
+     def test_phase_recompute_reader_exactly_once_and_partial_line(self):
+         from Hierarchical_KV.shortq_placement.bayesian_mapper import PhaseRecomputeCostReader

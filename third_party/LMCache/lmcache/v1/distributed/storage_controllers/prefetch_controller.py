@@ -1816,8 +1816,9 @@ class PrefetchController(StorageControllerInterface):
         if os.getenv("LMCACHE_BAYES_TIMING", "0") == "1" and loaded_keys and request.load_started_at > 0:
             elapsed_ms = (time.monotonic() - request.load_started_at) * 1000.0
             if elapsed_ms > 0:
-                logger.info("[BAYES_L2_LOAD_COMPLETE] request=%d chunks=%d elapsed_ms=%.6f",
-                            request.request_id, len(loaded_keys), elapsed_ms)
+                logger.info("[BAYES_L2_LOAD_COMPLETE] request=%d external_request=%s chunks=%d elapsed_ms=%.6f",
+                            request.request_id, request.external_request_id or "unknown",
+                            len(loaded_keys), elapsed_ms)
 
         self._complete_request(request.request_id, retained)
 

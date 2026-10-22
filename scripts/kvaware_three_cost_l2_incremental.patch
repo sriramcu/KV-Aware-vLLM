@@ -1,0 +1,671 @@
+diff --git a/Hierarchical_KV/shortq_placement/bayesian_mapper.py b/Hierarchical_KV/shortq_placement/bayesian_mapper.py
+index 6b6f53a..6f55884 100644
+--- a/Hierarchical_KV/shortq_placement/bayesian_mapper.py
++++ b/Hierarchical_KV/shortq_placement/bayesian_mapper.py
+@@ -108,8 +108,8 @@ class WaveBayesianMapper:
+         self.request_labels: dict[str, dict[str, str]] = {}
+         self.seen_scores: set[str] = set()
+         self.hist_counts = [0] * len(self.prior_hist)
+-        self.cost_sum_ms = {"cpu": 0.0, "disk": 0.0}
+-        self.cost_counts = {"cpu": 0, "disk": 0}
++        self.cost_sum_ms = {"cpu": 0.0, "disk": 0.0, "recompute": 0.0}
++        self.cost_counts = {"cpu": 0.0, "disk": 0.0, "recompute": 0.0}
+         self.out_of_range_scores = 0
+         self.epoch = 0
+         self.profiles: list[dict[str, Any]] = []
+@@ -129,17 +129,15 @@ class WaveBayesianMapper:
+                     self.out_of_range_scores += int(score < self.edges[0] or score > self.edges[-1])
+                     self.hist_counts[self._bin(score)] += 1
+ 
+-    def observe_cost(self, tier: str, milliseconds_per_chunk: float, count: int = 1) -> None:
++    def observe_cost(self, tier: str, milliseconds_per_chunk: float, count: float = 1) -> None:
+         if tier not in self.cost_counts:
+             raise ValueError(tier)
+         if not math.isfinite(milliseconds_per_chunk) or milliseconds_per_chunk <= 0 or count <= 0:
+-            raise ValueError("invalid retrieval observation")
++            raise ValueError("invalid tier-cost observation")
+         self.cost_sum_ms[tier] += milliseconds_per_chunk * count
+         self.cost_counts[tier] += count
+ 
+     def estimated_cost(self, tier: str) -> float:
+-        if tier == "recompute":
+-            return self.prior_ms[tier]  # No reliable GPU recompute timer in this patch.
+         n = self.cost_counts[tier]
+         if n == 0:
+             return self.prior_ms[tier]
+@@ -340,24 +338,29 @@ class LmcacheLogCostReader:
+ 
+ 
+ class LmcacheCompletionCostReader(LmcacheLogCostReader):
+-    """Completed-device H2D + finished L2 load stage, no blocking synchronize.
++    """Completed runtime H2D and L2 load stages; associate by external request.
+ 
+-    H2D measures elapsed time until a stream-ordered callback runs. L2 stage
+-    measures from load start to completion. Their sum is an approximate serial
+-    GET-path cost, not an exclusive service time nor a causal E2E cost. The
+-    components are not matched per request; report as a calibrated proxy.
++    L2 stage and H2D are not exclusive service costs and may overlap. A matched
++    H2D request may contain both L1 and L2 chunks; its per-chunk H2D value is
++    an approximation, not a per-key physical transfer trace. A wave-local H2D
++    average is used ONLY if no matched request was observed, and is reported.
+     """
+-    _h2d = re.compile(r"\[BAYES_H2D_COMPLETE\].*?chunks=(\d+).*?elapsed_ms=([0-9.]+)")
+-    _disk = re.compile(r"\[BAYES_L2_LOAD_COMPLETE\].*?chunks=(\d+).*?elapsed_ms=([0-9.]+)")
++    _h2d = re.compile(
++        r"\[BAYES_H2D_COMPLETE\].*?request=(\S+).*?chunks=(\d+).*?elapsed_ms=([0-9.]+)")
++    _disk = re.compile(
++        r"\[BAYES_L2_LOAD_COMPLETE\].*?external_request=(\S+).*?chunks=(\d+).*?elapsed_ms=([0-9.]+)")
++    _legacy_disk = re.compile(
++        r"\[BAYES_L2_LOAD_COMPLETE\].*?chunks=(\d+).*?elapsed_ms=([0-9.]+)")
+ 
+     def collect(self, mapper: WaveBayesianMapper) -> dict[str, int]:
+-        counts = {"h2d_completed": 0, "disk_load_completed": 0}
++        counts = {"h2d_completed": 0, "disk_load_completed": 0,
++                  "disk_matched": 0, "disk_wave_fallback": 0,
++                  "disk_legacy_unmatched": 0}
+         if not self.logfile.exists():
+             return counts
+         with self.logfile.open(encoding="utf-8", errors="replace") as f:
+             f.seek(self.offset)
+             data = f.read()
+-            # Preserve complete lines only; never double-count partially written logs.
+             if not data.endswith("\n"):
+                 cut = data.rfind("\n")
+                 if cut < 0:
+@@ -365,25 +368,100 @@ class LmcacheCompletionCostReader(LmcacheLogCostReader):
+                 data = data[:cut + 1]
+                 f.seek(self.offset + len(data.encode("utf-8", errors="replace")))
+             self.offset = f.tell()
+-        new_disk_sum, new_disk_n = 0.0, 0
++        h2d_by_request: dict[str, list[float]] = {}
++        disk_rows: list[tuple[str | None, int, float]] = []
++        wave_h2d_sum = 0.0
++        wave_h2d_n = 0
+         for line in data.splitlines():
+             m = self._h2d.search(line)
+-            if m and int(m[1]) > 0 and float(m[2]) > 0:
+-                n = int(m[1])
+-                mapper.observe_cost("cpu", float(m[2]) / n, count=n)
++            if m and int(m[2]) > 0 and float(m[3]) > 0:
++                key, n, elapsed = m[1], int(m[2]), float(m[3])
++                per_chunk = elapsed / n
++                mapper.observe_cost("cpu", per_chunk, count=n)
++                h2d_by_request.setdefault(key, []).append(per_chunk)
++                wave_h2d_sum += elapsed
++                wave_h2d_n += n
+                 counts["h2d_completed"] += 1
+             m = self._disk.search(line)
+-            if m and int(m[1]) > 0 and float(m[2]) > 0:
+-                n = int(m[1])
+-                new_disk_sum += float(m[2])
+-                new_disk_n += n
++            if m and int(m[2]) > 0 and float(m[3]) > 0:
++                disk_rows.append((m[1], int(m[2]), float(m[3])))
+                 counts["disk_load_completed"] += 1
+-        if new_disk_n:
+-            # Disk GET includes loading from disk into host plus H2D. Use the
+-            # best observed H2D component. Unlike the old log proxy this H2D
+-            # measurement is collected after device-stream completion.
+-            h2d_per_chunk = (mapper.cost_sum_ms["cpu"] / mapper.cost_counts["cpu"]
+-                             if mapper.cost_counts["cpu"] else mapper.prior_ms["cpu"])
+-            mapper.observe_cost("disk", new_disk_sum / new_disk_n + h2d_per_chunk,
+-                                count=new_disk_n)
++            elif "[BAYES_L2_LOAD_COMPLETE]" in line:
++                legacy = self._legacy_disk.search(line)
++                if legacy and int(legacy[1]) > 0 and float(legacy[2]) > 0:
++                    disk_rows.append((None, int(legacy[1]), float(legacy[2])))
++                    counts["disk_load_completed"] += 1
++                    counts["disk_legacy_unmatched"] += 1
++        fallback = (wave_h2d_sum / wave_h2d_n if wave_h2d_n else None)
++        for key, n, elapsed in disk_rows:
++            if key is not None and key in h2d_by_request:
++                # TP2 logical readiness is controlled by the slower rank.
++                h2d = max(h2d_by_request[key])
++                counts["disk_matched"] += 1
++            elif fallback is not None:
++                h2d = fallback
++                counts["disk_wave_fallback"] += 1
++            else:
++                # Do not mix a lifetime CPU H2D mean with the current L2
++                # sample; retain the prior until representative H2D exists.
++                continue
++            mapper.observe_cost("disk", elapsed / n + h2d, count=n)
+         return counts
++
++
++class PhaseRecomputeCostReader:
++    """Wave-level model-executor elapsed cost per 512 actual prompt tokens.
++
++    Nonblocking CPU-side engine timestamps include executor/queue contention;
++    mixed decode-heavy or async pipelined steps are excluded. This is a
++    congestion-aware effective proxy, not exclusive GPU compute or marginal
++    critical-path time. No GPU synchronization or profiling process needed.
++    """
++    def __init__(self, trace_dir: str | Path, *, min_prefill_fraction: float = 0.9,
++                 min_prompt_tokens: int = 512):
++        self.trace_dir = Path(trace_dir)
++        self.offsets: dict[Path, int] = {}
++        self.min_prefill_fraction = min_prefill_fraction
++        self.min_prompt_tokens = min_prompt_tokens
++
++    def collect(self, mapper: WaveBayesianMapper) -> dict[str, int | float]:
++        status: dict[str, int | float] = {"recompute_steps": 0,
++            "recompute_skipped": 0, "recompute_chunk_equivalents": 0.0}
++        if not self.trace_dir.is_dir():
++            return status
++        for path in sorted(self.trace_dir.glob("phase_engine.pid*.jsonl")):
++            with path.open(encoding="utf-8", errors="replace") as f:
++                f.seek(self.offsets.get(path, 0))
++                data = f.read()
++                if not data.endswith("\n"):
++                    cut = data.rfind("\n")
++                    if cut < 0:
++                        continue
++                    data = data[:cut + 1]
++                    f.seek(self.offsets.get(path, 0) + len(data.encode("utf-8", errors="replace")))
++                self.offsets[path] = f.tell()
++            for line in data.splitlines():
++                try:
++                    row = json.loads(line)
++                    if row.get("kind") != "engine_step":
++                        continue
++                    prompt = int(row.get("prompt_compute_tokens", 0))
++                    decode = int(row.get("decode_position_tokens", 0))
++                    # In async scheduler mode the interval can include other
++                    # queued steps; reject those until separately attributed.
++                    if row.get("async_scheduling", False):
++                        status["recompute_skipped"] += 1
++                        continue
++                    elapsed_ns = int(row["result_end_ns"]) - int(row["submit_end_ns"])
++                    if (prompt < self.min_prompt_tokens or elapsed_ns <= 0 or
++                            prompt / max(1, prompt + decode) < self.min_prefill_fraction):
++                        status["recompute_skipped"] += 1
++                        continue
++                    chunks = prompt / 512.0
++                    mapper.observe_cost("recompute", (elapsed_ns / 1e6) / chunks,
++                                        count=chunks)
++                    status["recompute_steps"] += 1
++                    status["recompute_chunk_equivalents"] += chunks
++                except (ValueError, TypeError, KeyError, json.JSONDecodeError):
++                    status["recompute_skipped"] += 1
++        return status
+diff --git a/experiments/calibrate_bayesian_recompute.py b/experiments/calibrate_bayesian_recompute.py
+new file mode 100644
+index 0000000..37ff0be
+--- /dev/null
++++ b/experiments/calibrate_bayesian_recompute.py
+@@ -0,0 +1,116 @@
++"""One-off H100 TP2 *model-backed* prefill prior; no test-set prompts.
++
++Uses actual serving model and scheduler engine-step wall intervals. This is
++an effective congestion-aware recompute reference per 512 prompt tokens,
++not exclusive GPU compute/marginal end-to-end savings. Calibration is
++purposefully small; do not use final Q650 requests as calibration inputs.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import math
++import os
++from pathlib import Path
++import statistics
++import tempfile
++
++
++def main() -> None:
++    p = argparse.ArgumentParser()
++    p.add_argument('--prior-in', type=Path, required=True)
++    p.add_argument('--prior-out', type=Path, required=True)
++    p.add_argument('--trace-dir', type=Path, required=True)
++    p.add_argument('--model', default='meta-llama/Llama-3.3-70B-Instruct')
++    p.add_argument('--max-model-len', type=int, default=8000)
++    p.add_argument('--gpu-utilization', type=float, default=0.65)
++    p.add_argument('--rounds', type=int, default=3)
++    p.add_argument('--min-samples', type=int, default=3)
++    args = p.parse_args()
++    if args.rounds < 2 or args.min_samples < 2:
++        p.error('need >=2 rounds and >=2 valid samples')
++    # Device timing is not required: engine events need neither CUDA
++    # synchronization nor cross-rank clock alignment.
++    os.environ['VLLM_PHASE_TRACE'] = '1'
++    os.environ['VLLM_PHASE_TRACE_DEVICE_TIMING'] = '0'
++    os.environ['VLLM_PHASE_TRACE_DIR'] = str(args.trace_dir)
++    args.trace_dir.mkdir(parents=True, exist_ok=True)
++    if any(args.trace_dir.glob('phase_engine.pid*.jsonl')):
++        raise RuntimeError('Refusing to reuse nonempty engine-trace directory')
++
++    from vllm import LLM, SamplingParams
++    from Hierarchical_KV.shortq_placement.bayesian_mapper import PhaseRecomputeCostReader
++
++    print('[BAYES_CALIB_RECOMPUTE] loading actual TP2 serving model', flush=True)
++    llm = LLM(model=args.model, tensor_parallel_size=2, quantization='fp8',
++              gpu_memory_utilization=args.gpu_utilization,
++              max_model_len=args.max_model_len, max_num_seqs=16,
++              enable_prefix_caching=False)
++    tokenizer = llm.get_tokenizer()
++    tokens = tokenizer.encode('Medical background and retrieved evidence. ',
++                              add_special_tokens=False)
++    if len(tokens) < 2:
++        raise RuntimeError('calibration tokenization failed')
++    bos = getattr(tokenizer, 'bos_token_id', None)
++    lengths = (1024, 2048, 3072, 4096)
++    prompts = []
++    for size in lengths:
++        content = (tokens * ((size + len(tokens) - 1) // len(tokens)))[:size]
++        prompts.append({'prompt_token_ids': ([bos] if bos is not None else []) + content})
++    sampling = SamplingParams(temperature=0.0, min_tokens=1, max_tokens=1)
++    print('[BAYES_CALIB_RECOMPUTE] warmup', flush=True)
++    llm.generate(prompts[:2], sampling, use_tqdm=False)
++    # Discard warm-up trace without perturbing mapper or GPU.
++    class Accumulator:
++        def __init__(self):
++            self.samples: list[tuple[float, float]] = []
++        def observe_cost(self, tier, milliseconds_per_chunk, count=1):
++            if tier != 'recompute' or not math.isfinite(milliseconds_per_chunk):
++                raise ValueError('invalid recompute sample')
++            self.samples.append((float(milliseconds_per_chunk), float(count)))
++
++    reader = PhaseRecomputeCostReader(args.trace_dir)
++    sink = Accumulator()
++    reader.collect(sink)
++    for i in range(args.rounds):
++        print(f'[BAYES_CALIB_RECOMPUTE] probe round={i+1}/{args.rounds}', flush=True)
++        llm.generate(prompts, sampling, use_tqdm=False)
++    stats = reader.collect(sink)
++    if len(sink.samples) < args.min_samples:
++        raise RuntimeError(f'Only {len(sink.samples)} prefill samples; need {args.min_samples}. '
++                           f'Diagnostics: {stats}')
++    total_chunks = sum(w for _, w in sink.samples)
++    prior_ms = sum(v * w for v, w in sink.samples) / total_chunks
++    if not math.isfinite(prior_ms) or prior_ms <= 0:
++        raise RuntimeError('Nonpositive or nonfinite measured recompute cost')
++    prior = json.loads(args.prior_in.read_text(encoding='utf-8'))
++    prior['cost_prior_ms']['recompute'] = round(prior_ms, 5)
++    prior['comment'] = ('Score histogram unchanged; CPU/disk standalone transfer calibration; '
++                        'recompute reference is a short actual-model TP2 prefill probe.')
++    meta = prior.setdefault('cost_calibration', {})
++    meta.update({
++        'recompute_prior_measured': True,
++        'recompute_method': 'TP2 actual-model prefill engine executor wait; chunk-equivalent weighted mean',
++        'recompute_model': args.model,
++        'recompute_samples': len(sink.samples),
++        'recompute_chunk_equivalents': total_chunks,
++        'recompute_step_median_ms_per_chunk': statistics.median(v for v, _ in sink.samples),
++        'recompute_step_min_ms_per_chunk': min(v for v, _ in sink.samples),
++        'recompute_step_max_ms_per_chunk': max(v for v, _ in sink.samples),
++        'recompute_probe_prompt_lengths': list(lengths),
++        'recompute_probe_rounds': args.rounds,
++        'recompute_warning': 'Engine executor wait includes queue/overhead, not marginal request E2E; isolated short probe may not recreate high-load congestion',
++    })
++    args.prior_out.parent.mkdir(parents=True, exist_ok=True)
++    with tempfile.NamedTemporaryFile('w', encoding='utf-8', dir=args.prior_out.parent,
++                                     prefix='.bayes_prior_', delete=False) as f:
++        tmp = Path(f.name)
++        json.dump(prior, f, sort_keys=True, indent=2)
++        f.write('\n')
++    os.replace(tmp, args.prior_out)
++    print(f'[BAYES_CALIB_RECOMPUTE] prior={prior_ms:.5f}ms samples={len(sink.samples)} '
++          f'chunks={total_chunks:.2f} written={args.prior_out}', flush=True)
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/experiments/mp_nognn_project.py b/experiments/mp_nognn_project.py
+index 1be11a2..ee91b8c 100755
+--- a/experiments/mp_nognn_project.py
++++ b/experiments/mp_nognn_project.py
+@@ -1324,9 +1324,11 @@ def main():
+ 
+     bayes_mapper = None
+     bayes_reader = None
++    recompute_reader = None
+     if args.bayes_score_file:
+         from Hierarchical_KV.shortq_placement.bayesian_mapper import (
+-            WaveBayesianMapper, LmcacheLogCostReader, LmcacheCompletionCostReader, atomic_json,
++            WaveBayesianMapper, LmcacheLogCostReader, LmcacheCompletionCostReader,
++            PhaseRecomputeCostReader, atomic_json,
+         )
+         required = (args.bayes_prior_file, args.bayes_metadata_file, args.bayes_vpc_file)
+         if any(not x for x in required):
+@@ -1351,6 +1353,11 @@ def main():
+             bayes_reader = (LmcacheCompletionCostReader(args.bayes_lmcache_log)
+                             if args.bayes_direct_cost_feedback else
+                             LmcacheLogCostReader(args.bayes_lmcache_log))
++        if args.bayes_direct_cost_feedback:
++            trace_dir = os.environ.get("VLLM_PHASE_TRACE_DIR", "")
++            if not trace_dir or os.environ.get("VLLM_PHASE_TRACE") != "1":
++                raise ValueError("Online recompute feedback requires VLLM_PHASE_TRACE=1 and VLLM_PHASE_TRACE_DIR")
++            recompute_reader = PhaseRecomputeCostReader(trace_dir)
+         print("[BAYES_INIT] " + json.dumps({
+             "score_file": args.bayes_score_file, "prior_file": args.bayes_prior_file,
+             "prior_weight": args.bayes_prior_weight, "capacities_gb": bayes_mapper.capacities,
+@@ -1376,6 +1383,8 @@ def main():
+         assert bayes_mapper is not None
+         bayes_mapper.observe_scores(sources)
+         observed = bayes_reader.collect(bayes_mapper) if bayes_reader else {}
++        if recompute_reader is not None:
++            observed.update(recompute_reader.collect(bayes_mapper))
+         atomic_json(out_dir / "bayes_wave_history.json", bayes_mapper.profiles)
+         print("[BAYES_WAVE_OBSERVE] " + json.dumps({
+             "phase": phase, "new_score_samples": len(bayes_mapper.seen_scores),
+diff --git a/scripts/run_h100_bayes_canonical_smoke.sh b/scripts/run_h100_bayes_canonical_smoke.sh
+index 95fb439..b27f44e 100755
+--- a/scripts/run_h100_bayes_canonical_smoke.sh
++++ b/scripts/run_h100_bayes_canonical_smoke.sh
+@@ -20,7 +20,8 @@ export GNN_CHUNK_VOTE_POLICY=threshold_with_drop_plurality
+ export VLLM_PHASE_TRACE=1 VLLM_PHASE_TRACE_DEVICE_TIMING=0
+ export EXPERIMENT_LABEL="${EXPERIMENT_LABEL:-bayes_canonical_smoke}"
+ export KV_BAYES_GPU_GB="${KV_BAYES_GPU_GB:-10}"
+-export KV_BAYES_DISK_GB="${KV_BAYES_DISK_GB:-100}"
++export LMCACHE_L2_SIZE_GB="${LMCACHE_L2_SIZE_GB:-100}"
++export KV_BAYES_DISK_GB="${KV_BAYES_DISK_GB:-$LMCACHE_L2_SIZE_GB}"
+ export KV_BAYES_PRIOR_WEIGHT="${KV_BAYES_PRIOR_WEIGHT:-1}"
+ # This narrowly binned prior is diagnostic only: derived from the initial
+ # Q12 smoke score range, not an independently calibrated production prior.
+diff --git a/scripts/run_h100_bayes_cost_calibrate.sbatch b/scripts/run_h100_bayes_cost_calibrate.sbatch
+index 78d3ac8..933e29d 100644
+--- a/scripts/run_h100_bayes_cost_calibrate.sbatch
++++ b/scripts/run_h100_bayes_cost_calibrate.sbatch
+@@ -5,7 +5,7 @@
+ #SBATCH --ntasks=1
+ #SBATCH --cpus-per-task=16
+ #SBATCH --gres=gpu:2
+-#SBATCH --time=00:30:00
++#SBATCH --time=01:30:00
+ #SBATCH --output=/mnt/shared/gpfs/home/sriramc2/runs/kvaware/%x_%j.out
+ #SBATCH --error=/mnt/shared/gpfs/home/sriramc2/runs/kvaware/%x_%j.err
+ set -Eeuo pipefail
+@@ -15,7 +15,13 @@ cd "$REPO"
+ echo "SLURM_JOB_ID=${SLURM_JOB_ID} CPUs=${SLURM_CPUS_PER_TASK:-unset}"; nproc
+ scontrol show job "$SLURM_JOB_ID" | grep -E 'NumCPUs=|ReqTRES=|AllocTRES=' || true
+ export CUDA_MPS_PIPE_DIRECTORY="/tmp/kvaware-no-mps-${USER}-${SLURM_JOB_ID}-DO-NOT-CREATE"
++CALIB_DIR="/mnt/shared/gpfs/home/sriramc2/runs/kvaware/calib_${SLURM_JOB_ID}"
++mkdir -p "$CALIB_DIR"
+ python experiments/calibrate_bayesian_tier_costs.py \
+   --prior-in "$REPO/Hierarchical_KV/shortq_placement/priors/rank_smoke_diagnostic.json" \
+-  --prior-out /mnt/shared/gpfs/home/sriramc2/runs/kvaware/rank_h100_calibrated.json \
++  --prior-out "$CALIB_DIR/transfer_only.json" \
+   --scratch /scratch2/sriramc2
++python experiments/calibrate_bayesian_recompute.py \
++  --prior-in "$CALIB_DIR/transfer_only.json" \
++  --prior-out /mnt/shared/gpfs/home/sriramc2/runs/kvaware/rank_h100_calibrated.json \
++  --trace-dir "$CALIB_DIR/prefill_trace"
+diff --git a/scripts/run_h100_bayes_sweep_cell.sbatch b/scripts/run_h100_bayes_sweep_cell.sbatch
+index f476dbf..e9dbf5f 100644
+--- a/scripts/run_h100_bayes_sweep_cell.sbatch
++++ b/scripts/run_h100_bayes_sweep_cell.sbatch
+@@ -19,6 +19,7 @@ esac
+ export NUM_QUESTIONS=650 SUBMISSION_BATCH_SIZE=100
+ export MIN_TOKENS=128 MAX_TOKENS=128 MAX_NUM_SEQS=16
+ export LMCACHE_L1_SIZE_GB="${SWEEP_CPU_GB:-225}"
++export LMCACHE_L2_SIZE_GB="${SWEEP_DISK_GB:-100}"
+ export LMCACHE_MP_MAX_INFLIGHT_STORE_GB="${SWEEP_STORE_CAP_GB:-0.25}"
+ export KV_PASSAGE_ORDER_POLICY="${SWEEP_ORDER:-canonical}"
+ export KV_REQUEST_ORDER=seeded_shuffle KV_REQUEST_ORDER_SEED=0
+@@ -43,7 +44,7 @@ export KV_GNN_DYNAMIC_PROFILE=h100_q650
+ export KV_GNN_L1_BACKING=1 KV_GNN_L2_BACKING=0
+ export GNN_CHUNK_VOTE_POLICY=threshold_with_drop_plurality
+ export KV_BAYES_GPU_GB="${SWEEP_GPU_GB:-10}"
+-export KV_BAYES_DISK_GB="${SWEEP_DISK_GB:-100}"
++export KV_BAYES_DISK_GB="$LMCACHE_L2_SIZE_GB"
+ if [[ "$SWEEP_CELL" == bayes_* || "${SWEEP_POLICY:-}" == "bayes" ]]; then
+   export KV_BAYES_ENABLE=1
+   export KV_BAYES_PRIOR_FILE="${SWEEP_PRIOR_FILE:-/mnt/shared/gpfs/home/sriramc2/runs/kvaware/rank_h100_calibrated.json}"
+diff --git a/scripts/run_h100_bayes_targeted_smoke.sbatch b/scripts/run_h100_bayes_targeted_smoke.sbatch
+index d26300d..d7c8335 100644
+--- a/scripts/run_h100_bayes_targeted_smoke.sbatch
++++ b/scripts/run_h100_bayes_targeted_smoke.sbatch
+@@ -14,9 +14,11 @@ export KV_BAYES_PRIOR_FILE="${KV_BAYES_PRIOR_FILE:-/mnt/shared/gpfs/home/sriramc
+ [[ -s "$KV_BAYES_PRIOR_FILE" ]] || { echo "ERROR: calibrate priors first" >&2; exit 2; }
+ export KV_BAYES_DIRECT_COST_FEEDBACK=1 KV_BAYES_USE_COST_PROXIES=0
+ export KV_BAYES_READMISSION=1 KV_BAYES_POSTERIOR_MODE=fixed
+-export KV_BAYES_PRIOR_WEIGHT=1 KV_BAYES_GPU_GB=10 KV_BAYES_DISK_GB=100
+-export NUM_QUESTIONS=80 SUBMISSION_BATCH_SIZE=20
+-export MIN_TOKENS=16 MAX_TOKENS=16
++export KV_BAYES_PRIOR_WEIGHT=1 KV_BAYES_GPU_GB=10
++export LMCACHE_L2_SIZE_GB="${LMCACHE_L2_SIZE_GB:-100}"
++export KV_BAYES_DISK_GB="$LMCACHE_L2_SIZE_GB"
++export NUM_QUESTIONS="${NUM_QUESTIONS:-80}" SUBMISSION_BATCH_SIZE="${SUBMISSION_BATCH_SIZE:-20}"
++export MIN_TOKENS="${MIN_TOKENS:-16}" MAX_TOKENS="${MAX_TOKENS:-16}"
+ export LMCACHE_L1_SIZE_GB=225 SMOKE_FORCE_MIN_UNIQUE_PER_PLACEMENT=0
+-export EXPERIMENT_LABEL=bayes_direct_readmission_q80_b20
++export EXPERIMENT_LABEL="${EXPERIMENT_LABEL:-bayes_three_cost_q${NUM_QUESTIONS}_b${SUBMISSION_BATCH_SIZE}}"
+ bash scripts/run_h100_bayes_canonical_smoke.sh
+diff --git a/scripts/run_h100_mp_nognn_q650_current_cleanall.sbatch b/scripts/run_h100_mp_nognn_q650_current_cleanall.sbatch
+index 79ebec7..8bb534d 100755
+--- a/scripts/run_h100_mp_nognn_q650_current_cleanall.sbatch
++++ b/scripts/run_h100_mp_nognn_q650_current_cleanall.sbatch
+@@ -91,6 +91,9 @@ LMCACHE_MP_MAX_INFLIGHT_STORE_GB="${LMCACHE_MP_MAX_INFLIGHT_STORE_GB:-0}"
+ # Match the legacy project chunk size rather than the 256-token smoke-test size.
+ LMCACHE_CHUNK_SIZE="${LMCACHE_CHUNK_SIZE:-512}"
+ LMCACHE_L1_SIZE_GB="${LMCACHE_L1_SIZE_GB:-200}"
++LMCACHE_L2_SIZE_GB="${LMCACHE_L2_SIZE_GB:-100}"
++LMCACHE_L2_EVICTION_TRIGGER="${LMCACHE_L2_EVICTION_TRIGGER:-0.90}"
++LMCACHE_L2_EVICTION_RATIO="${LMCACHE_L2_EVICTION_RATIO:-0.10}"
+ LMCACHE_MAX_WORKERS="${LMCACHE_MAX_WORKERS:-8}"
+ LMCACHE_L2_WORKERS="${LMCACHE_L2_WORKERS:-8}"
+ LMCACHE_MP_TIMEOUT="${LMCACHE_MP_TIMEOUT:-120}"
+@@ -726,6 +729,9 @@ cat > "${RUN_DIR}/run_config.json" <<EOF
+   "cuda_mps_pipe_directory": "${CUDA_MPS_PIPE_DIRECTORY}",
+   "lmcache_chunk_size": ${LMCACHE_CHUNK_SIZE},
+   "lmcache_l1_size_gb": ${LMCACHE_L1_SIZE_GB},
++  "lmcache_l2_size_gb": ${LMCACHE_L2_SIZE_GB},
++  "lmcache_l2_eviction_trigger": ${LMCACHE_L2_EVICTION_TRIGGER},
++  "lmcache_l2_eviction_ratio": ${LMCACHE_L2_EVICTION_RATIO},
+   "lmcache_l2_dir": "${LMCACHE_L2_DIR}",
+   "dataset_name": "${DATASET_NAME}",
+   "num_questions": ${NUM_QUESTIONS},
+@@ -754,7 +760,8 @@ python - "$LMCACHE_L2_DIR" \
+   "${KV_FS_LOOKUP_WORKERS}" \
+   "${KV_FS_RETRIEVE_WORKERS}" \
+   "${KV_FS_STORE_WORKERS}" \
+-  "${KV_FS_DELETE_WORKERS}" <<'PY'
++  "${KV_FS_DELETE_WORKERS}" \
++  "${LMCACHE_L2_SIZE_GB}" "${LMCACHE_L2_EVICTION_TRIGGER}" "${LMCACHE_L2_EVICTION_RATIO}" <<'PY'
+ import json
+ import sys
+ 
+@@ -762,6 +769,9 @@ base_path = sys.argv[1]
+ shared_workers = int(sys.argv[2])
+ lane_names = ("lookup", "retrieve", "store", "delete")
+ lane_counts = list(map(int, sys.argv[3:7]))
++capacity, trigger, ratio = map(float, sys.argv[7:10])
++if capacity <= 0 or not 0 < trigger <= 1 or not 0 < ratio <= 1:
++    raise ValueError("Invalid physical L2 capacity or eviction watermarks")
+ 
+ if shared_workers <= 0:
+     raise ValueError("KV_FS_SHARED_WORKERS must be > 0")
+@@ -773,6 +783,9 @@ spec = {
+     "base_path": base_path,
+     "num_workers": shared_workers,
+     "use_odirect": False,
++    "max_capacity_gb": capacity,
++    "eviction": {"eviction_policy": "LRU", "trigger_watermark": trigger,
++                 "eviction_ratio": ratio},
+ }
+ per_op = {
+     name: count
+diff --git a/scripts/run_shortq_gnn_dynamic_vpc_common.sh b/scripts/run_shortq_gnn_dynamic_vpc_common.sh
+index c35ddc2..36a605a 100755
+--- a/scripts/run_shortq_gnn_dynamic_vpc_common.sh
++++ b/scripts/run_shortq_gnn_dynamic_vpc_common.sh
+@@ -30,6 +30,9 @@ GNN_INFERENCE_BATCH_SIZE="${GNN_INFERENCE_BATCH_SIZE:-1}"
+ KV_GNN_AWARE_VPC="${KV_GNN_AWARE_VPC:-1}"
+ KV_GNN_L1_BACKING="${KV_GNN_L1_BACKING:-1}"
+ LMCACHE_L1_SIZE_GB="${LMCACHE_L1_SIZE_GB:-200}"
++LMCACHE_L2_SIZE_GB="${LMCACHE_L2_SIZE_GB:-100}"
++LMCACHE_L2_EVICTION_TRIGGER="${LMCACHE_L2_EVICTION_TRIGGER:-0.90}"
++LMCACHE_L2_EVICTION_RATIO="${LMCACHE_L2_EVICTION_RATIO:-0.10}"
+ # Optional durability experiment: back every host-resident GNN prompt chunk to
+ # L2 while preserving its original VPC/L1 placement. Disabled by default so
+ # existing grid runs are unchanged.
+@@ -73,7 +76,8 @@ done
+ "$VENV/bin/python" - "$LMCACHE_L2_LOAD_MAX_IN_FLIGHT" \
+   "$LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT" "$LMCACHE_MP_MAX_INFLIGHT_STORE_GB" \
+   "$KV_FS_SHARED_WORKERS" "$KV_FS_LOOKUP_WORKERS" "$KV_FS_RETRIEVE_WORKERS" \
+-  "$KV_FS_STORE_WORKERS" "$KV_FS_DELETE_WORKERS" <<'PY'
++  "$KV_FS_STORE_WORKERS" "$KV_FS_DELETE_WORKERS" \
++  "$LMCACHE_L2_SIZE_GB" "$LMCACHE_L2_EVICTION_TRIGGER" "$LMCACHE_L2_EVICTION_RATIO" <<'PY'
+ import sys
+ load_pf, lookup_pf = map(int, sys.argv[1:3])
+ store_cap_gb = float(sys.argv[3])
+@@ -178,7 +182,10 @@ KV_BAYES_PRIOR_WEIGHT="${KV_BAYES_PRIOR_WEIGHT:-1}"
+ KV_BAYES_PRIOR_FILE="${KV_BAYES_PRIOR_FILE:-${REPO}/Hierarchical_KV/shortq_placement/priors/rank_example.json}"
+ KV_BAYES_SCORE_FILE="${PLACEMENT_DIR}/gnn_chunk_scores.jsonl"
+ KV_BAYES_GPU_GB="${KV_BAYES_GPU_GB:-10}"
+-KV_BAYES_DISK_GB="${KV_BAYES_DISK_GB:-100}"
++KV_BAYES_DISK_GB="${KV_BAYES_DISK_GB:-$LMCACHE_L2_SIZE_GB}"
++if [[ "$KV_BAYES_ENABLE" == "1" && "$KV_BAYES_DISK_GB" != "$LMCACHE_L2_SIZE_GB" ]]; then
++  echo "ERROR: mapper disk budget must match physical L2 size for this experiment" >&2; exit 2
++fi
+ KV_BAYES_USE_COST_PROXIES="${KV_BAYES_USE_COST_PROXIES:-0}"
+ KV_BAYES_DIRECT_COST_FEEDBACK="${KV_BAYES_DIRECT_COST_FEEDBACK:-0}"
+ KV_BAYES_POSTERIOR_MODE="${KV_BAYES_POSTERIOR_MODE:-fixed}"
+@@ -389,6 +396,9 @@ cat > "${RUN_DIR}/run_config.json" <<JSON
+   "bayes_score_file": "$KV_BAYES_SCORE_FILE",
+   "bayes_gpu_gb": $KV_BAYES_GPU_GB,
+   "bayes_disk_gb": $KV_BAYES_DISK_GB,
++  "lmcache_l2_size_gb": $LMCACHE_L2_SIZE_GB,
++  "lmcache_l2_eviction_trigger": $LMCACHE_L2_EVICTION_TRIGGER,
++  "lmcache_l2_eviction_ratio": $LMCACHE_L2_EVICTION_RATIO,
+   "bayes_cost_observation_proxies": $KV_BAYES_USE_COST_PROXIES,
+   "bayes_direct_timing": $KV_BAYES_DIRECT_COST_FEEDBACK,
+   "bayes_readmission": $KV_BAYES_READMISSION,
+@@ -445,7 +455,8 @@ fi
+ 
+ L2_JSON=$(python - "$L2_DIR" "$KV_FS_SHARED_WORKERS" \
+   "$KV_FS_LOOKUP_WORKERS" "$KV_FS_RETRIEVE_WORKERS" \
+-  "$KV_FS_STORE_WORKERS" "$KV_FS_DELETE_WORKERS" <<'PY'
++  "$KV_FS_STORE_WORKERS" "$KV_FS_DELETE_WORKERS" \
++  "$LMCACHE_L2_SIZE_GB" "$LMCACHE_L2_EVICTION_TRIGGER" "$LMCACHE_L2_EVICTION_RATIO" <<'PY'
+ import json,sys
+ spec = {
+     'type': 'fs_native',
+@@ -453,6 +464,12 @@ spec = {
+     'num_workers': int(sys.argv[2]),
+     'use_odirect': False,
+ }
++size, trigger, ratio = map(float, sys.argv[7:10])
++if size <= 0 or not 0 < trigger <= 1 or not 0 < ratio <= 1:
++    raise ValueError('L2 capacity must be positive; watermarks must be in (0,1]')
++spec['max_capacity_gb'] = size
++spec['eviction'] = {'eviction_policy': 'LRU', 'trigger_watermark': trigger,
++                    'eviction_ratio': ratio}
+ names = ('lookup', 'retrieve', 'store', 'delete')
+ counts = map(int, sys.argv[3:7])
+ per_op = {name: count for name, count in zip(names, counts) if count > 0}
+diff --git a/tests/test_bayesian_mapper_cpu.py b/tests/test_bayesian_mapper_cpu.py
+index 67a1841..46ad8ba 100644
+--- a/tests/test_bayesian_mapper_cpu.py
++++ b/tests/test_bayesian_mapper_cpu.py
+@@ -245,11 +245,66 @@ class BayesianMapperTests(unittest.TestCase):
+         log.write_text('noise\n[BAYES_H2D_COMPLETE] request=a chunks=2 elapsed_ms=40.000\n'
+                        '[BAYES_L2_LOAD_COMPLETE] request=7 chunks=4 elapsed_ms=800.000\n')
+         r = LmcacheCompletionCostReader(log)
+-        self.assertEqual(r.collect(m), {'h2d_completed': 1, 'disk_load_completed': 1})
+-        self.assertEqual(m.cost_counts, {'cpu': 2, 'disk': 4})
++        first = r.collect(m)
++        self.assertEqual(first['h2d_completed'], 1)
++        self.assertEqual(first['disk_load_completed'], 1)
++        self.assertEqual(first['disk_wave_fallback'], 1)
++        self.assertEqual(m.cost_counts, {'cpu': 2, 'disk': 4, 'recompute': 0})
+         self.assertAlmostEqual(m.estimated_cost('cpu'), 20)
+         self.assertAlmostEqual(m.estimated_cost('disk'), 360)
+-        self.assertEqual(r.collect(m), {'h2d_completed': 0, 'disk_load_completed': 0})
++        self.assertEqual(r.collect(m)['h2d_completed'], 0)
++        self.assertEqual(r.collect(m)['disk_load_completed'], 0)
++
++    def test_recompute_cost_is_observed_and_weighted(self):
++        m = self.mapper()
++        self.assertAlmostEqual(m.estimated_cost('recompute'), 100)
++        m.observe_cost('recompute', 200, count=2.5)
++        m.observe_cost('recompute', 80, count=0.5)
++        self.assertAlmostEqual(m.cost_counts['recompute'], 3)
++        self.assertAlmostEqual(m.estimated_cost('recompute'),
++                               (100 + (200*2.5+80*.5)/3)/2)
++        self.assertAlmostEqual(m.bands()['fractions']['cpu'], 100/210)
++
++    def test_matching_l2_h2d_by_external_request(self):
++        from Hierarchical_KV.shortq_placement.bayesian_mapper import LmcacheCompletionCostReader
++        m = self.mapper()
++        log = self.dir / 'matched.log'
++        log.write_text(
++            '[BAYES_L2_LOAD_COMPLETE] request=19 external_request=req-a chunks=2 elapsed_ms=60\n'
++            '[BAYES_H2D_COMPLETE] request=req-a chunks=4 elapsed_ms=80\n'
++            '[BAYES_H2D_COMPLETE] request=req-a chunks=4 elapsed_ms=120\n'
++            '[BAYES_H2D_COMPLETE] request=req-b chunks=2 elapsed_ms=700\n'
++        )
++        counts = LmcacheCompletionCostReader(log).collect(m)
++        self.assertEqual(counts['disk_matched'], 1)
++        self.assertEqual(counts['disk_wave_fallback'], 0)
++        # Matched H2D is max(80/4, 120/4) = 30ms, not req-b's 350ms.
++        self.assertAlmostEqual(m.estimated_cost('disk'), (500 + 60/2 + 30)/2)
++
++    def test_phase_recompute_reader_exactly_once_and_partial_line(self):
++        from Hierarchical_KV.shortq_placement.bayesian_mapper import PhaseRecomputeCostReader
++        m = self.mapper()
++        trace_dir = self.dir / 'trace'
++        trace_dir.mkdir()
++        logfile = trace_dir / 'phase_engine.pid1.jsonl'
++        entry = lambda prompt, decode, elapsed_ms: json.dumps({
++            'kind': 'engine_step', 'prompt_compute_tokens': prompt,
++            'decode_position_tokens': decode, 'submit_end_ns': 1000,
++            'result_end_ns': 1000 + int(elapsed_ms * 1e6)}) + '\n'
++        logfile.write_text(entry(1024, 0, 200) + entry(1024, 1000, 100) +
++                           '{"kind":"engine_step"')
++        r = PhaseRecomputeCostReader(trace_dir)
++        status = r.collect(m)
++        self.assertEqual(status['recompute_steps'], 1)
++        self.assertEqual(status['recompute_skipped'], 1)
++        self.assertEqual(m.cost_counts['recompute'], 2)
++        self.assertAlmostEqual(m.estimated_cost('recompute'), (100+100)/2)
++        with logfile.open('a') as f:
++            f.write('\n' + entry(512, 0, 60))
++        # Previous incomplete JSON line is skipped, but new data is read.
++        self.assertEqual(r.collect(m)['recompute_steps'], 1)
++        self.assertEqual(r.collect(m)['recompute_steps'], 0)
++        self.assertAlmostEqual(m.cost_counts['recompute'], 3)
+ 
+     def test_inflight_store_pin_survives_snapshot_change(self):
+         import importlib.util
+diff --git a/third_party/LMCache/lmcache/v1/distributed/storage_controllers/prefetch_controller.py b/third_party/LMCache/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
+index fcc1630..dc3c8ad 100644
+--- a/third_party/LMCache/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
++++ b/third_party/LMCache/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
+@@ -1816,8 +1816,9 @@ class PrefetchController(StorageControllerInterface):
+         if os.getenv("LMCACHE_BAYES_TIMING", "0") == "1" and loaded_keys and request.load_started_at > 0:
+             elapsed_ms = (time.monotonic() - request.load_started_at) * 1000.0
+             if elapsed_ms > 0:
+-                logger.info("[BAYES_L2_LOAD_COMPLETE] request=%d chunks=%d elapsed_ms=%.6f",
+-                            request.request_id, len(loaded_keys), elapsed_ms)
++                logger.info("[BAYES_L2_LOAD_COMPLETE] request=%d external_request=%s chunks=%d elapsed_ms=%.6f",
++                            request.request_id, request.external_request_id or "unknown",
++                            len(loaded_keys), elapsed_ms)
+ 
+         self._complete_request(request.request_id, retained)
+ 
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 460e588..2e464ee 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -685,6 +685,7 @@ class EngineCore:
+                     scheduler_output, non_block=True
+                 )
+             if sc_timing is not None:
++                scheduler_output._sc_phase_async_scheduling = True
+                 sc_timing[id(scheduler_output)] = (
+                     sc_t0, sc_t1, sc_phase_trace.now_ns())
+             if self.is_ec_consumer:
+diff --git a/vllm/v1/metrics/phase_trace.py b/vllm/v1/metrics/phase_trace.py
+index 41585cb..6c7def9 100644
+--- a/vllm/v1/metrics/phase_trace.py
++++ b/vllm/v1/metrics/phase_trace.py
+@@ -104,6 +104,7 @@ def record_engine_step(output: Any, schedule_start_ns: int,
+         schedule_end_ns=schedule_end_ns, submit_end_ns=submit_end_ns,
+         result_end_ns=result_end_ns, update_end_ns=update_end_ns,
+         prompt_compute_tokens=prompt_n, decode_position_tokens=decode_n,
++        async_scheduling=bool(getattr(output, "_sc_phase_async_scheduling", False)),
+         scheduled_total=output.total_num_scheduled_tokens,
+         running_requests=getattr(output, "_sc_phase_running_count", None),
+         waiting_remote_requests=getattr(output, "_sc_phase_waiting_remote", None),

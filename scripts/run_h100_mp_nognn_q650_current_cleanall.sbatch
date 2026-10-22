@@ -91,6 +91,9 @@ LMCACHE_MP_MAX_INFLIGHT_STORE_GB="${LMCACHE_MP_MAX_INFLIGHT_STORE_GB:-0}"
 # Match the legacy project chunk size rather than the 256-token smoke-test size.
 LMCACHE_CHUNK_SIZE="${LMCACHE_CHUNK_SIZE:-512}"
 LMCACHE_L1_SIZE_GB="${LMCACHE_L1_SIZE_GB:-200}"
+LMCACHE_L2_SIZE_GB="${LMCACHE_L2_SIZE_GB:-100}"
+LMCACHE_L2_EVICTION_TRIGGER="${LMCACHE_L2_EVICTION_TRIGGER:-0.90}"
+LMCACHE_L2_EVICTION_RATIO="${LMCACHE_L2_EVICTION_RATIO:-0.10}"
 LMCACHE_MAX_WORKERS="${LMCACHE_MAX_WORKERS:-8}"
 LMCACHE_L2_WORKERS="${LMCACHE_L2_WORKERS:-8}"
 LMCACHE_MP_TIMEOUT="${LMCACHE_MP_TIMEOUT:-120}"
@@ -726,6 +729,9 @@ cat > "${RUN_DIR}/run_config.json" <<EOF
   "cuda_mps_pipe_directory": "${CUDA_MPS_PIPE_DIRECTORY}",
   "lmcache_chunk_size": ${LMCACHE_CHUNK_SIZE},
   "lmcache_l1_size_gb": ${LMCACHE_L1_SIZE_GB},
+  "lmcache_l2_size_gb": ${LMCACHE_L2_SIZE_GB},
+  "lmcache_l2_eviction_trigger": ${LMCACHE_L2_EVICTION_TRIGGER},
+  "lmcache_l2_eviction_ratio": ${LMCACHE_L2_EVICTION_RATIO},
   "lmcache_l2_dir": "${LMCACHE_L2_DIR}",
   "dataset_name": "${DATASET_NAME}",
   "num_questions": ${NUM_QUESTIONS},
@@ -754,7 +760,8 @@ python - "$LMCACHE_L2_DIR" \
   "${KV_FS_LOOKUP_WORKERS}" \
   "${KV_FS_RETRIEVE_WORKERS}" \
   "${KV_FS_STORE_WORKERS}" \
-  "${KV_FS_DELETE_WORKERS}" <<'PY'
+  "${KV_FS_DELETE_WORKERS}" \
+  "${LMCACHE_L2_SIZE_GB}" "${LMCACHE_L2_EVICTION_TRIGGER}" "${LMCACHE_L2_EVICTION_RATIO}" <<'PY'
 import json
 import sys
 
@@ -762,6 +769,9 @@ base_path = sys.argv[1]
 shared_workers = int(sys.argv[2])
 lane_names = ("lookup", "retrieve", "store", "delete")
 lane_counts = list(map(int, sys.argv[3:7]))
+capacity, trigger, ratio = map(float, sys.argv[7:10])
+if capacity <= 0 or not 0 < trigger <= 1 or not 0 < ratio <= 1:
+    raise ValueError("Invalid physical L2 capacity or eviction watermarks")
 
 if shared_workers <= 0:
     raise ValueError("KV_FS_SHARED_WORKERS must be > 0")
@@ -773,6 +783,9 @@ spec = {
     "base_path": base_path,
     "num_workers": shared_workers,
     "use_odirect": False,
+    "max_capacity_gb": capacity,
+    "eviction": {"eviction_policy": "LRU", "trigger_watermark": trigger,
+                 "eviction_ratio": ratio},
 }
 per_op = {
     name: count

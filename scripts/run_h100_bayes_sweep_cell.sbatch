@@ -19,6 +19,7 @@ esac
 export NUM_QUESTIONS=650 SUBMISSION_BATCH_SIZE=100
 export MIN_TOKENS=128 MAX_TOKENS=128 MAX_NUM_SEQS=16
 export LMCACHE_L1_SIZE_GB="${SWEEP_CPU_GB:-225}"
+export LMCACHE_L2_SIZE_GB="${SWEEP_DISK_GB:-100}"
 export LMCACHE_MP_MAX_INFLIGHT_STORE_GB="${SWEEP_STORE_CAP_GB:-0.25}"
 export KV_PASSAGE_ORDER_POLICY="${SWEEP_ORDER:-canonical}"
 export KV_REQUEST_ORDER=seeded_shuffle KV_REQUEST_ORDER_SEED=0
@@ -43,7 +44,7 @@ export KV_GNN_DYNAMIC_PROFILE=h100_q650
 export KV_GNN_L1_BACKING=1 KV_GNN_L2_BACKING=0
 export GNN_CHUNK_VOTE_POLICY=threshold_with_drop_plurality
 export KV_BAYES_GPU_GB="${SWEEP_GPU_GB:-10}"
-export KV_BAYES_DISK_GB="${SWEEP_DISK_GB:-100}"
+export KV_BAYES_DISK_GB="$LMCACHE_L2_SIZE_GB"
 if [[ "$SWEEP_CELL" == bayes_* || "${SWEEP_POLICY:-}" == "bayes" ]]; then
   export KV_BAYES_ENABLE=1
   export KV_BAYES_PRIOR_FILE="${SWEEP_PRIOR_FILE:-/mnt/shared/gpfs/home/sriramc2/runs/kvaware/rank_h100_calibrated.json}"
