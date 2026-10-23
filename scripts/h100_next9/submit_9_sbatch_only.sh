@@ -1,0 +1,9 @@
+sbatch --dependency=singleton --job-name=kvq650-10batch --export=ALL,CASE_ID=P01_CAL_SCORE_COSTOFF scripts/h100_next9/run_h100_next9_cell.sbatch
+sbatch --dependency=singleton --job-name=kvq650-10batch --export=ALL,CASE_ID=P02_UNIF_BOTH_FIXED scripts/h100_next9/run_h100_next9_cell.sbatch
+sbatch --dependency=singleton --job-name=kvq650-10batch --export=ALL,CASE_ID=P03_UNIF_SCORE_FIXED scripts/h100_next9/run_h100_next9_cell.sbatch
+sbatch --dependency=singleton --job-name=kvq650-10batch --export=ALL,CASE_ID=P04_UNIF_BOTH_HI scripts/h100_next9/run_h100_next9_cell.sbatch
+sbatch --dependency=singleton --job-name=kvq650-10batch --export=ALL,CASE_ID=P05_UNIF_BOTH_LO scripts/h100_next9/run_h100_next9_cell.sbatch
+sbatch --dependency=singleton --job-name=kvq650-10batch --export=ALL,CASE_ID=P06_UNIF_SCORE_HI scripts/h100_next9/run_h100_next9_cell.sbatch
+sbatch --dependency=singleton --job-name=kvq650-10batch --export=ALL,CASE_ID=P07_UNIF_SCORE_LO scripts/h100_next9/run_h100_next9_cell.sbatch
+sbatch --dependency=singleton --job-name=kvq650-10batch --export=ALL,CASE_ID=SCAR_NG scripts/h100_next9/run_h100_next9_cell.sbatch
+sbatch --dependency=singleton --job-name=kvq650-10batch --export=ALL,CASE_ID=SCAR_BY scripts/h100_next9/run_h100_next9_cell.sbatch

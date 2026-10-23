@@ -1,120 +1,96 @@
-# CodeNimbus H100 Q650 ten-cell matrix (original passage ordering)
+## v3 installer correction (after v2 assertion failure)
 
-This package queues P1–P8 plus P11 and P12, *not* P9/P10. It works against the
-**current patched repository**, rather than bundling old copies of the launchers.
+The v2 installer might successfully patch the mapper but then fail a test
+because it incorrectly demands the **entire** `cost_counts` dictionary contain
+*only* `cpu` and `disk`. Some mapper variants track extra cost tiers.
+The v3 behavior test records all counters/sums and verifies:
 
-## First: install on the login node
+- OFF: no cost counter, accumulated cost, or estimated CPU/Disk cost changes.
+- ON: CPU count increases exactly 12 and Disk count exactly 3, with nonzero effect on estimates.
+- Profile flag agrees with switch, score observations still work.
 
-From the repo root:
+The v3 installer is idempotent: if the v2 patch is present, it does not
+re-patch or overwrite the `bayesian_mapper.py.next9_before_cost_guard.bak` file.
+If a real adaptation failure exists, v3 aborts with **before/after diagnostics**.
+No Slurm jobs or scratch cleanups happen during installation or checks.
+
+After replacing the package:
+
+```
+unzip -o ~/h100_next9_launch_v3.zip -d .
+python scripts/h100_next9/install.py --repo "$PWD"
+python scripts/h100_next9/install.py --repo "$PWD" --check-only
+```
+
+# H100 next-nine: arbitrary-prior robustness (7) + proportional scarcity (2)
+
+This bundle **reuses your existing, working `scripts/h100_next8/*_variable.*` launchers** and does not reinstall or overwrite them. It changes only the pure-Python Bayesian mapper, installing a guarded `KV_BAYES_ADAPT_COST` switch. It intentionally fixes the former `Invalid cell: next8_*` error by using `c_next9_*` names accepted by the shared dispatcher.
+
+## Install (CodeNimbus login node, no H100 required)
+
+Copy the zip into your repo/home and run:
 
 ```bash
 cd /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
-unzip -o ~/h100_ten_job_launch.zip -d .
-python scripts/h100_10batch/install.py --repo "$PWD"
+unzip -o ~/h100_next9_launch.zip -d .
+python scripts/h100_next9/install.py --repo "$PWD"
 ```
 
-The installer **does not overwrite** either original launcher. It reads and
-clones your current `scripts/run_h100_bayes_sweep_cell.sbatch` and
-`scripts/run_h100_mp_nognn_q650_current_cleanall.sbatch` into
-`scripts/h100_10batch/`, after applying two targeted changes:
+The installer creates `scripts/h100_next9/priors/calibrated_scores_equal_cost_10ms.json` by **preserving the calibrated histogram** in `/mnt/shared/gpfs/home/sriramc2/runs/kvaware/h100_expected_ordinal_exploratory.json` and changing *only* the cost prior to 10/10/10 ms. The original calibrated file remains unmodified. The packaged `uniform_scores_equal_cost_10ms.json` has 256 equal-width bins on [0,100], each probability 1/256, and costs 10/10/10 ms.
 
-* The Bayesian sweep clone propagates the requested fixed/pseudo-count posterior.
-* Both Bayesian and no-GNN modes honor **`CLEAN_OLD_LMCACHE=1` (the default)**.
-  Before every experiment, the guarded cleaner removes all children of
-  `/scratch2/sriramc2` but preserves the root directory. No-GNN performs this
-  in the generated no-GNN clone; Bayesian performs it in the existing common
-  launcher. Unique L2 paths are still used.
+The v2 installer uses syntax-aware matching for the cost-update guard, to tolerate harmless source differences in `observe_cost()` while refusing ambiguous changes. The first v1 attempt may have already created the hybrid JSON; rerunning is safe and does not overwrite it.
 
-**WARNING:** Singleton serializes this batch only. The full-root cleanup can
-remove scratch files belonging to **other concurrently running jobs** under
-`/scratch2/sriramc2`. Don't run unrelated scratch-using experiments concurrently.
+The installer backs up the original `Hierarchical_KV/shortq_placement/bayesian_mapper.py` as `bayesian_mapper.py.next9_before_cost_guard.bak`, adds `KV_BAYES_ADAPT_COST=0|1` (default ON), and tests ON/OFF posterior behavior with a synthetic single-wave score source. The switch **ignores observations in `observe_cost()`** when OFF; the direct-cost instrumentation and LMCache log parsing stay ON. It also writes a `cost_adaptation_enabled` boolean in every `bayes_wave_history.json` profile. No vLLM/LMCache C++ or storage code is changed.
 
-The installer will refuse to proceed if required current physical L2 capacity
-patches are absent. For Bayesian jobs it also verifies that the ordinal
-expected-score prior exists at:
-`/mnt/shared/gpfs/home/sriramc2/runs/kvaware/h100_expected_ordinal_exploratory.json`.
-
-## Second: submit all ten to the queue
+To rerun the checks later without changing anything:
 
 ```bash
-bash scripts/h100_10batch/submit_10_sbatch_only.sh
+python scripts/h100_next9/install.py --repo "$PWD" --check-only
 ```
 
-`submit_10_sbatch_only.sh` contains **exactly ten `sbatch` commands and no
-other lines**, so you can run any line separately for re-submissions.
-
-Every submission uses `--dependency=singleton --job-name=kvq650-10batch`.
-Consequently **all ten jobs enter the queue immediately** but **at most one
-of this batch runs at a time**; each next job can run after the previous ends,
-including if the previous fails. That prevents port collisions and keeps the
-batch's scratch usage nonconcurrent. Jobs from elsewhere using the same scratch
-root should still avoid touching the job-specific L2 paths.
-
-Each successive experiment clears the prior run's scratch cache. The final
-experiment's cache remains until another clean run starts or you remove it.
-All logs/results under the GPFS run directory are preserved.
-
-All runs: H100 partition `gpu-h100-dchen`, TP2 Llama-3.3-70B FP8,
-`cpus-per-task=16`, 6h walltime, Q650, B100, original passage order,
-seeded cold shuffle seed0, warm random seed1, 128 output tokens,
-max_num_seqs16, L1 CPU setting as below; physical L2 capacity equals the
-specified Disk budget, and L2 watermark is 0.9. No `--mem` is included.
-
-## Jobs
-
-| Job | Experiment | GPU policy | L1 CPU GiB | Physical L2 GiB | Disk PUT cap GiB | Posterior | Prior parameters |
-|---|---|---:|---:|---:|---:|---|---|
-| P1 | no GNN vs 29920 | n/a | 225 | 500 | 0.25 | n/a | n/a |
-| P2 | ordinal GNN | 25 | 225 | 500 | 0.25 | fixed | w=0.5 |
-| P3 | ordinal GNN | 30 | 225 | 300 | 0.25 | pseudo_count | score=1000, cost=100 |
-| P4 | no GNN vs 29918/29919 | n/a | 225 | 700 | 0.25 | n/a | n/a |
-| P5 | no GNN vs 29889 | n/a | 225 | 300 | 0.25 | n/a | n/a |
-| P6 | ordinal GNN | 25 | 225 | 500 | 0.25 | fixed | w=0.2 |
-| P7 | ordinal GNN | 30 | 225 | 300 | 0.25 | fixed | w=0.2 |
-| P8 | no GNN vs 29890 | n/a | 100 | 100 | **0** | n/a | n/a |
-| P11 | ordinal GNN vs 29920 | 25 | 225 | 500 | **0** | fixed | w=1 |
-| P12 | no GNN vs P1 | n/a | 225 | 500 | **0** | n/a | n/a |
-
-An L2 PUT cap of `0` means **uncapped**. No-GNN has no Bayesian GPU *policy*
-budget; vLLM TP2/GPU configuration is held fixed for comparison.
-
-## Inspection
+Optional case-by-case login-node dry run, with **no Slurm allocation and no scratch deletion**:
 
 ```bash
-squeue -u "$USER" -o '%.18i %.22j %.2t %.12M %.30R'
+DRY_RUN=1 CASE_ID=P01_CAL_SCORE_COSTOFF bash scripts/h100_next9/run_h100_next9_cell.sbatch
+DRY_RUN=1 CASE_ID=SCAR_NG bash scripts/h100_next9/run_h100_next9_cell.sbatch
 ```
 
-Logs: `/mnt/shared/gpfs/home/sriramc2/runs/kvaware/kvq650-10batch_<SLURM_JOB_ID>.out` and `.err`.
+## Run
 
-The run directory names retain labels such as `c_P2_bayes` and `c_P1_nognn`,
-so you can associate runs with the experiment grid.
+Submit exactly nine serialized jobs:
 
-Check each completed run's `run_config.json` before analysis, particularly
-`bayes_posterior_mode`, `bayes_score_prior_count`, `bayes_cost_prior_count`,
-`lmcache_l2_size_gb`, `store_max_inflight_gb`, and original passage order.
+```bash
+bash scripts/h100_next9/submit_9_sbatch_only.sh
+```
 
-## Methodological cautions
+They share `--dependency=singleton --job-name=kvq650-10batch` with the preceding test jobs so there are no concurrent *same-job-name* scratch cleanups. **Other active users/jobs of `/scratch2/sriramc2` are NOT protected.** Every run intentionally deletes *all contents* of `/scratch2/sriramc2` and preserves the root directory. Results/logs reside on GPFS. This is destructive; confirm no unrelated jobs are using that scratch before submitting. No `--mem` directive is used. Each job requests 2×H100 TP2, 16 CPU cores, 6 hours.
 
-* This runs all ten as requested, but it does not guarantee their queue start
-  times. Singleton serializes only jobs with this job name submitted by you.
-* Physically capped L2 should be installed in both the current Bayesian/common
-  and no-GNN baseline launchers (the installer verifies required markers).
-* No-GNN is **not** identical to the GNN policy with the model removed: learned
-  retention bias is disabled but ordinary vLLM prefix caching is still enabled.
-* The score prior was built from the exploratory medical workload; do not
-  present this ten-run group as independent test-set generalization.
-* Do **not** use older submission scripts that may clear the whole scratch root
-  concurrently with these jobs.
+### Experimental grid
 
-## Default scratch cleanup and reruns
+All runs are Medical Q650/B100, original passage ordering, cold seed0/warm seed1, 512-token chunks, max_num_seqs16, capped Disk PUT=0.25GiB, full cold-to-warm store barrier, all GNN using expected-ordinal scores. All prior ablations use GPU25/CPU225/Disk500 and **score adaptation ON**. Fixed-weight cells use `w=0.5`. Pseudo-count cells retain `w=0.5` in their logs but the pseudo-count equations use `kA/kB`, not `w`.
 
-`scripts/h100_10batch/run_h100_10batch_cell.sbatch` exports
-`CLEAN_OLD_LMCACHE=1`. Set to `0` only if you need to preserve scratch contents.
-The 10 sbatch lines remain unchanged and use `singleton`, which waits for jobs
-with the same name/user to finish, **even after a job fails**. `afterok` instead
-blocks on failure, and is not suitable for this overnight sweep.
+| Cell | Score prior | Cost prior | Score adaptation | Cost adaptation | Posterior | GPU/CPU/Disk GiB |
+|---|---|---|---|---|---|---|
+| P01_CAL_SCORE_COSTOFF | Calibrated medical histogram | Equal 10/10/10 | ON | OFF | Fixed w=0.5 | 25/225/500 |
+| P02_UNIF_BOTH_FIXED | Uniform | Equal 10/10/10 | ON | ON | Fixed w=0.5 | 25/225/500 |
+| P03_UNIF_SCORE_FIXED | Uniform | Equal 10/10/10 | ON | OFF | Fixed w=0.5 | 25/225/500 |
+| P04_UNIF_BOTH_HI | Uniform | Equal 10/10/10 | ON | ON | Pseudo kA=1000/kB=100 | 25/225/500 |
+| P05_UNIF_BOTH_LO | Uniform | Equal 10/10/10 | ON | ON | Pseudo kA=10/kB=1 | 25/225/500 |
+| P06_UNIF_SCORE_HI | Uniform | Equal 10/10/10 | ON | OFF | Pseudo kA=1000/kB=100† | 25/225/500 |
+| P07_UNIF_SCORE_LO | Uniform | Equal 10/10/10 | ON | OFF | Pseudo kA=10/kB=1† | 25/225/500 |
+| SCAR_NG | n/a | n/a | n/a | n/a | No GNN | n/a/100/222 |
+| SCAR_BY | 29954's original calibrated histogram | 29954's original calibrated cost prior | ON | ON | Fixed w=0.5 | 25/100/222 |
 
-If you previously submitted jobs using the old wrapper, Slurm may have already
-spooled the old wrapper with `CLEAN_OLD_LMCACHE=0`; do not assume editing the
-file on disk changes those submissions. Re-submit those jobs after verifying
-their currently queued settings.
+† kB is provided as the same nominal setting in the matched cost-ON cell but has **no effect** with cost adaptation OFF.
+
+**Important methodology note:** P01 and P03 hold cost prior and cost adaptation constant, isolating *score-histogram calibration*. P01 is **not** the original calibrated cost-prior configuration; the sole baseline retaining all original calibration is existing job **29954**. SCAR_BY is an exact policy continuation of 29954 with only CPU/Disk capacities changed. SCAR_NG matches physical CPU/Disk capacities. The GPU policy budget is fixed at 25 GiB, so the three tiers are not proportionally scaled; only CPU and Disk are scaled together from 225/500 to 100/222. The cost prior 10ms scale is arbitrary and affects posterior cost updates; report it transparently.
+
+The current Bayesian implementation always freezes `recompute` cost at the prior; only CPU and Disk cost estimates adapt, so "cost adaptation ON" means *CPU/Disk* cost adaptation only.
+
+## Logs & sanity checks
+
+All jobs write GPFS Slurm logs `runs/kvaware/kvq650-10batch_<JOBID>.out` and `.err`, and preserve the normal detailed result folders with unique `c_next9_<CASE_ID>_<POLICY>` labels. `bayes_wave_history.json` includes `cost_adaptation_enabled`: it must be false for P01/P03/P06/P07, true for P02/P04/P05/SCAR_BY. OFF cells should keep mapper `cost_sample_counts={"cpu":0,"disk":0}` but still have direct LMCache timing records in their LMCache logs.
+
+The sampler still updates only after the normal B100 waves. This bundle does **not** attempt intra-batch Bayesian updates and does not change request concurrency or schedule.
+
+If a local H100 env differs from the current known-good next8 launcher, the installer checks fail rather than falling back to the old unpatched launcher.

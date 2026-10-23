@@ -58,4 +58,5 @@ if [[ "$SWEEP_CELL" == bayes_* || "${SWEEP_POLICY:-}" == "bayes" ]]; then
     export KV_BAYES_RANDOM_SCORE_SEED=42
   fi
 fi
+export KV_BAYES_SCORE_FORMAT=expected_ordinal_0_100
 bash scripts/run_shortq_gnn_dynamic_vpc_common.sh

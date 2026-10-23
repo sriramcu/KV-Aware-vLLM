@@ -81,6 +81,10 @@ class WaveBayesianMapper:
         s = sum(self.prior_hist)
         self.prior_hist = [v / s for v in self.prior_hist]
         self.prior_ms = {t: float(self.prior["cost_prior_ms"][t]) for t in ("cpu", "disk", "recompute")}
+        cost_switch = os.environ.get("KV_BAYES_ADAPT_COST", "1")
+        if cost_switch not in ("0", "1"):
+            raise ValueError("KV_BAYES_ADAPT_COST must be 0 or 1")
+        self.adapt_cost = cost_switch == "1"
         if any(not math.isfinite(x) or x <= 0 for x in self.prior_ms.values()):
             raise ValueError("cost_prior_ms values must be finite and > 0")
         self.capacities = {"gpu": float(gpu_gb), "cpu": float(cpu_gb), "disk": float(disk_gb)}
@@ -134,6 +138,8 @@ class WaveBayesianMapper:
             raise ValueError(tier)
         if not math.isfinite(milliseconds_per_chunk) or milliseconds_per_chunk <= 0 or count <= 0:
             raise ValueError("invalid tier-cost observation")
+        if not self.adapt_cost:
+            return  # Instrumentation remains ON; freeze CPU/Disk posterior.
         self.cost_sum_ms[tier] += milliseconds_per_chunk * count
         self.cost_counts[tier] += count
 
@@ -303,6 +309,7 @@ class WaveBayesianMapper:
             "posterior_mode": self.posterior_mode,
             "score_prior_count": self.score_prior_count,
             "cost_prior_count": self.cost_prior_count,
+            "cost_adaptation_enabled": self.adapt_cost,
             "cost_sample_counts": dict(self.cost_counts),
             "cost_estimate_ms": {t: self.estimated_cost(t) for t in ("cpu", "disk", "recompute")},
             "thresholds": {k: b[k] for k in TIERS},
