@@ -1,0 +1,10 @@
+sbatch --dependency=singleton --job-name=kvq650-10batch --export=ALL,CASE_ID=P1 scripts/h100_10batch/run_h100_10batch_cell.sbatch
+sbatch --dependency=singleton --job-name=kvq650-10batch --export=ALL,CASE_ID=P2 scripts/h100_10batch/run_h100_10batch_cell.sbatch
+sbatch --dependency=singleton --job-name=kvq650-10batch --export=ALL,CASE_ID=P3 scripts/h100_10batch/run_h100_10batch_cell.sbatch
+sbatch --dependency=singleton --job-name=kvq650-10batch --export=ALL,CASE_ID=P4 scripts/h100_10batch/run_h100_10batch_cell.sbatch
+sbatch --dependency=singleton --job-name=kvq650-10batch --export=ALL,CASE_ID=P5 scripts/h100_10batch/run_h100_10batch_cell.sbatch
+sbatch --dependency=singleton --job-name=kvq650-10batch --export=ALL,CASE_ID=P6 scripts/h100_10batch/run_h100_10batch_cell.sbatch
+sbatch --dependency=singleton --job-name=kvq650-10batch --export=ALL,CASE_ID=P7 scripts/h100_10batch/run_h100_10batch_cell.sbatch
+sbatch --dependency=singleton --job-name=kvq650-10batch --export=ALL,CASE_ID=P8 scripts/h100_10batch/run_h100_10batch_cell.sbatch
+sbatch --dependency=singleton --job-name=kvq650-10batch --export=ALL,CASE_ID=P11 scripts/h100_10batch/run_h100_10batch_cell.sbatch
+sbatch --dependency=singleton --job-name=kvq650-10batch --export=ALL,CASE_ID=P12 scripts/h100_10batch/run_h100_10batch_cell.sbatch

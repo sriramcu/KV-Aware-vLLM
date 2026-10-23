@@ -1,110 +1,120 @@
-<!-- markdownlint-disable MD001 MD041 -->
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
-    <img alt="vLLM" src="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-light.png" width=55%>
-  </picture>
-</p>
+# CodeNimbus H100 Q650 ten-cell matrix (original passage ordering)
 
-<h3 align="center">
-Easy, fast, and cheap LLM serving for everyone
-</h3>
+This package queues P1–P8 plus P11 and P12, *not* P9/P10. It works against the
+**current patched repository**, rather than bundling old copies of the launchers.
 
-<p align="center">
-| <a href="https://docs.vllm.ai"><b>Documentation</b></a> | <a href="https://blog.vllm.ai/"><b>Blog</b></a> | <a href="https://arxiv.org/abs/2309.06180"><b>Paper</b></a> | <a href="https://x.com/vllm_project"><b>Twitter/X</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> |
-</p>
+## First: install on the login node
 
-🔥 We have built a vLLM website to help you get started with vLLM. Please visit [vllm.ai](https://vllm.ai) to learn more.
-For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
-
----
-
-## About
-
-vLLM is a fast and easy-to-use library for LLM inference and serving.
-
-Originally developed in the [Sky Computing Lab](https://sky.cs.berkeley.edu) at UC Berkeley, vLLM has grown into one of the most active open-source AI projects built and maintained by a diverse community of many dozens of academic institutions and companies from over 2000 contributors.
-
-vLLM is fast with:
-
-- State-of-the-art serving throughput
-- Efficient management of attention key and value memory with [**PagedAttention**](https://blog.vllm.ai/2023/06/20/vllm.html)
-- Continuous batching of incoming requests, chunked prefill, prefix caching
-- Fast and flexible model execution with piecewise and full CUDA/HIP graphs
-- Quantization: FP8, MXFP8/MXFP4, NVFP4, INT8, INT4, GPTQ/AWQ, GGUF, compressed-tensors, ModelOpt, TorchAO, and [more](https://docs.vllm.ai/en/latest/features/quantization/index.html)
-- Optimized attention kernels including FlashAttention, FlashInfer, TRTLLM-GEN, FlashMLA, and Triton
-- Optimized GEMM/MoE kernels for various precisions using CUTLASS, TRTLLM-GEN, CuTeDSL
-- Speculative decoding including n-gram, suffix, EAGLE, DFlash
-- Automatic kernel generation and graph-level transformations using torch.compile
-- Disaggregated prefill, decode, and encode
-
-vLLM is flexible and easy to use with:
-
-- Seamless integration with popular Hugging Face models
-- High-throughput serving with various decoding algorithms, including *parallel sampling*, *beam search*, and more
-- Tensor, pipeline, data, expert, and context parallelism for distributed inference
-- Streaming outputs
-- Generation of structured outputs using xgrammar or guidance
-- Tool calling and reasoning parsers
-- OpenAI-compatible API server, plus Anthropic Messages API and gRPC support
-- Efficient multi-LoRA support for dense and MoE layers
-- Support for NVIDIA GPUs, AMD GPUs, Intel GPUs, and x86/ARM/PowerPC CPUs. Additionally, diverse hardware plugins such as Google TPUs, Intel Gaudi, IBM Spyre, Huawei Ascend, Rebellions NPU, Apple Silicon, MetaX GPU, and more.
-
-vLLM seamlessly supports 200+ model architectures on Hugging Face, including:
-
-- Decoder-only LLMs (e.g., Llama, Qwen, Gemma)
-- Mixture-of-Expert LLMs (e.g., Mixtral, DeepSeek-V3, Qwen-MoE, GPT-OSS)
-- Hybrid attention and state-space models (e.g., Mamba, Qwen3.5)
-- Multi-modal models (e.g., LLaVA, Qwen-VL, Pixtral)
-- Embedding and retrieval models (e.g., E5-Mistral, GTE, ColBERT)
-- Reward and classification models (e.g., Qwen-Math)
-
-Find the full list of supported models [here](https://docs.vllm.ai/en/latest/models/supported_models.html).
-
-## Getting Started
-
-Install vLLM with [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`:
+From the repo root:
 
 ```bash
-uv pip install vllm
+cd /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
+unzip -o ~/h100_ten_job_launch.zip -d .
+python scripts/h100_10batch/install.py --repo "$PWD"
 ```
 
-Or [build from source](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/index.html#build-wheel-from-source) for development.
+The installer **does not overwrite** either original launcher. It reads and
+clones your current `scripts/run_h100_bayes_sweep_cell.sbatch` and
+`scripts/run_h100_mp_nognn_q650_current_cleanall.sbatch` into
+`scripts/h100_10batch/`, after applying two targeted changes:
 
-Visit our [documentation](https://docs.vllm.ai/en/latest/) to learn more.
+* The Bayesian sweep clone propagates the requested fixed/pseudo-count posterior.
+* Both Bayesian and no-GNN modes honor **`CLEAN_OLD_LMCACHE=1` (the default)**.
+  Before every experiment, the guarded cleaner removes all children of
+  `/scratch2/sriramc2` but preserves the root directory. No-GNN performs this
+  in the generated no-GNN clone; Bayesian performs it in the existing common
+  launcher. Unique L2 paths are still used.
 
-- [Installation](https://docs.vllm.ai/en/latest/getting_started/installation.html)
-- [Quickstart](https://docs.vllm.ai/en/latest/getting_started/quickstart.html)
-- [List of Supported Models](https://docs.vllm.ai/en/latest/models/supported_models.html)
+**WARNING:** Singleton serializes this batch only. The full-root cleanup can
+remove scratch files belonging to **other concurrently running jobs** under
+`/scratch2/sriramc2`. Don't run unrelated scratch-using experiments concurrently.
 
-## Contributing
+The installer will refuse to proceed if required current physical L2 capacity
+patches are absent. For Bayesian jobs it also verifies that the ordinal
+expected-score prior exists at:
+`/mnt/shared/gpfs/home/sriramc2/runs/kvaware/h100_expected_ordinal_exploratory.json`.
 
-We welcome and value any contributions and collaborations.
-Please check out [Contributing to vLLM](https://docs.vllm.ai/en/latest/contributing/index.html) for how to get involved.
+## Second: submit all ten to the queue
 
-## Citation
-
-If you use vLLM for your research, please cite our [paper](https://arxiv.org/abs/2309.06180):
-
-```bibtex
-@inproceedings{kwon2023efficient,
-  title={Efficient Memory Management for Large Language Model Serving with PagedAttention},
-  author={Woosuk Kwon and Zhuohan Li and Siyuan Zhuang and Ying Sheng and Lianmin Zheng and Cody Hao Yu and Joseph E. Gonzalez and Hao Zhang and Ion Stoica},
-  booktitle={Proceedings of the ACM SIGOPS 29th Symposium on Operating Systems Principles},
-  year={2023}
-}
+```bash
+bash scripts/h100_10batch/submit_10_sbatch_only.sh
 ```
 
-## Contact Us
+`submit_10_sbatch_only.sh` contains **exactly ten `sbatch` commands and no
+other lines**, so you can run any line separately for re-submissions.
 
-<!-- --8<-- [start:contact-us] -->
-- For technical questions and feature requests, please use GitHub [Issues](https://github.com/vllm-project/vllm/issues)
-- For discussing with fellow users, please use the [vLLM Forum](https://discuss.vllm.ai)
-- For coordinating contributions and development, please use [Slack](https://slack.vllm.ai)
-- For security disclosures, please use GitHub's [Security Advisories](https://github.com/vllm-project/vllm/security/advisories) feature
-- For collaborations and partnerships, please contact us at [collaboration@vllm.ai](mailto:collaboration@vllm.ai)
-<!-- --8<-- [end:contact-us] -->
+Every submission uses `--dependency=singleton --job-name=kvq650-10batch`.
+Consequently **all ten jobs enter the queue immediately** but **at most one
+of this batch runs at a time**; each next job can run after the previous ends,
+including if the previous fails. That prevents port collisions and keeps the
+batch's scratch usage nonconcurrent. Jobs from elsewhere using the same scratch
+root should still avoid touching the job-specific L2 paths.
 
-## Media Kit
+Each successive experiment clears the prior run's scratch cache. The final
+experiment's cache remains until another clean run starts or you remove it.
+All logs/results under the GPFS run directory are preserved.
 
-- If you wish to use vLLM's logo, please refer to [our media kit repo](https://github.com/vllm-project/media-kit)
+All runs: H100 partition `gpu-h100-dchen`, TP2 Llama-3.3-70B FP8,
+`cpus-per-task=16`, 6h walltime, Q650, B100, original passage order,
+seeded cold shuffle seed0, warm random seed1, 128 output tokens,
+max_num_seqs16, L1 CPU setting as below; physical L2 capacity equals the
+specified Disk budget, and L2 watermark is 0.9. No `--mem` is included.
+
+## Jobs
+
+| Job | Experiment | GPU policy | L1 CPU GiB | Physical L2 GiB | Disk PUT cap GiB | Posterior | Prior parameters |
+|---|---|---:|---:|---:|---:|---|---|
+| P1 | no GNN vs 29920 | n/a | 225 | 500 | 0.25 | n/a | n/a |
+| P2 | ordinal GNN | 25 | 225 | 500 | 0.25 | fixed | w=0.5 |
+| P3 | ordinal GNN | 30 | 225 | 300 | 0.25 | pseudo_count | score=1000, cost=100 |
+| P4 | no GNN vs 29918/29919 | n/a | 225 | 700 | 0.25 | n/a | n/a |
+| P5 | no GNN vs 29889 | n/a | 225 | 300 | 0.25 | n/a | n/a |
+| P6 | ordinal GNN | 25 | 225 | 500 | 0.25 | fixed | w=0.2 |
+| P7 | ordinal GNN | 30 | 225 | 300 | 0.25 | fixed | w=0.2 |
+| P8 | no GNN vs 29890 | n/a | 100 | 100 | **0** | n/a | n/a |
+| P11 | ordinal GNN vs 29920 | 25 | 225 | 500 | **0** | fixed | w=1 |
+| P12 | no GNN vs P1 | n/a | 225 | 500 | **0** | n/a | n/a |
+
+An L2 PUT cap of `0` means **uncapped**. No-GNN has no Bayesian GPU *policy*
+budget; vLLM TP2/GPU configuration is held fixed for comparison.
+
+## Inspection
+
+```bash
+squeue -u "$USER" -o '%.18i %.22j %.2t %.12M %.30R'
+```
+
+Logs: `/mnt/shared/gpfs/home/sriramc2/runs/kvaware/kvq650-10batch_<SLURM_JOB_ID>.out` and `.err`.
+
+The run directory names retain labels such as `c_P2_bayes` and `c_P1_nognn`,
+so you can associate runs with the experiment grid.
+
+Check each completed run's `run_config.json` before analysis, particularly
+`bayes_posterior_mode`, `bayes_score_prior_count`, `bayes_cost_prior_count`,
+`lmcache_l2_size_gb`, `store_max_inflight_gb`, and original passage order.
+
+## Methodological cautions
+
+* This runs all ten as requested, but it does not guarantee their queue start
+  times. Singleton serializes only jobs with this job name submitted by you.
+* Physically capped L2 should be installed in both the current Bayesian/common
+  and no-GNN baseline launchers (the installer verifies required markers).
+* No-GNN is **not** identical to the GNN policy with the model removed: learned
+  retention bias is disabled but ordinary vLLM prefix caching is still enabled.
+* The score prior was built from the exploratory medical workload; do not
+  present this ten-run group as independent test-set generalization.
+* Do **not** use older submission scripts that may clear the whole scratch root
+  concurrently with these jobs.
+
+## Default scratch cleanup and reruns
+
+`scripts/h100_10batch/run_h100_10batch_cell.sbatch` exports
+`CLEAN_OLD_LMCACHE=1`. Set to `0` only if you need to preserve scratch contents.
+The 10 sbatch lines remain unchanged and use `singleton`, which waits for jobs
+with the same name/user to finish, **even after a job fails**. `afterok` instead
+blocks on failure, and is not suitable for this overnight sweep.
+
+If you previously submitted jobs using the old wrapper, Slurm may have already
+spooled the old wrapper with `CLEAN_OLD_LMCACHE=0`; do not assume editing the
+file on disk changes those submissions. Re-submit those jobs after verifying
+their currently queued settings.
