@@ -213,6 +213,16 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 "bayes_h2d_done", self._bayes_h2d_complete,
                 payload_type=tuple[float, int, str],
             )
+        # [SC] Optional diagnostic is independent of the adaptive estimator.
+        # Only the existing BAYES_H2D_COMPLETE stream feeds observe_cost().
+        self._h2d_diag_enabled = _env_flag("LMCACHE_BAYES_H2D_DIAG")
+        if self._h2d_diag_enabled:
+            self._h2d_diag_lock = threading.Lock()
+            self._h2d_diag_pending: dict[str, tuple[Any, ...]] = {}
+            self._device_host_func_dispatcher.register(
+                "bayes_h2d_diag_done", self._bayes_h2d_diag_complete,
+                payload_type=str,
+            )
         self._device_host_func_dispatcher.start()
 
     @staticmethod
@@ -222,6 +232,58 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         if chunks > 0 and elapsed_ms > 0:
             logger.info("[BAYES_H2D_COMPLETE] request=%s chunks=%d elapsed_ms=%.6f",
                         request, chunks, elapsed_ms)
+
+    @staticmethod
+    def _bayes_h2d_diag_record(event: Any, stream: Any) -> bool:
+        """Fail-open CUDA event recording; diagnostics must not fail RETRIEVE."""
+        try:
+            event.record(stream)
+            return True
+        except Exception:
+            logger.exception("[BAYES_H2D_DIAG_ERROR] event recording")
+            return False
+
+    def _bayes_h2d_diag_complete(self, transfer_key: str) -> None:
+        """Inspect completed CUDA events on dispatcher thread, never a CUDA callback.
+
+        This executes on DeviceHostFuncDispatcher AFTER the native CUDA host
+        callback has been drained. CUDA runtime calls are legal here. The
+        observation sent to the Bayesian mapper is deliberately untouched.
+        """
+        with self._h2d_diag_lock:
+            record = self._h2d_diag_pending.pop(transfer_key, None)
+        if record is None:
+            logger.warning("[BAYES_H2D_DIAG_MISSING] transfer_key=%s", transfer_key)
+            return
+        (request, device, chunks, nbytes, started, host_enqueued,
+         before_wait, after_wait, before_copy, after_copy) = record
+        try:
+            # Third Party -- lazy import avoids initializing CUDA when off.
+            import cupy
+
+            device_idx = int(str(device).split(":")[-1])
+            with cupy.cuda.Device(device_idx):
+                wait_ms = cupy.cuda.get_elapsed_time(before_wait, after_wait)
+                postwait_ms = cupy.cuda.get_elapsed_time(after_wait, before_copy)
+                transfer_ms = cupy.cuda.get_elapsed_time(before_copy, after_copy)
+                stream_total_ms = cupy.cuda.get_elapsed_time(before_wait, after_copy)
+            callback_elapsed_ms = (time.perf_counter() - started) * 1000.0
+            logger.info(
+                "[BAYES_H2D_DIAG] request=%s transfer_key=%s device=%s "
+                "chunks=%d nbytes=%d host_enqueue_ms=%.6f "
+                "gpu_producer_wait_ms=%.6f gpu_postwait_gap_ms=%.6f "
+                "gpu_transfer_region_ms=%.6f gpu_stream_region_ms=%.6f "
+                "wall_to_dispatch_ms=%.6f",
+                request, transfer_key, device, chunks, nbytes,
+                (host_enqueued - started) * 1000.0,
+                wait_ms, postwait_ms, transfer_ms, stream_total_ms,
+                callback_elapsed_ms,
+            )
+        except Exception:
+            logger.exception(
+                "[BAYES_H2D_DIAG_ERROR] request=%s transfer_key=%s",
+                request, transfer_key,
+            )
 
     def register_host_func(self, kind: str, handler: Any, payload_type: Any) -> None:
         """Register *handler* for *kind* on the per-process device host-func
@@ -1013,7 +1075,32 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             producer_event = event_backend.import_event(
                 event_ipc_handle, cache_context.device
             )
+            # [SC] Event pairs are stamped *on the existing transfer stream*;
+            # they never synchronize the CPU. The intervals intentionally
+            # measure (1) producer dependency wait, (2) gap before H2D issue,
+            # and (3) queued GPU transfer region. Native phase samples further
+            # split (3) into staging DMA versus scatter kernels.
+            diag_events = None
+            if self._h2d_diag_enabled:
+                try:
+                    import cupy
+                    pre_wait_ev = cupy.cuda.Event()
+                    post_wait_ev = cupy.cuda.Event()
+                    pre_copy_ev = cupy.cuda.Event()
+                    post_copy_ev = cupy.cuda.Event()
+                    if self._bayes_h2d_diag_record(
+                        pre_wait_ev, cache_context.cupy_stream
+                    ):
+                        diag_events = (
+                            pre_wait_ev, post_wait_ev, pre_copy_ev, post_copy_ev
+                        )
+                except Exception:
+                    logger.exception("[BAYES_H2D_DIAG_ERROR] pre-wait setup")
             event_backend.wait_event(producer_event, cache_context.stream)
+            if diag_events is not None and not self._bayes_h2d_diag_record(
+                diag_events[1], cache_context.cupy_stream
+            ):
+                diag_events = None
 
             # Per object group, the prefetch only locked the in-window suffix
             # (the last ``num_chunks_in_sw`` chunks; the whole prefix for full
@@ -1040,6 +1127,10 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             total_bytes = 0
             retrieve_succeeded = True
             try:
+                if diag_events is not None and not self._bayes_h2d_diag_record(
+                    diag_events[2], cache_context.cupy_stream
+                ):
+                    diag_events = None
                 for obj_group_id in range(num_object_groups):
                     if obj_group_id in skipped_groups:
                         continue
@@ -1080,6 +1171,17 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 logger.exception("Cannot retrieve keys due to exception")
                 retrieve_succeeded = False
             finally:
+                # Emit a separate diagnostic callback, ordered behind H2D.
+                # This does not alter BAYES_H2D_COMPLETE or observe_cost().
+                if diag_events is not None and self._bayes_h2d_diag_record(
+                    diag_events[3], cache_context.cupy_stream
+                ) and prefetched_keys:
+                    with self._h2d_diag_lock:
+                        self._h2d_diag_pending[transfer_key] = (
+                            str(key.request_id), str(cache_context.device),
+                            len(prefetched_keys), total_bytes, st,
+                            time.perf_counter(), *diag_events,
+                        )
                 event_backend.record_event(event, cache_context.stream)
                 if prefetched_keys and _env_flag("LMCACHE_BAYES_TIMING"):
                     # Callback is ordered AFTER the H2D copy on this GPU
@@ -1117,6 +1219,23 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         },
                     ),
                 )
+                # Place the diagnostic callback LAST so it cannot delay
+                # BAYES_H2D_COMPLETE, finish_read_prefetched, or MP_RETRIEVE_END.
+                if diag_events is not None and prefetched_keys:
+                    with self._h2d_diag_lock:
+                        diag_ready = transfer_key in self._h2d_diag_pending
+                    if diag_ready:
+                        try:
+                            submit_callback_to_stream(
+                                cache_context.cupy_stream,
+                                "bayes_h2d_diag_done", transfer_key,
+                            )
+                        except Exception:
+                            with self._h2d_diag_lock:
+                                self._h2d_diag_pending.pop(transfer_key, None)
+                            logger.exception(
+                                "[BAYES_H2D_DIAG_ERROR] callback enqueue"
+                            )
         if retrieve_succeeded:
             tokens_retrieved = num_chunks * self._ctx.chunk_size
             ed = time.perf_counter()

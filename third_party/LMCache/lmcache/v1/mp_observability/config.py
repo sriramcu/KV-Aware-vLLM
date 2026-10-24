@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 import argparse
+import os
 import uuid
 
 if TYPE_CHECKING:
@@ -400,13 +401,25 @@ def init_observability(
         )
     )
 
-    if obs_config.metrics_enabled or obs_config.tracing_enabled:
+    h2d_diag = os.environ.get("LMCACHE_BAYES_H2D_DIAG", "0") == "1"
+    if h2d_diag and not obs_config.enabled:
+        raise ValueError(
+            "LMCACHE_BAYES_H2D_DIAG=1 requires observability enabled "
+            "(omit --disable-observability)."
+        )
+    if obs_config.metrics_enabled or obs_config.tracing_enabled or h2d_diag:
         # First Party
         from lmcache.v1.mp_observability.subscribers.transfer_phase_sampler import (
             TransferPhaseSampler,
         )
 
         bus.register_subscriber(TransferPhaseSampler(bus))
+
+    if h2d_diag:
+        from lmcache.v1.mp_observability.subscribers.bayes_h2d_diagnostic import (
+            BayesH2DDiagnosticSubscriber,
+        )
+        bus.register_subscriber(BayesH2DDiagnosticSubscriber())
 
     if obs_config.metrics_enabled:
         # First Party
