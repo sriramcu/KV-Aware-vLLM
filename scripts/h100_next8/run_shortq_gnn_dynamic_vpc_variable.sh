@@ -31,6 +31,10 @@ KV_GNN_AWARE_VPC="${KV_GNN_AWARE_VPC:-1}"
 KV_GNN_L1_BACKING="${KV_GNN_L1_BACKING:-1}"
 LMCACHE_L1_SIZE_GB="${LMCACHE_L1_SIZE_GB:-200}"
 LMCACHE_L2_SIZE_GB="${LMCACHE_L2_SIZE_GB:-100}"
+# CE28G: these are the exact physical L1 eviction controls passed to LMCache.
+# Previously the server used 0.80 / 0.20 implicit CLI defaults.
+LMCACHE_L1_EVICTION_TRIGGER="${LMCACHE_L1_EVICTION_TRIGGER:-0.80}"
+LMCACHE_L1_EVICTION_RATIO="${LMCACHE_L1_EVICTION_RATIO:-0.20}"
 LMCACHE_L2_EVICTION_TRIGGER="${LMCACHE_L2_EVICTION_TRIGGER:-0.90}"
 LMCACHE_L2_EVICTION_RATIO="${LMCACHE_L2_EVICTION_RATIO:-0.10}"
 # Optional durability experiment: back every host-resident GNN prompt chunk to
@@ -184,6 +188,11 @@ HASH_PREDICTION_TRACE="${PLACEMENT_DIR}/gnn_hash_prediction_occurrences.jsonl"
 GNN_TIMING_TRACE="${PLACEMENT_DIR}/gnn_prediction_timing.jsonl"
 PLACEMENT_SUMMARY="${PLACEMENT_DIR}/gnn_placement_summary.json"
 KV_BAYES_ENABLE="${KV_BAYES_ENABLE:-0}"
+# [SC CE28G] One switch; no separate Bayes watermark values.
+KV_BAYES_USE_WATERMARK_CAPACITY="${KV_BAYES_USE_WATERMARK_CAPACITY:-0}"
+[[ "$KV_BAYES_USE_WATERMARK_CAPACITY" == 0 || "$KV_BAYES_USE_WATERMARK_CAPACITY" == 1 ]] || {
+  echo "KV_BAYES_USE_WATERMARK_CAPACITY must be 0 or 1" >&2; exit 2;
+}
 KV_BAYES_PRIOR_WEIGHT="${KV_BAYES_PRIOR_WEIGHT:-1}"
 KV_BAYES_PRIOR_FILE="${KV_BAYES_PRIOR_FILE:-${REPO}/Hierarchical_KV/shortq_placement/priors/rank_example.json}"
 KV_BAYES_SCORE_FILE="${PLACEMENT_DIR}/gnn_chunk_scores.jsonl"
@@ -197,6 +206,27 @@ KV_BAYES_DISK_GB="${KV_BAYES_DISK_GB:-$LMCACHE_L2_SIZE_GB}"
 if [[ "$KV_BAYES_ENABLE" == "1" && "$KV_BAYES_DISK_GB" != "$LMCACHE_L2_SIZE_GB" ]]; then
   echo "ERROR: mapper disk budget must match physical L2 size for this experiment" >&2; exit 2
 fi
+# [SC CE28G] Physical eviction knobs are authoritative. Reject values before
+# any service starts, and compute mapper budgets from those exact knobs.
+CE28G_CAP_VALUES="$(python - "$L1_GB" "$KV_BAYES_DISK_GB" \
+    "$LMCACHE_L1_EVICTION_TRIGGER" "$LMCACHE_L1_EVICTION_RATIO" \
+    "$LMCACHE_L2_EVICTION_TRIGGER" "$LMCACHE_L2_EVICTION_RATIO" \
+    "$KV_BAYES_USE_WATERMARK_CAPACITY" <<'PY_CE28G'
+import math,sys
+cpu,disk,l1wm,l1ratio,l2wm,l2ratio,enabled=map(float,sys.argv[1:])
+assert cpu>0 and disk>0 and all(math.isfinite(v) for v in (cpu,disk,l1wm,l1ratio,l2wm,l2ratio))
+assert all(0<x<=1 for x in (l1wm,l1ratio,l2wm,l2ratio))
+assert enabled in (0,1)
+print(f'{cpu*l1wm if enabled else cpu:.8f} {disk*l2wm if enabled else disk:.8f}')
+PY_CE28G
+)"
+read -r BAYES_CPU_EFFECTIVE_GB BAYES_DISK_EFFECTIVE_GB <<< "$CE28G_CAP_VALUES"
+echo "[CE28G_CAPACITY] physical_cpu=$L1_GB physical_disk=$KV_BAYES_DISK_GB "\
+  "l1_watermark=$LMCACHE_L1_EVICTION_TRIGGER l1_evict_ratio=$LMCACHE_L1_EVICTION_RATIO "\
+  "l2_watermark=$LMCACHE_L2_EVICTION_TRIGGER l2_evict_ratio=$LMCACHE_L2_EVICTION_RATIO "\
+  "apply=$KV_BAYES_USE_WATERMARK_CAPACITY effective_cpu=$BAYES_CPU_EFFECTIVE_GB "\
+  "effective_disk=$BAYES_DISK_EFFECTIVE_GB"
+
 KV_BAYES_USE_COST_PROXIES="${KV_BAYES_USE_COST_PROXIES:-0}"
 KV_BAYES_DIRECT_COST_FEEDBACK="${KV_BAYES_DIRECT_COST_FEEDBACK:-0}"
 KV_BAYES_POSTERIOR_MODE="${KV_BAYES_POSTERIOR_MODE:-fixed}"
@@ -419,6 +449,11 @@ cat > "${RUN_DIR}/run_config.json" <<JSON
   "bayes_gpu_gb": $KV_BAYES_GPU_GB,
   "bayes_disk_gb": $KV_BAYES_DISK_GB,
   "lmcache_l2_size_gb": $LMCACHE_L2_SIZE_GB,
+  "lmcache_l1_eviction_trigger": $LMCACHE_L1_EVICTION_TRIGGER,
+  "lmcache_l1_eviction_ratio": $LMCACHE_L1_EVICTION_RATIO,
+  "bayes_use_watermark_capacity": $KV_BAYES_USE_WATERMARK_CAPACITY,
+  "bayes_cpu_effective_gb": $BAYES_CPU_EFFECTIVE_GB,
+  "bayes_disk_effective_gb": $BAYES_DISK_EFFECTIVE_GB,
   "lmcache_l2_eviction_trigger": $LMCACHE_L2_EVICTION_TRIGGER,
   "lmcache_l2_eviction_ratio": $LMCACHE_L2_EVICTION_RATIO,
   "bayes_cost_observation_proxies": $KV_BAYES_USE_COST_PROXIES,
@@ -507,6 +542,8 @@ echo "fs_native adapter: $L2_JSON"
 echo "===== START LMCACHE ====="
 lmcache server --host localhost --port 5556 --chunk-size "$LMCACHE_CHUNK_SIZE" \
   --l1-size-gb "$L1_GB" \
+  --eviction-trigger-watermark "$LMCACHE_L1_EVICTION_TRIGGER" \
+  --eviction-ratio "$LMCACHE_L1_EVICTION_RATIO" \
   --l2-load-max-in-flight "$LMCACHE_L2_LOAD_MAX_IN_FLIGHT" \
   --l2-lookup-max-in-flight "$LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT" \
   --l2-store-max-inflight-gb "$LMCACHE_MP_MAX_INFLIGHT_STORE_GB" \
@@ -578,8 +615,8 @@ if [[ "$KV_BAYES_ENABLE" == "1" ]]; then
     --bayes_score_prior_count "$KV_BAYES_SCORE_PRIOR_COUNT"
     --bayes_cost_prior_count "$KV_BAYES_COST_PRIOR_COUNT"
     --bayes_gpu_gb "$KV_BAYES_GPU_GB"
-    --bayes_cpu_gb "$L1_GB"
-    --bayes_disk_gb "$KV_BAYES_DISK_GB"
+    --bayes_cpu_gb "$BAYES_CPU_EFFECTIVE_GB"
+    --bayes_disk_gb "$BAYES_DISK_EFFECTIVE_GB"
     --bayes_metadata_file "$RUNTIME_METADATA"
     --bayes_vpc_file "$VPC_IMPORTANCE_SIDECAR"
     --bayes_lmcache_log "${LOG_DIR}/lmcache.log"

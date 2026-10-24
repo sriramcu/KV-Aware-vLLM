@@ -1,0 +1,35 @@
+--- a/scripts/ce28g/test_cost_v2_offline.py
++++ b/scripts/ce28g/test_cost_v2_offline.py
+@@ -6,7 +6,16 @@
+ 
+ repo=Path(__file__).resolve().parents[2]
+ sys.path.insert(0,str(repo/'Hierarchical_KV/shortq_placement'))
+-from bayesian_mapper import LmcacheCompletionCostReader
++import bayesian_mapper as bm
++
++expected = (repo / 'Hierarchical_KV/shortq_placement/bayesian_mapper.py').resolve()
++actual = Path(bm.__file__).resolve()
++print(f"CE28G mapper loaded: {actual}", flush=True)
++assert actual == expected, f"Wrong mapper imported: {actual}; expected {expected}"
++assert 'BAYES_H2D_COST_V2' in bm.LmcacheCompletionCostReader._h2d.pattern, (
++    "Stale pre-CE28G cost reader was imported. Check the source and Python import paths."
++)
++LmcacheCompletionCostReader = bm.LmcacheCompletionCostReader
+ 
+ class Recorder:
+     def __init__(self): self.obs=[]
+--- a/scripts/ce28g/verify_ce28g.py
++++ b/scripts/ce28g/verify_ce28g.py
+@@ -18,9 +18,10 @@
+ mapper=(r/'Hierarchical_KV/shortq_placement/bayesian_mapper.py').read_text()
+ transfer=(r/'third_party/LMCache/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py').read_text()
+ launcher=(r/'scripts/h100_next8/run_shortq_gnn_dynamic_vpc_variable.sh').read_text()
+-assert 'r"\\[BAYES_H2D_COST_V2\\]' not in mapper  # sanity: no double backslashes
++assert r'\[BAYES_H2D_COST_V2\]' in mapper
++assert r'\\[BAYES_H2D_COST_V2\\]' not in mapper  # no doubled escapes
+ assert 'BAYES_H2D_COST_V2' in mapper and 'BAYES_H2D_COST_V2' in transfer
+-assert 'self._h2d = re.compile(' in mapper
++assert '_h2d = re.compile(' in mapper
+ assert 'KV_BAYES_ADAPT_COST' in mapper and 'if not self.adapt_cost:' in mapper
+ assert '--eviction-trigger-watermark "$LMCACHE_L1_EVICTION_TRIGGER"' in launcher
+ assert '--eviction-ratio "$LMCACHE_L1_EVICTION_RATIO"' in launcher

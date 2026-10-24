@@ -1,0 +1,8 @@
+CE28G source base: user-uploaded Oct 23 repository snapshot with the previously delivered H2D instrumentation patch applied.
+Validation performed on Oct 24 2026:
+ - git apply --check and git apply against a fresh copy of the post-instrumentation baseline: PASS.
+ - Python AST parse: PASS (mapper, LMCache transfer, verifier).
+ - bash -n: PASS (variable launcher and CE28G .sbatch/.sh).
+ - scripts/ce28g/test_cost_v2_offline.py: PASS (CPU estimates use V2; Disk H2D component uses V2; no fallback to old wall-time).
+ - Exactly eight unique CASE_IDs and no Slurm --mem: PASS.
+ - CodeNimbus H100 runtime after CE28G patch: NOT YET TESTED. Original diagnostic event timings were validated by user job 30048, not CE28G.

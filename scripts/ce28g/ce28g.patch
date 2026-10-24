@@ -1,0 +1,429 @@
+diff --git a/Hierarchical_KV/shortq_placement/bayesian_mapper.py b/Hierarchical_KV/shortq_placement/bayesian_mapper.py
+index 7add960..36a214a 100644
+--- a/Hierarchical_KV/shortq_placement/bayesian_mapper.py
++++ b/Hierarchical_KV/shortq_placement/bayesian_mapper.py
+@@ -375,17 +375,20 @@ class LmcacheCompletionCostReader(LmcacheLogCostReader):
+     an approximation, not a per-key physical transfer trace. A wave-local H2D
+     average is used ONLY if no matched request was observed, and is reported.
+     """
++    # [SC CE28G] Permanently consume ONLY completed CUDA transfer-region
++    # observations. The old BAYES_H2D_COMPLETE interval is diagnostic only.
+     _h2d = re.compile(
+-        r"\[BAYES_H2D_COMPLETE\].*?request=(\S+).*?chunks=(\d+).*?elapsed_ms=([0-9.]+)")
++        r"\[BAYES_H2D_COST_V2\].*?request=(\S+).*?chunks=(\d+).*?elapsed_ms=([0-9.]+)")
++    _old_h2d = re.compile(r"\[BAYES_H2D_COMPLETE\]")
+     _disk = re.compile(
+         r"\[BAYES_L2_LOAD_COMPLETE\].*?external_request=(\S+).*?chunks=(\d+).*?elapsed_ms=([0-9.]+)")
+     _legacy_disk = re.compile(
+         r"\[BAYES_L2_LOAD_COMPLETE\].*?chunks=(\d+).*?elapsed_ms=([0-9.]+)")
+ 
+     def collect(self, mapper: WaveBayesianMapper) -> dict[str, int]:
+-        counts = {"h2d_completed": 0, "disk_load_completed": 0,
+-                  "disk_matched": 0, "disk_wave_fallback": 0,
+-                  "disk_legacy_unmatched": 0}
++        counts = {"h2d_completed": 0, "h2d_legacy_diagnostic": 0,
++                  "disk_load_completed": 0, "disk_matched": 0,
++                  "disk_wave_fallback": 0, "disk_legacy_unmatched": 0}
+         if not self.logfile.exists():
+             return counts
+         with self.logfile.open(encoding="utf-8", errors="replace") as f:
+@@ -403,6 +406,8 @@ class LmcacheCompletionCostReader(LmcacheLogCostReader):
+         wave_h2d_sum = 0.0
+         wave_h2d_n = 0
+         for line in data.splitlines():
++            if self._old_h2d.search(line):
++                counts["h2d_legacy_diagnostic"] += 1
+             m = self._h2d.search(line)
+             if m and int(m[2]) > 0 and float(m[3]) > 0:
+                 key, n, elapsed = m[1], int(m[2]), float(m[3])
+@@ -422,6 +427,14 @@ class LmcacheCompletionCostReader(LmcacheLogCostReader):
+                     disk_rows.append((None, int(legacy[1]), float(legacy[2])))
+                     counts["disk_load_completed"] += 1
+                     counts["disk_legacy_unmatched"] += 1
++        # Never silently fall back to the old inflated CPU measurement.
++        # Guard a completely missing V2 stream whenever legacy completions
++        # were emitted during this wave. Some late V2 callbacks may cross
++        # wave boundaries; compare per-wave counts with that limitation.
++        if counts["h2d_legacy_diagnostic"] > 0 and not counts["h2d_completed"]:
++            raise RuntimeError(
++                "CE28G: old H2D completions exist but no BAYES_H2D_COST_V2 "
++                "events were observed; verify CUDA events and LMCache logs")
+         fallback = (wave_h2d_sum / wave_h2d_n if wave_h2d_n else None)
+         for key, n, elapsed in disk_rows:
+             if key is not None and key in h2d_by_request:
+diff --git a/scripts/ce28g/README.md b/scripts/ce28g/README.md
+new file mode 100644
+index 0000000..a48f400
+--- /dev/null
++++ b/scripts/ce28g/README.md
+@@ -0,0 +1,81 @@
++# CE28G — Cost Estimator 2.0 eight-run grid
++
++**Target:** UIUC CodeNimbus / 2 × H100 TP2 / vLLM 0.29.0 / vendored LMCache MP. This patch is designed to apply **after** the previously installed `kv_h2d_instrumentation/bayes_h2d_diagnostic.patch` and Next9 v3 cost guard. It was assembled against the source snapshot supplied October 23, 2026. It has not been H100-runtime-tested in its CE28G form.
++
++## The experiment, exactly eight cells
++
++All: Medical Short-Q 650 requests, B100, original passage ordering, 128 generated tokens, `max_num_seqs=16`, GPU preference budget 25 GiB, physical CPU L1 225 GiB, physical Disk L2 500 GiB, PUT cap 0.25 GiB, original retrieval / request ordering, frozen old GNN, score posterior ON. Physical eviction trigger watermark remains **80% L1 / 90% L2** throughout. Nominal GPU policy budget remains 25 GiB (not watermark-adjusted).
++
++| Order | CASE_ID | Prior | Posterior | Cost adaptation | Physical eviction ratio L1/L2 | Bayesian capacity adjusted to watermark |
++|---|---|---|---|---|---|---|
++| 1 | `CAL_ON_BASE` | Original 29954 calibrated scores+costs | fixed w=0.5 | ON | 0.20 / 0.10 | OFF (CPU225/Disk500) |
++| 2 | `CAL_OFF_BASE` | Original 29954 calibrated scores+costs | fixed w=0.5 | OFF | 0.20 / 0.10 | OFF (CPU225/Disk500) |
++| 3 | `CAL_ON_WM5` | Original 29954 calibrated scores+costs | fixed w=0.5 | ON | 0.05 / 0.05 | ON (CPU180/Disk450) |
++| 4 | `CAL_OFF_WM5` | Original 29954 calibrated scores+costs | fixed w=0.5 | OFF | 0.05 / 0.05 | ON (CPU180/Disk450) |
++| 5 | `P04_HI_ON` | Uniform scores, equal 10ms costs | pseudo kA=1000, kB=100 | ON | 0.05 / 0.05 | ON |
++| 6 | `P05_LO_ON` | Uniform scores, equal 10ms costs | pseudo kA=10, kB=1 | ON | 0.05 / 0.05 | ON |
++| 7 | `P06_HI_OFF` | Uniform scores, equal 10ms costs | pseudo kA=1000, kB=100 | OFF | 0.05 / 0.05 | ON |
++| 8 | `P07_LO_OFF` | Uniform scores, equal 10ms costs | pseudo kA=10, kB=1 | OFF | 0.05 / 0.05 | ON |
++
++**Causal scope:** 1 vs 2 isolates cost adaptation with corrected cost V2 and original cache policy. 3 vs 4 isolates adaptation with combined watermark adjustment + smaller eviction batches. 1 vs 3 and 2 vs 4 change **both** mapper effective budgets and physical eviction ratios, so cannot isolate either independently. P04/P05 still change both score and cost pseudo-counts; P06/P07 isolate score pseudo-count with cost updates frozen.
++
++## Source changes
++
++- **Permanent H2D estimator:** `[BAYES_H2D_COST_V2]` uses CuPy CUDA-event time for the `gpu_transfer_region_ms` interval (includes staging DMA + scatter). There is no old/new estimator switch and no hardcoded 3.24ms constant. Legacy `[BAYES_H2D_COMPLETE]` stays in LMCache logs for diagnostics **but no longer enters the Bayesian posterior**. Same `gpu_transfer_region_ms` had been validated in job 30048. V2 timing is automatically recorded whenever `LMCACHE_BAYES_TIMING=1`; CE28G enables native timing diagnostics for corroboration.
++- **Disk estimate:** retains measured L2-load time and existing request-match/wave-fallback logic; replaces the H2D *component* with the new GPU-region timing. Disk/load overlap and non-identical cost semantics remain limitations.
++- **Cost OFF:** `KV_BAYES_ADAPT_COST=0` preserves the Next9 v3 early guard: cost counts and estimates do not change, while all cost measurements still appear in the logs.
++- **Actual physical eviction:** L1 CLI now explicitly receives `--eviction-trigger-watermark` and `--eviction-ratio`; L2 FS adapter's existing `trigger_watermark` and `eviction_ratio` are still populated from the same launcher variables.
++- **Mapper capacities:** single `KV_BAYES_USE_WATERMARK_CAPACITY=0/1` switch. With 1, the **actual physical** `LMCACHE_L1_EVICTION_TRIGGER` and `LMCACHE_L2_EVICTION_TRIGGER` multiply the configured 225GiB/500GiB budgets. There are **no separate mapper watermark settings**. Physical allocations and watermark values are recorded in the run manifest and `[CE28G_CAPACITY]` line.
++
++## Installation
++
++On login node, from repo root:
++
++```bash
++cd /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
++# Extract provided bundle to your home or repo, e.g. `unzip CE28G_patch_bundle.zip`.
++PATCH=/path/to/ce28g/ce28g.patch
++git apply --check "$PATCH"
++git apply "$PATCH"
++python scripts/ce28g/test_cost_v2_offline.py
++python scripts/ce28g/verify_ce28g.py --repo "$PWD" \
++  --prior /mnt/shared/gpfs/home/sriramc2/runs/kvaware/h100_expected_ordinal_exploratory.json
++python scripts/ce28g/verify_ce28g.py --repo "$PWD" \
++  --prior "$PWD/scripts/h100_next9/priors/uniform_scores_equal_cost_10ms.json"
++```
++
++If `git apply --check` fails: **do not** use `--reject`, overwrite source, or restore `bayesian_mapper.py.next9_before_cost_guard.bak`. Report the `git apply --check` error and current diff first. No `--mem` Slurm flag, C++ rebuild, or new virtual environment is required by this patch.
++
++## Case audits before any scratch wipe
++
++```bash
++for case_id in CAL_ON_BASE CAL_OFF_BASE CAL_ON_WM5 CAL_OFF_WM5 \
++               P04_HI_ON P05_LO_ON P06_HI_OFF P07_LO_OFF; do
++  DRY_RUN=1 CASE_ID="$case_id" bash scripts/ce28g/run_ce28g_cell.sbatch || exit
++ done
++```
++
++Case audits validate prerequisites and print settings; they **do not** launch vLLM, allocate GPUs, or touch scratch. The underlying workload does not start until the next step.
++
++## Submit exactly eight jobs, serialized with singleton
++
++Make sure unrelated jobs/processes are not using `/scratch2/sriramc2`. `CLEAN_OLD_LMCACHE=1` recursively removes **all contents** but preserves that root directory; logs, metrics, and summaries are stored on GPFS.
++
++```bash
++cd /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
++bash scripts/ce28g/submit_8_sbatch_only.sh | tee /mnt/shared/gpfs/home/sriramc2/runs/kvaware/ce28g_submit_ids.txt
++```
++
++It uses `--dependency=singleton --job-name=kvq650-10batch` on each case, one node, `--gres=gpu:2`, `--cpus-per-task=16`, six hours, **no** `--mem`. The job IDs are not known until submission; capture `Submitted batch job …` outputs in the file above. Because singleton also waits behind other jobs of the same Slurm job name, do not combine with an uncoordinated scratch-cleanup series.
++
++## Required runtime evidence per job
++
++- `[CE28G_CONFIG]` and `[CE28G_CAPACITY]` lines with intended effective mapper budgets.
++- `logs/lmcache.log` contains `[BAYES_H2D_COST_V2]`, legacy `[BAYES_H2D_COMPLETE]` (diagnostic only), `[BAYES_H2D_DIAG]`, and native `[BAYES_H2D_PHASE]` records. Estimate the corresponding event medians / chip rank correlations; compare event counts to detect any lost diagnostic callbacks. Verify **no** `[BAYES_H2D_COST_V2_ERROR]` or `[BAYES_H2D_DIAG_ERROR]`.
++- `results/bayes_wave_history.json`: with cost ON, CPU+Disk cost observations should be in the transfer-stage ms/chunk range, with recompute still its separate existing proxy; with cost OFF, CPU/Disk/recompute posteriors and counts must stay at prior/zero.
++- Actual L1 eviction triggers, keys evicted, L2 evictions, L1 occupancy, PUT cap skips, TP-shard routing errors, store barrier and failed stores.
++- Scheduler-useful GPU/CPU/Disk prompt KV and recomputation **not** raw hit rate; physical reachable prefix gaps and cold/warm E2E. GNN preprocessing cost separately reported.
++
++## Limits / warnings
++
++The H2D corrected estimator is a CUDA transfer-region measure, **not** a proven incremental serving critical-path time. The Disk estimator still adds possibly overlapping L2 and H2D stages. The old input's accidental admission selectivity may be lost, causing greater cache churn. Watermark budget adjustment uses **static soft eviction triggers**, not a live free-space/occupancy predictor. Lower eviction ratios may increase eviction frequency. The diagnostic run is not interchangeable with job 29954 without acknowledging differences in code revision and observations. **This code has passed CPU-only checks, not an H100 integration run**; audit the first cell's V2 marker and actual posterior before interpreting the entire grid.
+diff --git a/scripts/ce28g/run_ce28g_cell.sbatch b/scripts/ce28g/run_ce28g_cell.sbatch
+new file mode 100755
+index 0000000..890cda4
+--- /dev/null
++++ b/scripts/ce28g/run_ce28g_cell.sbatch
+@@ -0,0 +1,57 @@
++#!/usr/bin/env bash
++#SBATCH --job-name=kvq650-10batch
++#SBATCH --partition=gpu-h100-dchen
++#SBATCH --nodes=1
++#SBATCH --ntasks=1
++#SBATCH --cpus-per-task=16
++#SBATCH --gres=gpu:2
++#SBATCH --time=06:00:00
++#SBATCH --output=/mnt/shared/gpfs/home/sriramc2/runs/kvaware/%x_%j.out
++#SBATCH --error=/mnt/shared/gpfs/home/sriramc2/runs/kvaware/%x_%j.err
++set -Eeuo pipefail
++REPO=/mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
++cd "$REPO"
++: "${CASE_ID:?Specify CASE_ID from scripts/ce28g/submit_8_sbatch_only.sh}"
++CAL_PRIOR=/mnt/shared/gpfs/home/sriramc2/runs/kvaware/h100_expected_ordinal_exploratory.json
++UNIFORM_PRIOR="$REPO/scripts/h100_next9/priors/uniform_scores_equal_cost_10ms.json"
++POSTERIOR=fixed W=0.5 KA=10 KB=5 PRIOR="$CAL_PRIOR" ADAPT_COST=1
++L1_EVICT=0.20 L2_EVICT=0.10 WM_MAP=0
++case "$CASE_ID" in
++  CAL_ON_BASE)  ADAPT_COST=1 ;;
++  CAL_OFF_BASE) ADAPT_COST=0 ;;
++  CAL_ON_WM5)  ADAPT_COST=1; L1_EVICT=0.05; L2_EVICT=0.05; WM_MAP=1 ;;
++  CAL_OFF_WM5) ADAPT_COST=0; L1_EVICT=0.05; L2_EVICT=0.05; WM_MAP=1 ;;
++  P04_HI_ON)   PRIOR="$UNIFORM_PRIOR"; POSTERIOR=pseudo_count; KA=1000; KB=100; ADAPT_COST=1; L1_EVICT=0.05; L2_EVICT=0.05; WM_MAP=1 ;;
++  P05_LO_ON)   PRIOR="$UNIFORM_PRIOR"; POSTERIOR=pseudo_count; KA=10; KB=1; ADAPT_COST=1; L1_EVICT=0.05; L2_EVICT=0.05; WM_MAP=1 ;;
++  P06_HI_OFF)  PRIOR="$UNIFORM_PRIOR"; POSTERIOR=pseudo_count; KA=1000; KB=100; ADAPT_COST=0; L1_EVICT=0.05; L2_EVICT=0.05; WM_MAP=1 ;;
++  P07_LO_OFF)  PRIOR="$UNIFORM_PRIOR"; POSTERIOR=pseudo_count; KA=10; KB=1; ADAPT_COST=0; L1_EVICT=0.05; L2_EVICT=0.05; WM_MAP=1 ;;
++  *) echo "ERROR: unknown CE28G CASE_ID=$CASE_ID" >&2; exit 2 ;;
++esac
++export SWEEP_CELL="c_ce28g_${CASE_ID}_bayes" SWEEP_POLICY=bayes SWEEP_ORDER=original
++export SWEEP_GPU_GB=25 SWEEP_CPU_GB=225 SWEEP_DISK_GB=500 SWEEP_STORE_CAP_GB=0.25
++export SWEEP_PRIOR_FILE="$PRIOR" SWEEP_PRIOR_WEIGHT="$W"
++export SWEEP_POSTERIOR_MODE="$POSTERIOR" SWEEP_SCORE_PRIOR_COUNT="$KA"
++export SWEEP_COST_PRIOR_COUNT="$KB" KV_BAYES_ADAPT_COST="$ADAPT_COST"
++export KV_BAYES_USE_WATERMARK_CAPACITY="$WM_MAP"
++export LMCACHE_L1_EVICTION_TRIGGER=0.80 LMCACHE_L1_EVICTION_RATIO="$L1_EVICT"
++export LMCACHE_L2_EVICTION_TRIGGER=0.90 LMCACHE_L2_EVICTION_RATIO="$L2_EVICT"
++# Cost V2 uses CuPy stream-event intervals; old completion remains diagnostic.
++# Native phase instrumentation is retained to audit both CPU and Disk H2D.
++export LMCACHE_BAYES_H2D_DIAG=1 KV_BAYES_DIRECT_COST_FEEDBACK=1 KV_BAYES_USE_COST_PROXIES=0
++export NEXT8_DATASET=medical NEXT8_Q=650 NEXT8_B=100
++export CLEAN_OLD_LMCACHE=1
++export VLLM_PHASE_TRACE=1 VLLM_PHASE_TRACE_DEVICE_TIMING=0
++export KV_COLD_WARM_STORE_BARRIER=1 KV_MUTUAL_PREFIX=1 KV_VPC_SUFFICIENT_BYPASS=1
++export LMCACHE_MP_PREFIX_DIAGNOSTICS=1
++export GRID_LABEL="CE28G_${CASE_ID}_medical_q650_b100"
++printf '[CE28G_CONFIG] case=%s prior=%s posterior=%s w=%s kA=%s kB=%s adapt_cost=%s l1_ratio=%s l2_ratio=%s wm_mapper=%s estimator=gpu_transfer_region\n' \
++  "$CASE_ID" "$PRIOR" "$POSTERIOR" "$W" "$KA" "$KB" "$ADAPT_COST" "$L1_EVICT" "$L2_EVICT" "$WM_MAP"
++python3 scripts/ce28g/verify_ce28g.py --repo "$REPO" --prior "$PRIOR"
++if [[ "${DRY_RUN:-0}" == 1 ]]; then
++  echo "[CE28G] DRY_RUN successful. No scratch cleanup, GPU or job launch."
++  exit 0
++fi
++python3 scripts/h100_next8/preflight_dataset.py --repo "$REPO" \
++  --dataset medical --questions 650 --policy bayes
++# THIS WILL DELETE EVERY CHILD OF /scratch2/sriramc2; KEEP SINGLETON SERIES.
++bash scripts/h100_next8/run_h100_bayes_sweep_variable.sbatch
+diff --git a/scripts/ce28g/submit_8_sbatch_only.sh b/scripts/ce28g/submit_8_sbatch_only.sh
+new file mode 100755
+index 0000000..e94609f
+--- /dev/null
++++ b/scripts/ce28g/submit_8_sbatch_only.sh
+@@ -0,0 +1,8 @@
++#!/usr/bin/env bash
++set -Eeuo pipefail
++cd /mnt/shared/gpfs/home/sriramc2/KV-Aware-vLLM
++for case_id in CAL_ON_BASE CAL_OFF_BASE CAL_ON_WM5 CAL_OFF_WM5 \
++               P04_HI_ON P05_LO_ON P06_HI_OFF P07_LO_OFF; do
++  sbatch --dependency=singleton --job-name=kvq650-10batch \
++    --export=ALL,CASE_ID="$case_id" scripts/ce28g/run_ce28g_cell.sbatch
++done
+diff --git a/scripts/ce28g/test_cost_v2_offline.py b/scripts/ce28g/test_cost_v2_offline.py
+new file mode 100644
+index 0000000..a71c883
+--- /dev/null
++++ b/scripts/ce28g/test_cost_v2_offline.py
+@@ -0,0 +1,37 @@
++#!/usr/bin/env python3
++"""CPU-only CE28G behavioral regression (no torch/cuda needed)."""
++from pathlib import Path
++import tempfile
++import sys
++
++repo=Path(__file__).resolve().parents[2]
++sys.path.insert(0,str(repo/'Hierarchical_KV/shortq_placement'))
++from bayesian_mapper import LmcacheCompletionCostReader
++
++class Recorder:
++    def __init__(self): self.obs=[]
++    def observe_cost(self,tier,ms,count=1): self.obs.append((tier,round(ms,5),count))
++
++with tempfile.TemporaryDirectory() as td:
++    log=Path(td)/'lmcache.log'
++    log.write_text('''[BAYES_H2D_COMPLETE] request=q1 chunks=2 elapsed_ms=1000.0
++[BAYES_H2D_COST_V2] request=q1 chunks=2 elapsed_ms=8.40 transfer_key=t1
++[BAYES_H2D_COST_V2] request=q1 chunks=2 elapsed_ms=9.00 transfer_key=t2
++[BAYES_L2_LOAD_COMPLETE] external_request=q1 chunks=2 elapsed_ms=80.00
++''')
++    r=LmcacheCompletionCostReader(log)
++    rec=Recorder()
++    c=r.collect(rec)
++    assert c['h2d_completed']==2 and c['h2d_legacy_diagnostic']==1,c
++    assert rec.obs==[('cpu',4.2,2),('cpu',4.5,2),('disk',44.5,2)],rec.obs
++    # Incremental reading does not double count previously consumed lines.
++    assert r.collect(rec)['h2d_completed']==0
++    assert len(rec.obs)==3
++    log.write_text('[BAYES_H2D_COMPLETE] request=q2 chunks=2 elapsed_ms=1000.0\n')
++    r=LmcacheCompletionCostReader(log)
++    try:
++        r.collect(Recorder())
++        raise AssertionError('Missing V2 cost was silently replaced by old cost')
++    except RuntimeError as e:
++        assert 'BAYES_H2D_COST_V2' in str(e)
++print('CE28G OFFLINE COST V2 PASS: no legacy fallback; L2 uses corrected H2D')
+diff --git a/scripts/ce28g/verify_ce28g.py b/scripts/ce28g/verify_ce28g.py
+new file mode 100755
+index 0000000..6dc14cb
+--- /dev/null
++++ b/scripts/ce28g/verify_ce28g.py
+@@ -0,0 +1,34 @@
++#!/usr/bin/env python3
++"""CE28G static safety preflight. Does not run GPU or touch scratch."""
++import argparse
++import ast
++import json
++from pathlib import Path
++p=argparse.ArgumentParser()
++p.add_argument('--repo',required=True)
++p.add_argument('--prior',required=True)
++a=p.parse_args()
++r=Path(a.repo)
++for rel in ('Hierarchical_KV/shortq_placement/bayesian_mapper.py',
++            'third_party/LMCache/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py',
++            'scripts/h100_next8/run_shortq_gnn_dynamic_vpc_variable.sh'):
++    f=r/rel
++    assert f.is_file(),f
++    if f.suffix=='.py': ast.parse(f.read_text(),filename=str(f))
++mapper=(r/'Hierarchical_KV/shortq_placement/bayesian_mapper.py').read_text()
++transfer=(r/'third_party/LMCache/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py').read_text()
++launcher=(r/'scripts/h100_next8/run_shortq_gnn_dynamic_vpc_variable.sh').read_text()
++assert 'r"\\[BAYES_H2D_COST_V2\\]' not in mapper  # sanity: no double backslashes
++assert 'BAYES_H2D_COST_V2' in mapper and 'BAYES_H2D_COST_V2' in transfer
++assert 'self._h2d = re.compile(' in mapper
++assert 'KV_BAYES_ADAPT_COST' in mapper and 'if not self.adapt_cost:' in mapper
++assert '--eviction-trigger-watermark "$LMCACHE_L1_EVICTION_TRIGGER"' in launcher
++assert '--eviction-ratio "$LMCACHE_L1_EVICTION_RATIO"' in launcher
++assert '--bayes_cpu_gb "$BAYES_CPU_EFFECTIVE_GB"' in launcher
++assert '--bayes_disk_gb "$BAYES_DISK_EFFECTIVE_GB"' in launcher
++assert 'KV_BAYES_USE_WATERMARK_CAPACITY' in launcher
++prior=Path(a.prior)
++assert prior.is_file() and prior.stat().st_size>0, f'prior missing: {prior}'
++obj=json.loads(prior.read_text())
++assert obj.get('score_format')=='expected_ordinal_0_100',obj.get('score_format')
++print('CE28G VERIFY PASS: patched cost V2, physical watermarks, capacity toggle, prior')
+diff --git a/scripts/h100_next8/run_shortq_gnn_dynamic_vpc_variable.sh b/scripts/h100_next8/run_shortq_gnn_dynamic_vpc_variable.sh
+index 78cc0d8..e701227 100644
+--- a/scripts/h100_next8/run_shortq_gnn_dynamic_vpc_variable.sh
++++ b/scripts/h100_next8/run_shortq_gnn_dynamic_vpc_variable.sh
+@@ -31,6 +31,10 @@ KV_GNN_AWARE_VPC="${KV_GNN_AWARE_VPC:-1}"
+ KV_GNN_L1_BACKING="${KV_GNN_L1_BACKING:-1}"
+ LMCACHE_L1_SIZE_GB="${LMCACHE_L1_SIZE_GB:-200}"
+ LMCACHE_L2_SIZE_GB="${LMCACHE_L2_SIZE_GB:-100}"
++# CE28G: these are the exact physical L1 eviction controls passed to LMCache.
++# Previously the server used 0.80 / 0.20 implicit CLI defaults.
++LMCACHE_L1_EVICTION_TRIGGER="${LMCACHE_L1_EVICTION_TRIGGER:-0.80}"
++LMCACHE_L1_EVICTION_RATIO="${LMCACHE_L1_EVICTION_RATIO:-0.20}"
+ LMCACHE_L2_EVICTION_TRIGGER="${LMCACHE_L2_EVICTION_TRIGGER:-0.90}"
+ LMCACHE_L2_EVICTION_RATIO="${LMCACHE_L2_EVICTION_RATIO:-0.10}"
+ # Optional durability experiment: back every host-resident GNN prompt chunk to
+@@ -184,6 +188,11 @@ HASH_PREDICTION_TRACE="${PLACEMENT_DIR}/gnn_hash_prediction_occurrences.jsonl"
+ GNN_TIMING_TRACE="${PLACEMENT_DIR}/gnn_prediction_timing.jsonl"
+ PLACEMENT_SUMMARY="${PLACEMENT_DIR}/gnn_placement_summary.json"
+ KV_BAYES_ENABLE="${KV_BAYES_ENABLE:-0}"
++# [SC CE28G] One switch; no separate Bayes watermark values.
++KV_BAYES_USE_WATERMARK_CAPACITY="${KV_BAYES_USE_WATERMARK_CAPACITY:-0}"
++[[ "$KV_BAYES_USE_WATERMARK_CAPACITY" == 0 || "$KV_BAYES_USE_WATERMARK_CAPACITY" == 1 ]] || {
++  echo "KV_BAYES_USE_WATERMARK_CAPACITY must be 0 or 1" >&2; exit 2;
++}
+ KV_BAYES_PRIOR_WEIGHT="${KV_BAYES_PRIOR_WEIGHT:-1}"
+ KV_BAYES_PRIOR_FILE="${KV_BAYES_PRIOR_FILE:-${REPO}/Hierarchical_KV/shortq_placement/priors/rank_example.json}"
+ KV_BAYES_SCORE_FILE="${PLACEMENT_DIR}/gnn_chunk_scores.jsonl"
+@@ -197,6 +206,27 @@ KV_BAYES_DISK_GB="${KV_BAYES_DISK_GB:-$LMCACHE_L2_SIZE_GB}"
+ if [[ "$KV_BAYES_ENABLE" == "1" && "$KV_BAYES_DISK_GB" != "$LMCACHE_L2_SIZE_GB" ]]; then
+   echo "ERROR: mapper disk budget must match physical L2 size for this experiment" >&2; exit 2
+ fi
++# [SC CE28G] Physical eviction knobs are authoritative. Reject values before
++# any service starts, and compute mapper budgets from those exact knobs.
++CE28G_CAP_VALUES="$(python - "$L1_GB" "$KV_BAYES_DISK_GB" \
++    "$LMCACHE_L1_EVICTION_TRIGGER" "$LMCACHE_L1_EVICTION_RATIO" \
++    "$LMCACHE_L2_EVICTION_TRIGGER" "$LMCACHE_L2_EVICTION_RATIO" \
++    "$KV_BAYES_USE_WATERMARK_CAPACITY" <<'PY_CE28G'
++import math,sys
++cpu,disk,l1wm,l1ratio,l2wm,l2ratio,enabled=map(float,sys.argv[1:])
++assert cpu>0 and disk>0 and all(math.isfinite(v) for v in (cpu,disk,l1wm,l1ratio,l2wm,l2ratio))
++assert all(0<x<=1 for x in (l1wm,l1ratio,l2wm,l2ratio))
++assert enabled in (0,1)
++print(f'{cpu*l1wm if enabled else cpu:.8f} {disk*l2wm if enabled else disk:.8f}')
++PY_CE28G
++)"
++read -r BAYES_CPU_EFFECTIVE_GB BAYES_DISK_EFFECTIVE_GB <<< "$CE28G_CAP_VALUES"
++echo "[CE28G_CAPACITY] physical_cpu=$L1_GB physical_disk=$KV_BAYES_DISK_GB "\
++  "l1_watermark=$LMCACHE_L1_EVICTION_TRIGGER l1_evict_ratio=$LMCACHE_L1_EVICTION_RATIO "\
++  "l2_watermark=$LMCACHE_L2_EVICTION_TRIGGER l2_evict_ratio=$LMCACHE_L2_EVICTION_RATIO "\
++  "apply=$KV_BAYES_USE_WATERMARK_CAPACITY effective_cpu=$BAYES_CPU_EFFECTIVE_GB "\
++  "effective_disk=$BAYES_DISK_EFFECTIVE_GB"
++
+ KV_BAYES_USE_COST_PROXIES="${KV_BAYES_USE_COST_PROXIES:-0}"
+ KV_BAYES_DIRECT_COST_FEEDBACK="${KV_BAYES_DIRECT_COST_FEEDBACK:-0}"
+ KV_BAYES_POSTERIOR_MODE="${KV_BAYES_POSTERIOR_MODE:-fixed}"
+@@ -419,6 +449,11 @@ cat > "${RUN_DIR}/run_config.json" <<JSON
+   "bayes_gpu_gb": $KV_BAYES_GPU_GB,
+   "bayes_disk_gb": $KV_BAYES_DISK_GB,
+   "lmcache_l2_size_gb": $LMCACHE_L2_SIZE_GB,
++  "lmcache_l1_eviction_trigger": $LMCACHE_L1_EVICTION_TRIGGER,
++  "lmcache_l1_eviction_ratio": $LMCACHE_L1_EVICTION_RATIO,
++  "bayes_use_watermark_capacity": $KV_BAYES_USE_WATERMARK_CAPACITY,
++  "bayes_cpu_effective_gb": $BAYES_CPU_EFFECTIVE_GB,
++  "bayes_disk_effective_gb": $BAYES_DISK_EFFECTIVE_GB,
+   "lmcache_l2_eviction_trigger": $LMCACHE_L2_EVICTION_TRIGGER,
+   "lmcache_l2_eviction_ratio": $LMCACHE_L2_EVICTION_RATIO,
+   "bayes_cost_observation_proxies": $KV_BAYES_USE_COST_PROXIES,
+@@ -507,6 +542,8 @@ echo "fs_native adapter: $L2_JSON"
+ echo "===== START LMCACHE ====="
+ lmcache server --host localhost --port 5556 --chunk-size "$LMCACHE_CHUNK_SIZE" \
+   --l1-size-gb "$L1_GB" \
++  --eviction-trigger-watermark "$LMCACHE_L1_EVICTION_TRIGGER" \
++  --eviction-ratio "$LMCACHE_L1_EVICTION_RATIO" \
+   --l2-load-max-in-flight "$LMCACHE_L2_LOAD_MAX_IN_FLIGHT" \
+   --l2-lookup-max-in-flight "$LMCACHE_L2_LOOKUP_MAX_IN_FLIGHT" \
+   --l2-store-max-inflight-gb "$LMCACHE_MP_MAX_INFLIGHT_STORE_GB" \
+@@ -578,8 +615,8 @@ if [[ "$KV_BAYES_ENABLE" == "1" ]]; then
+     --bayes_score_prior_count "$KV_BAYES_SCORE_PRIOR_COUNT"
+     --bayes_cost_prior_count "$KV_BAYES_COST_PRIOR_COUNT"
+     --bayes_gpu_gb "$KV_BAYES_GPU_GB"
+-    --bayes_cpu_gb "$L1_GB"
+-    --bayes_disk_gb "$KV_BAYES_DISK_GB"
++    --bayes_cpu_gb "$BAYES_CPU_EFFECTIVE_GB"
++    --bayes_disk_gb "$BAYES_DISK_EFFECTIVE_GB"
+     --bayes_metadata_file "$RUNTIME_METADATA"
+     --bayes_vpc_file "$VPC_IMPORTANCE_SIDECAR"
+     --bayes_lmcache_log "${LOG_DIR}/lmcache.log"
+diff --git a/third_party/LMCache/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py b/third_party/LMCache/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
+index 0b7760e..07a0f91 100644
+--- a/third_party/LMCache/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
++++ b/third_party/LMCache/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
+@@ -213,9 +213,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
+                 "bayes_h2d_done", self._bayes_h2d_complete,
+                 payload_type=tuple[float, int, str],
+             )
+-        # [SC] Optional diagnostic is independent of the adaptive estimator.
+-        # Only the existing BAYES_H2D_COMPLETE stream feeds observe_cost().
+-        self._h2d_diag_enabled = _env_flag("LMCACHE_BAYES_H2D_DIAG")
++        # [SC CE28G] This GPU transfer-region event is now the ONLY H2D cost
++        # observation consumed by Bayes. The legacy wall callback is retained
++        # solely for diagnosing synchronization/waiting overhead.
++        # Do not re-enable the original wall-clock cost in the mapper.
++        self._h2d_diag_enabled = (_env_flag("LMCACHE_BAYES_H2D_DIAG")
++                                  or _env_flag("LMCACHE_BAYES_TIMING"))
+         if self._h2d_diag_enabled:
+             self._h2d_diag_lock = threading.Lock()
+             self._h2d_diag_pending: dict[str, tuple[Any, ...]] = {}
+@@ -268,6 +271,21 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
+                 transfer_ms = cupy.cuda.get_elapsed_time(before_copy, after_copy)
+                 stream_total_ms = cupy.cuda.get_elapsed_time(before_wait, after_copy)
+             callback_elapsed_ms = (time.perf_counter() - started) * 1000.0
++            # [SC CE28G] GPU region excludes producer wait, transfer-stream
++            # scheduling outside the bracket, and later callback dispatch.
++            # The region includes H2D and paged-KV scatter. Explicitly reject
++            # bad values rather than falling back to inflated wall time.
++            if chunks > 0 and 0.0 < transfer_ms < float("inf"):
++                logger.info(
++                    "[BAYES_H2D_COST_V2] request=%s chunks=%d "
++                    "elapsed_ms=%.6f transfer_key=%s",
++                    request, chunks, transfer_ms, transfer_key,
++                )
++            else:
++                logger.error(
++                    "[BAYES_H2D_COST_V2_ERROR] request=%s chunks=%d "
++                    "elapsed_ms=%s", request, chunks, transfer_ms,
++                )
+             logger.info(
+                 "[BAYES_H2D_DIAG] request=%s transfer_key=%s device=%s "
+                 "chunks=%d nbytes=%d host_enqueue_ms=%.6f "

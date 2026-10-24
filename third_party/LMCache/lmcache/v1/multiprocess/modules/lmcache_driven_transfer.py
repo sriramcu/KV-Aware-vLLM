@@ -213,9 +213,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 "bayes_h2d_done", self._bayes_h2d_complete,
                 payload_type=tuple[float, int, str],
             )
-        # [SC] Optional diagnostic is independent of the adaptive estimator.
-        # Only the existing BAYES_H2D_COMPLETE stream feeds observe_cost().
-        self._h2d_diag_enabled = _env_flag("LMCACHE_BAYES_H2D_DIAG")
+        # [SC CE28G] This GPU transfer-region event is now the ONLY H2D cost
+        # observation consumed by Bayes. The legacy wall callback is retained
+        # solely for diagnosing synchronization/waiting overhead.
+        # Do not re-enable the original wall-clock cost in the mapper.
+        self._h2d_diag_enabled = (_env_flag("LMCACHE_BAYES_H2D_DIAG")
+                                  or _env_flag("LMCACHE_BAYES_TIMING"))
         if self._h2d_diag_enabled:
             self._h2d_diag_lock = threading.Lock()
             self._h2d_diag_pending: dict[str, tuple[Any, ...]] = {}
@@ -268,6 +271,21 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 transfer_ms = cupy.cuda.get_elapsed_time(before_copy, after_copy)
                 stream_total_ms = cupy.cuda.get_elapsed_time(before_wait, after_copy)
             callback_elapsed_ms = (time.perf_counter() - started) * 1000.0
+            # [SC CE28G] GPU region excludes producer wait, transfer-stream
+            # scheduling outside the bracket, and later callback dispatch.
+            # The region includes H2D and paged-KV scatter. Explicitly reject
+            # bad values rather than falling back to inflated wall time.
+            if chunks > 0 and 0.0 < transfer_ms < float("inf"):
+                logger.info(
+                    "[BAYES_H2D_COST_V2] request=%s chunks=%d "
+                    "elapsed_ms=%.6f transfer_key=%s",
+                    request, chunks, transfer_ms, transfer_key,
+                )
+            else:
+                logger.error(
+                    "[BAYES_H2D_COST_V2_ERROR] request=%s chunks=%d "
+                    "elapsed_ms=%s", request, chunks, transfer_ms,
+                )
             logger.info(
                 "[BAYES_H2D_DIAG] request=%s transfer_key=%s device=%s "
                 "chunks=%d nbytes=%d host_enqueue_ms=%.6f "

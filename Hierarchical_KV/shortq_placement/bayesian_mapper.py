@@ -375,17 +375,20 @@ class LmcacheCompletionCostReader(LmcacheLogCostReader):
     an approximation, not a per-key physical transfer trace. A wave-local H2D
     average is used ONLY if no matched request was observed, and is reported.
     """
+    # [SC CE28G] Permanently consume ONLY completed CUDA transfer-region
+    # observations. The old BAYES_H2D_COMPLETE interval is diagnostic only.
     _h2d = re.compile(
-        r"\[BAYES_H2D_COMPLETE\].*?request=(\S+).*?chunks=(\d+).*?elapsed_ms=([0-9.]+)")
+        r"\[BAYES_H2D_COST_V2\].*?request=(\S+).*?chunks=(\d+).*?elapsed_ms=([0-9.]+)")
+    _old_h2d = re.compile(r"\[BAYES_H2D_COMPLETE\]")
     _disk = re.compile(
         r"\[BAYES_L2_LOAD_COMPLETE\].*?external_request=(\S+).*?chunks=(\d+).*?elapsed_ms=([0-9.]+)")
     _legacy_disk = re.compile(
         r"\[BAYES_L2_LOAD_COMPLETE\].*?chunks=(\d+).*?elapsed_ms=([0-9.]+)")
 
     def collect(self, mapper: WaveBayesianMapper) -> dict[str, int]:
-        counts = {"h2d_completed": 0, "disk_load_completed": 0,
-                  "disk_matched": 0, "disk_wave_fallback": 0,
-                  "disk_legacy_unmatched": 0}
+        counts = {"h2d_completed": 0, "h2d_legacy_diagnostic": 0,
+                  "disk_load_completed": 0, "disk_matched": 0,
+                  "disk_wave_fallback": 0, "disk_legacy_unmatched": 0}
         if not self.logfile.exists():
             return counts
         with self.logfile.open(encoding="utf-8", errors="replace") as f:
@@ -403,6 +406,8 @@ class LmcacheCompletionCostReader(LmcacheLogCostReader):
         wave_h2d_sum = 0.0
         wave_h2d_n = 0
         for line in data.splitlines():
+            if self._old_h2d.search(line):
+                counts["h2d_legacy_diagnostic"] += 1
             m = self._h2d.search(line)
             if m and int(m[2]) > 0 and float(m[3]) > 0:
                 key, n, elapsed = m[1], int(m[2]), float(m[3])
@@ -422,6 +427,14 @@ class LmcacheCompletionCostReader(LmcacheLogCostReader):
                     disk_rows.append((None, int(legacy[1]), float(legacy[2])))
                     counts["disk_load_completed"] += 1
                     counts["disk_legacy_unmatched"] += 1
+        # Never silently fall back to the old inflated CPU measurement.
+        # Guard a completely missing V2 stream whenever legacy completions
+        # were emitted during this wave. Some late V2 callbacks may cross
+        # wave boundaries; compare per-wave counts with that limitation.
+        if counts["h2d_legacy_diagnostic"] > 0 and not counts["h2d_completed"]:
+            raise RuntimeError(
+                "CE28G: old H2D completions exist but no BAYES_H2D_COST_V2 "
+                "events were observed; verify CUDA events and LMCache logs")
         fallback = (wave_h2d_sum / wave_h2d_n if wave_h2d_n else None)
         for key, n, elapsed in disk_rows:
             if key is not None and key in h2d_by_request:
